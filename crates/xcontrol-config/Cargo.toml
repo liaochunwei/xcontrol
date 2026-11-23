@@ -1,0 +1,38 @@
+[package]
+name = "xcontrol-config"
+description = "配置模型（TOML）、迁移、校验"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# docs/01 §5：config.toml schema 带 version 字段 + 迁移函数链；
+# 安全码默认存 OS 钥匙串（keyring 真实现为平台相关路径，延后落地并遵守分层红线）。
+# I/O 边界：本 crate 是配置 I/O 边界——允许 std::fs 同步读写，禁止网络 I/O 与 tokio；
+# xcontrol-proto / xcontrol-core 仍为零 I/O 红线 crate（docs/08 §1，xtask check-deps 断言）。
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+# 可选：仅 std-paths feature 使用。其传递依赖 libc（unix）/ windows-sys（windows）
+# 在 xtask FORBIDDEN_PACKAGES 黑名单内——依赖 xcontrol-config 的红线 crate
+# （xcontrol-proto / xcontrol-core）不得携带，故默认关闭（bin 侧按需开启）。
+dirs = { workspace = true, optional = true }
+# 可选：仅 keychain feature 使用（11-19-m6-security：OS 钥匙串真接线，docs/07 §3.3）。
+# 三平台后端 target 内部门控（mac security-framework / win windows-sys / linux
+# secret-service+zbus 纯 Rust，async-io 执行器——tokio 不进本 feature 传递树）；
+# 查树记录见根 workspace.dependencies keyring 条目。DBus 属会话总线 IPC；
+# 红线 crate（proto/core）不启用本 feature（默认编译面零增量）。
+keyring = { workspace = true, optional = true }
+
+# std-paths：平台标准目录解析（default_config_path / default_data_dir，docs/01 §5）。
+# bin 侧开启方式：`xcontrol-config = { workspace = true, features = ["std-paths"] }`。
+# keychain：KeychainSecretStore 真实现（keyring 后端）；关闭时保持占位行为
+# （KeychainUnavailable）——proto/core/测试面零平台依赖。
+[features]
+std-paths = ["dep:dirs"]
+keychain = ["dep:keyring"]
+
+[lints]
+workspace = true

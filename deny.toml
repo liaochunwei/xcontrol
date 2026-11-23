@@ -1,0 +1,28 @@
+# cargo-deny 配置（docs/08 §5：linux CI 审查步骤）。
+# 原则：依赖保持最小；新增重量级依赖（>10 直接依赖或底层 unsafe 库）须先写 ADR（docs/08 §8）。
+
+[licenses]
+version = 2
+# 当前树仅含 workspace 内部 crate（MIT OR Apache-2.0）；引入第三方依赖时
+# 按 docs/01 §6 基线回填（tokio=MIT、gpui=Apache-2.0 等）。
+allow = [
+  "MIT",
+  "Apache-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+deny = []
+skip = []
+skip-tree = []
+
+[advisories]
+version = 2
+yanked = "warn"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

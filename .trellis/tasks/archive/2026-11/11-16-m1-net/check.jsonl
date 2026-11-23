@@ -1,0 +1,4 @@
+{"file": "docs/02-protocol.md", "reason": "§3 逐行核对派生/握手/限速参数"}
+{"file": "docs/07-security.md", "reason": "安全要求对照"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "net 红线"}
+{"file": ".trellis/spec/rust-core/testing.md", "reason": "覆盖门槛"}

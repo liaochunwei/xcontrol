@@ -1,0 +1,6 @@
+{"file": "docs/06-ui.md", "reason": "§2 应用形态（QuitMode/on_reopen/单进程）、§6 状态与数据流（AppState 纯投影/CoreHandle）、§3 窗口清单"}
+{"file": "docs/00-requirements.md", "reason": "FR-1.4 验收标准"}
+{"file": "examples/spike-tray/EVIDENCE.md", "reason": "gpui API 实测记录（gpui_kit::application()/QuitMode/headless）——已验证事实，勿凭记忆"}
+{"file": ".trellis/spec/rust-platform/ui-tray.md", "reason": "gpui 红线（版本源单一/纯投影）"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "UI 是纯投影红线（红线 4）"}
+{"file": ".trellis/spec/rust-core/error-handling.md", "reason": "bin 顶层 anyhow/日志脱敏"}

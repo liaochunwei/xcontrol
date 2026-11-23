@@ -1,0 +1,14 @@
+.video_agent/
+/target/
+# spike crate 是独立 workspace，其 target 不受根 /target/ 规则覆盖（ADR-0001 spike 结论）
+/examples/spike-tray/target/
+# ZCode 工具工作区（trellis 工作流/agent 定义/本机配置——项目仓库不含工具态，11-22 清理裁定）
+/.zcode/
+**/*.rs.bk
+.DS_Store
+# cargo-fuzz 产物与锁文件（11-16-m1-proto 脚手架：README 说明 nightly 运行方法，产物不入库）
+# fuzz/target 是 cargo-fuzz 自建的构建目录（同 spike 教训：独立目录的 target 不受根规则覆盖）
+/crates/xcontrol-proto/fuzz/target/
+/crates/xcontrol-proto/fuzz/artifacts/
+/crates/xcontrol-proto/fuzz/coverage/
+/crates/xcontrol-proto/fuzz/Cargo.lock

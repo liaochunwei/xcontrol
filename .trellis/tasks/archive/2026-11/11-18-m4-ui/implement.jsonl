@@ -1,0 +1,4 @@
+{"file": "docs/06-ui.md", "reason": "§3 窗口清单/§4 信息架构与交互规范（即时生效/破坏性确认）/§2 向导触发"}
+{"file": "docs/00-requirements.md", "reason": "FR-6.3/FR-1.1 AC"}
+{"file": ".trellis/spec/rust-platform/ui-tray.md", "reason": "gpui 红线/表单纪律（即时生效/无保存按钮）"}
+{"file": "examples/spike-tray/EVIDENCE.md", "reason": "AX 自动化手法"}

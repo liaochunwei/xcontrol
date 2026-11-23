@@ -1,0 +1,228 @@
+# XControl CI（docs/08 §5）
+#
+# 矩阵：macOS-14 (arm64) / ubuntu-24.04 / windows-2022（MSVC 工具链，不装无关全局依赖）。
+# 步骤：fmt(仅 linux) → cargo-deny(仅 linux) → clippy → 依赖方向自检 → test → build
+#       → llvm-cov 覆盖率(仅 linux，fail-closed ≥85% 行覆盖，docs/08 §4)。
+# 另有 fuzz-smoke job（仅 linux，nightly；cargo-fuzz 编译性检查 + 每目标 20s 冒烟）。
+# 工具链由 rust-toolchain.toml 锁定 1.99（MSRV，docs/08 §2；M0 spike 实测修订，ADR-0001）。
+#
+# 延后项：
+# - gpui 系 crate（xcontrol-app）已落地（11-17-m2-app）。linux job 暂以
+#   `--exclude xcontrol-app` 跳过其编译（见各 cargo 步骤注释）：gpui-pre-linux
+#   默认启用 wayland+x11 后端，依赖 font-kit→freetype/fontconfig 的 *-sys 构建
+#   脚本（pkg-config 探测系统库）与 Vulkan/wgpu 运行链，ubuntu-24.04 runner 未装
+#   libfontconfig-dev/libfreetype6-dev/vulkan 系统包时**构建期即失败**（编译判断
+#   依据，本机无法实测 linux——装机后移除 exclude 并复跑验证，docs/01 §6）。
+#   app 的行为验证由 macOS job 承载（本机同为 macOS）；--loopback headless 冒烟
+#   属运行期步骤，不在 CI 矩阵内。
+# - gpui 系 crate（xcontrol-tray）11-18-m4-tray 落地：gpui-tray 直连（ADR-0001）
+#   经其 `gpui` feature 门控（optional 依赖），**仅 xcontrol-app 开启**——linux
+#   job 排除 app 后该 feature 不激活，xcontrol-tray 保持纯 std + thiserror 编译面
+#   （投影/自启纯逻辑测试在 linux 照常跑，无需追加 exclude）；托盘 gpui 集成的
+#   编译验证由 macOS job 承载（全量 workspace 构建经 app 拉入 gpui feature）。
+#   平台自启后端（launchd/HKCU/XDG）按 crate 内 feature 门控，由下方三平台
+#   feature 步骤各自显式编译验证。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: build-test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml 锁定 1.99 + minimal profile + clippy/rustfmt 组件
+      - name: Install pinned toolchain (1.99)
+        run: rustup toolchain install 1.99 --profile minimal --component clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # docs/08 §2：cargo +nightly fmt（rustfmt.toml 含 nightly-only 选项）
+      - name: rustfmt (linux, nightly)
+        if: runner.os == 'Linux'
+        run: |
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          cargo +nightly fmt --all -- --check
+
+      # linux 附加依赖审查（docs/08 §5）；taiki-e/install-action 下载预编译二进制，不装无关全局依赖
+      - name: Install cargo-deny (linux)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo-deny check (linux)
+        if: runner.os == 'Linux'
+        run: cargo deny check
+
+      # linux 暂排除 xcontrol-app（gpui 系统库缺位，见文件头"延后项"）；
+      # macOS/Windows 全量。app 的质量闸门由 macOS job 完整承载。
+      - name: clippy
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo clippy --workspace --exclude xcontrol-app --all-targets -- -D warnings
+          else
+            cargo clippy --workspace --all-targets -- -D warnings
+          fi
+
+      # 红线审查：xcontrol-proto / xcontrol-core 零平台依赖（docs/08 §1）。
+      # 三平台各跑一次：cargo tree 按 host target 解析，覆盖 target 门控依赖的解析差异。
+      # （check-deps 只做 cargo tree 解析，不编译 gpui，三平台均含 xcontrol-app。）
+      - name: dependency direction audit (xtask check-deps)
+        run: cargo run -p xtask -- check-deps
+
+      - name: test
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo test --workspace --exclude xcontrol-app
+          else
+            cargo test --workspace
+          fi
+
+      # 平台 feature 编译验证（macos runner 专属）：平台模块（input/clipboard/tray）
+      # 默认 build 不编译，缺此步则平台代码只在开发者本机验证（m2-clipboard check 发现）。
+      # tray 的 macos feature = launchd 自启后端（11-18-m4-tray）；gpui feature =
+      # gpui-tray 集成面（与 workspace 全量构建同面——app 已在 mac job 编译，
+      # 此处单 crate 显式复验）。托盘 launchd 实测（#[ignore]）不在 CI 跑：
+      # bootstrap 会短暂加载 launchd job（AC 手动验收）。
+      # 冒烟测试保持 #[ignore]（CI 无辅助功能授权、不侵入真实剪贴板）。
+      - name: clippy + test (macos feature)
+        if: runner.os == 'macOS'
+        run: |
+          cargo clippy -p xcontrol-input -p xcontrol-clipboard --features xcontrol-input/macos,xcontrol-clipboard/macos --all-targets -- -D warnings
+          cargo test -p xcontrol-input -p xcontrol-clipboard --features xcontrol-input/macos,xcontrol-clipboard/macos
+          cargo clippy -p xcontrol-tray --features xcontrol-tray/macos,xcontrol-tray/gpui --all-targets -- -D warnings
+          cargo test -p xcontrol-tray --features xcontrol-tray/macos,xcontrol-tray/gpui
+
+      # 平台 feature 编译验证（windows runner 专属，11-17-m3-input-win 接线；
+      # 11-17-m3-clipboard-win-x11 并入 clipboard 侧）：
+      # platform/windows.rs（input/clipboard）默认 build 不编译——m2-clipboard macos
+      # 步骤同款缺口的 Windows 侧补齐。winkeymap 纯数据测试跨平台可跑（mac/linux
+      # 已覆盖）；此处为 windows crate 绑定面（platform/windows.rs）的编译 + 纯逻辑
+      # 测试。注入类测试 #[ignore]（不侵入 CI runner / 开发机前台应用）；捕获冒烟
+      # 容错设计（hook 被拒只记录不红），LL hook 在 runner 用户会话可安装；
+      # clipboard 监听/冒烟测试在 runner 用户会话照常运行（无授权要求，系统剪贴板
+      # 冒烟 #[ignore]）。
+      - name: clippy + test (windows feature)
+        if: runner.os == 'Windows'
+        run: |
+          cargo clippy -p xcontrol-input --features xcontrol-input/windows --all-targets -- -D warnings
+          cargo test -p xcontrol-input --features xcontrol-input/windows
+          cargo clippy -p xcontrol-clipboard --features xcontrol-clipboard/windows --all-targets -- -D warnings
+          cargo test -p xcontrol-clipboard --features xcontrol-clipboard/windows
+          # tray 的 windows feature = HKCU Run 键自启后端（windows-registry safe
+          # 封装，11-18-m4-tray；target=windows 门控依赖在本步真实编译）。
+          cargo clippy -p xcontrol-tray --features xcontrol-tray/windows --all-targets -- -D warnings
+          cargo test -p xcontrol-tray --features xcontrol-tray/windows
+
+      # 平台 feature 编译验证（linux runner 专属，11-17-m3-input-x11 接线；
+      # 11-17-m3-clipboard-win-x11 并入 clipboard 侧）：
+      # platform/x11.rs（input/clipboard）默认 build 不编译，x11keymap 纯数据测试
+      # 跨平台可跑（mac 已覆盖）。x11rb 纯 Rust bindings（default-features off 不依赖
+      # libxcb/libc），ubuntu runner 无需装系统包；连接类测试按 $DISPLAY 存在性容错
+      # 跳过（runner 无 X 会话），注入/写剪贴板冒烟 #[ignore]（真实事件/真实剪贴板，
+      # CI 不触发——远端实测配方 docs/05 §3.1/§3.2）。
+      - name: clippy + test (x11 feature)
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy -p xcontrol-input --features xcontrol-input/x11 --all-targets -- -D warnings
+          cargo test -p xcontrol-input --features xcontrol-input/x11
+          cargo clippy -p xcontrol-clipboard --features xcontrol-clipboard/x11 --all-targets -- -D warnings
+          cargo test -p xcontrol-clipboard --features xcontrol-clipboard/x11
+          # tray 的 x11 feature = XDG autostart 后端（11-18-m4-tray；纯 std fs，
+          # linux runner 可真实编译——注意 gpui feature 不开，托盘集成面在 mac 验证）。
+          cargo clippy -p xcontrol-tray --features xcontrol-tray/x11 --all-targets -- -D warnings
+          cargo test -p xcontrol-tray --features xcontrol-tray/x11
+          # Wayland 剪贴板 feature（11-19-m5-clipboard-full）：wl-clipboard-rs 纯 Rust
+          # Wayland 客户端（default features = Rust backend，不依赖系统 libwayland），
+          # ubuntu runner 无需装系统包；连接类测试按 WAYLAND_DISPLAY socket 存在性
+          # 容错跳过（runner 无 wayland 会话），写剪贴板冒烟 #[ignore]——远端实测
+          # 配方 platform/wayland.rs 模块文档 + docs/05 §4。
+          cargo clippy -p xcontrol-clipboard --features xcontrol-clipboard/wayland --all-targets -- -D warnings
+          cargo test -p xcontrol-clipboard --features xcontrol-clipboard/wayland
+          # Wayland 输入 feature（11-19-m5-wayland）：ashpd（portal，remote_desktop
+          # 硬依赖 screencast feature——见 spec 卡 Wayland 输入层要点）+ reis（libei
+          # 协议）+ evdev（uinput）全纯 Rust（zbus/nix 无 C 编译步骤），ubuntu
+          # runner 无需系统包；portal 探测/uinput 实机/交互授权测试 #[ignore]（远端
+          # 配方 platform/wayland.rs 模块文档 + docs/05 §4.5）。
+          cargo clippy -p xcontrol-input --features xcontrol-input/wayland --all-targets -- -D warnings
+          cargo test -p xcontrol-input --features xcontrol-input/wayland
+
+      # linux 暂排除 xcontrol-app（同 clippy/test 注释：gpui 系统库缺位）。
+      - name: build
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo build --workspace --exclude xcontrol-app
+          else
+            cargo build --workspace
+          fi
+
+      # docs/08 §4 覆盖率闸门：行覆盖 ≥85%（fail-closed）。llvm-cov 需要
+      # llvm-tools-preview 组件（llvm-tools 已含于 pinned toolchain 的可安装组件）。
+      # linux 同步排除 xcontrol-app（覆盖率口径与编译面一致）。
+      - name: Install cargo-llvm-cov (linux)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: coverage gate ≥85% lines (linux)
+        if: runner.os == 'Linux'
+        run: |
+          rustup component add llvm-tools-preview
+          cargo llvm-cov --workspace --exclude xcontrol-app --summary-only --fail-under-lines 85
+
+  # fuzz 冒烟（docs/02 §8 测试要求、11-16-m1-proto 落地的 fuzz 套件）：
+  # 编译失败算红、运行期发现 crash 输入算红；每目标限时 20s 正常结束由
+  # -max_total_time 控制——外层 `timeout 30` 只是防挂死兜底，超时被杀（exit 124）
+  # 不算失败（冒烟语义 = "能编译 + 短时运行不出 crash"，非穷尽测试）。
+  fuzz-smoke:
+    name: fuzz smoke (linux, nightly)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-fuzz 需要 nightly（-Zsanitizer/build-std）+ rust-src（std 源码参与插桩构建）
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/xcontrol-proto/fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # 目标清单与 crates/xcontrol-proto/fuzz/Cargo.toml 的 [[bin]] 保持同步。
+      - name: Smoke run each fuzz target (20s each; 30s kill-guard is not a failure)
+        working-directory: crates/xcontrol-proto/fuzz
+        run: |
+          for target in frame_decode clip_announce; do
+            status=0
+            timeout 30 cargo +nightly fuzz run "$target" -- -max_total_time=20 || status=$?
+            # 124 = 外层 timeout 兜底触发（挂死被杀）：冒烟语义下不算失败；
+            # 其余非零 = 编译失败或发现 crash 输入 → 红。
+            if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
+              echo "fuzz target $target failed (exit $status)" >&2
+              exit "$status"
+            fi
+            status=0
+          done

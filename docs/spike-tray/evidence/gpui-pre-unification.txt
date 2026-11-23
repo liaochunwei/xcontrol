@@ -1,0 +1,13 @@
+gpui-pre v0.3.12
+├── gpui-base v0.9.1
+│   └── gpui-kit v0.9.1
+│       └── spike-tray v0.1.0 (/Users/csdark/Documents/XControl/examples/spike-tray)
+├── gpui-kit v0.9.1 (*)
+├── gpui-pre-apple v0.3.12
+│   └── gpui-pre-macos v0.3.12
+│       └── gpui-pre-platform v0.3.12
+│           └── gpui-kit v0.9.1 (*)
+├── gpui-pre-macos v0.3.12 (*)
+├── gpui-pre-platform v0.3.12 (*)
+└── gpui-tray v0.3.0
+    └── spike-tray v0.1.0 (/Users/csdark/Documents/XControl/examples/spike-tray)

@@ -1,0 +1,4 @@
+{"file": "docs/02-protocol.md", "reason": "§2 发现三层逐行契约（beacon 负载/周期/并发参数/去重）"}
+{"file": "docs/00-requirements.md", "reason": "FR-5.1/5.2/5.3 验收标准"}
+{"file": "docs/07-security.md", "reason": "§2 无离线 Oracle 原则（发现流量零派生物）"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "net 依赖边界/tokio 范围/白名单单条目规则"}

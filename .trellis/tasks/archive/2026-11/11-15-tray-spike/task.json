@@ -1,0 +1,29 @@
+{
+  "id": "tray-spike",
+  "name": "tray-spike",
+  "title": "托盘 spike：验证 QuitMode::Explicit 与 gpui-tray 兼容性",
+  "description": "M0 硬门禁：验证 gpui-pre 快照含 QuitMode::Explicit（关全部窗口进程存活）；试验 gpui-tray 的 gpui-kit feature 与 gpui-kit 0.9 共存；结论回写 docs/06-ui.md §1 与 ADR-0001（ADR-0001 §决策3）",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "csdark",
+  "assignee": "csdark",
+  "createdAt": "2026-11-15",
+  "completedAt": "2026-11-16",
+  "branch": "feat/m0-tray-spike",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "priority": "P0",
+    "dev_type": "spike"
+  }
+}

@@ -1,0 +1,4 @@
+{"file": "docs/04-clipboard.md", "reason": "§5 防回环逐条核对"}
+{"file": "docs/00-requirements.md", "reason": "FR-4.1 AC"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "门控红线"}
+{"file": ".trellis/spec/rust-core/testing.md", "reason": "覆盖门槛"}

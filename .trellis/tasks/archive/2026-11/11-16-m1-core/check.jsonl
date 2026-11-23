@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "core 红线核对"}
+{"file": ".trellis/spec/rust-core/testing.md", "reason": "覆盖率门槛"}
+{"file": "docs/02-protocol.md", "reason": "心跳/协商/会话语义对照"}
+{"file": "docs/03-input.md", "reason": "修饰键/顺序不变量对照"}

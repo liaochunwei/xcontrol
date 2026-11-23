@@ -1,0 +1,5 @@
+{"file": "docs/05-platform.md", "reason": "§1 macOS API 矩阵（捕获/注入/权限/光标逐行契约）"}
+{"file": "docs/03-input.md", "reason": "§2 XKey 体系与 kVK 转换表要求、§3 事件模型"}
+{"file": "docs/02-protocol.md", "reason": "§4.2 kind 表（f64 累加器语义/mods 位掩码）"}
+{"file": "docs/08-engineering.md", "reason": "InputSource/InputSink 命名、unsafe 规则（§2）"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "平台 feature 门控红线、async 边界（红线 3）"}

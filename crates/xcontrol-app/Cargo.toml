@@ -1,0 +1,64 @@
+[package]
+name = "xcontrol-app"
+description = "gpui UI + 进程入口（bin）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# 依赖方向（docs/08 §1）：app → 所有 crate。gpui / gpui-kit 只在此 crate 引入（ADR-0001），
+# 且 root Cargo.toml 的 dev profile 为 gpui 系 crate 设 opt-level = 3。
+# UI 是 AppState 快照的纯投影：只读 watch 流 + CoreHandle 命令，禁止直连网络/平台层。
+[dependencies]
+xcontrol-proto.workspace = true
+# std-paths：bin 侧开启（default_config_path/default_data_dir，docs/01 §5；
+# config Cargo.toml 注明的开启方式）。
+# keychain：OS 钥匙串真接线（11-19-m6-security，docs/07 §3.3）——安全码默认
+# keychain 存储，不可用时 UI/向导回退 file 0600；cli 不开（--status 只读引用）。
+xcontrol-config = { workspace = true, features = ["std-paths", "keychain"] }
+# mock-platform：--loopback 进程内演示消费 ScriptedInputSource/RecordingInputSink
+# （docs/08 §4 回环链路的 app 层组装；仅进本 bin，不影响 proto/core 红线树）。
+xcontrol-core = { workspace = true, features = ["mock-platform"] }
+xcontrol-net.workspace = true
+xcontrol-input.workspace = true
+xcontrol-clipboard.workspace = true
+# gpui feature：托盘集成面（gpui-tray 直连 + 菜单/图标模块，11-18-m4-tray）——
+# 仅本 crate 开启；linux CI 排除 app 后 xcontrol-tray 保持纯 std 编译面。
+xcontrol-tray = { workspace = true, features = ["gpui"] }
+# 文案表（FR-6.5，11-19-m6-release）：UI 层文案 tr() 化（设置页/向导/确认模态/
+# 窗口标题）；语言状态进程全局——启动读 config [general].language、
+# RuntimeConfigUpdate 消费点热切（与 log_level 同点）。
+xcontrol-i18n.workspace = true
+# 11-17-m2-app 过审（ADR-0001 / docs/06 §1）：gpui-kit 唯一 gpui 入口，
+# default-features off 照抄 examples/spike-tray 已验证组合（M0 EVIDENCE）。
+gpui-kit.workspace = true
+# 日志（docs/06 §6）：tracing 门面 + fmt subscriber + 滚动文件（M3 NFR-8）；
+# bin 顶层 anyhow（error-handling.md 规则 2）。
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+anyhow.workspace = true
+# tokio：session_rt 的执行域（docs/01 §2 网络/核心服务归 tokio；UI 主线程归 gpui，
+# 两者经 state.rs 的 watch/mpsc 单向桥接——tokio::sync 原语不依赖 tokio 运行时，
+# gpui 侧可安全 await）。feature 子集：多线程运行时 + select!/time + sync 通道；
+# net feature 不需要（TCP 由 xcontrol-net 封装）。
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+# 平台 feature 聚合口（docs/08 §3）：构建脚本按目标平台自动选择，
+# 平台 feature 逐一转发到 input / clipboard / tray。
+[features]
+macos = ["xcontrol-input/macos", "xcontrol-clipboard/macos", "xcontrol-tray/macos"]
+windows = ["xcontrol-input/windows", "xcontrol-clipboard/windows", "xcontrol-tray/windows"]
+x11 = ["xcontrol-input/x11", "xcontrol-clipboard/x11", "xcontrol-tray/x11"]
+wayland = ["xcontrol-input/wayland", "xcontrol-clipboard/wayland", "xcontrol-tray/wayland"]
+
+[lints]
+workspace = true
+
+# gpui_kit::test UI 集成测试面（11-18-m4-ui）：headless 窗口 + 按元素 id 真实事件
+# 派发 + AX 标签查询（find_by_label 与 AccessKit 同源）——向导/设置页交互全链路
+# 在 `cargo test -p xcontrol-app` 内可重复验证；仅测试目标生效（feature 并集只
+# 影响测试构建）。
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }

@@ -1,0 +1,4 @@
+    Checking gpui-pre-util v0.3.11
+error[E0658]: use of unstable library feature `slice_as_array`
+For more information about this error, try `rustc --explain E0658`.
+error: could not compile `gpui-pre-util` (lib) due to 1 previous error

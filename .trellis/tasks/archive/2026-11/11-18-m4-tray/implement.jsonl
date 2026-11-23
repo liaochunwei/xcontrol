@@ -1,0 +1,5 @@
+{"file": "docs/06-ui.md", "reason": "§5.1 图标状态机/§5.2 菜单固定顺序/§1 gpui-tray 直连定稿"}
+{"file": "docs/00-requirements.md", "reason": "FR-6.1 AC（状态 ≤1s/菜单项）"}
+{"file": "examples/spike-tray/src/bin/spike-b.rs", "reason": "gpui-tray API 实测锚（menu-state 用法）"}
+{"file": "examples/spike-tray/EVIDENCE.md", "reason": "spike B 证据与 osascript AX 自动化手法"}
+{"file": ".trellis/spec/rust-platform/ui-tray.md", "reason": "托盘事件流定稿语义"}

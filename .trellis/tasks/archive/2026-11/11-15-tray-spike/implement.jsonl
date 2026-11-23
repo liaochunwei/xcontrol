@@ -1,0 +1,3 @@
+{"file": "docs/06-ui.md", "reason": "托盘选型与 spike 验收清单(§8)"}
+{"file": "docs/adr/0001-gpui-and-tray.md", "reason": "决策内容与跟踪项"}
+{"file": ".trellis/spec/rust-platform/ui-tray.md", "reason": "gpui 依赖红线"}

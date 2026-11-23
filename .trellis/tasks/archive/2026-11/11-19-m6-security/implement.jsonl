@@ -1,0 +1,3 @@
+{"file": "docs/07-security.md", "reason": "§5 自查清单 + 策略"}
+{"file": "docs/00-requirements.md", "reason": "FR-5.4/5.5/6.4 AC"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "红线"}

@@ -1,0 +1,2 @@
+{"file": "docs/00-requirements.md", "reason": "NFR 对照"}
+{"file": ".trellis/spec/rust-core/testing.md", "reason": "基准门槛"}

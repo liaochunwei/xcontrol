@@ -1,0 +1,45 @@
+[package]
+name = "xcontrol-tray"
+description = "托盘适配层：核心状态快照 → 图标/菜单投影 + 三平台开机自启（gpui-tray 直连，ADR-0001）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# 依赖方向（docs/08 §1，11-18-m4-tray 修订）：本 crate 不再依赖 proto/config——
+# 投影输入 TraySnapshot 为 crate 内轻量类型（app 层从 AppState 转换），可测性优先；
+# gpui 系经 `gpui` feature 门控（gpui-tray 直连，ADR-0001），仅 xcontrol-app 开启。
+[dependencies]
+# AutostartError（error-handling.md 规则 1：库 crate 用 thiserror 定义错误枚举）。
+thiserror.workspace = true
+# 文案表（FR-6.5，11-19-m6-release）：菜单/状态头/tooltip 文案 tr() 化——纯 std
+# 零依赖，投影面（project.rs/menu.rs）直接消费；语言状态进程全局（app 启动与
+# RuntimeConfigUpdate 消费点 set_language，本 crate 只读）。
+xcontrol-i18n.workspace = true
+# gpui 直连（11-18-m4-tray 过审）：gpui-kit 唯一 gpui 入口（ADR-0001）+ gpui-tray
+# 托盘集成（docs/06 §1 定稿；feature 组合 = M0 spike 已验证组合，EVIDENCE §B）。
+# optional：仅 `gpui` feature 拉入编译——linux CI 排除 app 后本 crate 保持纯 std 编译面。
+gpui-kit = { workspace = true, optional = true }
+gpui-tray = { workspace = true, optional = true }
+
+# windows-registry：HKCU Run 键自启（docs/05 §2；微软官方 safe 封装——本 crate 保持
+# forbid(unsafe_code)，无需平台绑定层放行）。按 target 二级门控（architecture-rules
+# 红线 2 的依赖侧先例：非 windows 目标即使误开 windows feature 也不拉入编译）。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-registry.workspace = true
+
+# 平台 feature 名与模块名固定（docs/08 §3）：自启平台后端位于 autostart/{macos,windows,linux}.rs。
+# - macos：launchd agent（~/Library/LaunchAgents plist；纯 std：fs + launchctl Command）
+# - windows：HKCU Run 键（windows-registry）
+# - x11 / wayland：linux 桌面会话共用的 XDG autostart（纯 std fs；两者映射同一实现）
+# - gpui：gpui-tray 集成（图标渲染/菜单构建/TrayIcon 生命周期）——仅 app 开启
+[features]
+macos = []
+windows = []
+x11 = []
+wayland = []
+gpui = ["dep:gpui-kit", "dep:gpui-tray"]
+
+[lints]
+workspace = true

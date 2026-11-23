@@ -1,0 +1,58 @@
+[package]
+name = "xcontrol-net"
+description = "发现（UDP 广播/mDNS）、传输（TCP/QUIC）、加密"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# 依赖方向（docs/08 §1）：→ xcontrol-proto, xcontrol-config。
+# 本 crate 是 tokio 运行时的归属地之一（网络/发现/扫描/心跳，docs/01 §2）；
+# M1 的回环传输与 Noise 握手为同步实现、零 tokio（design.md 决策：M2 引入真实
+# TCP 时再评估把 Transport 升级为 async）。
+[dependencies]
+xcontrol-proto.workspace = true
+xcontrol-config.workspace = true
+# 11-16-m1-net 过审（docs/02 §3、ADR-0002）：snow（Noise 握手/传输态）、
+# argon2（PSK 派生 KDF，std 最小 feature）、blake3（salt/psk 域分离派生）、
+# thiserror（NetError）。双登记见根 workspace.dependencies + xtask 白名单。
+snow = { workspace = true }
+argon2 = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+# 11-17-m2-tcp 过审（docs/02 §1、ADR-0002 决策 1）：真实 TCP 传输运行时。
+# default-features off + 最小 feature 集（见根 workspace.dependencies 注释）——
+# 本 crate 是 tokio 的唯一归属（docs/01 §2 网络执行域；红线 3：tokio 不进
+# 平台输入层，经 mpsc 桥接——该桥接属 app 层组装，不在本 crate）。
+tokio = { workspace = true }
+# 11-17-m3-discovery 过审（docs/02 §2、ADR-0002 决策 3）：mdns-sd（mDNS 通告/
+# 浏览，自带后台守护线程，announce.rs/browse.rs 桥接进 tokio 执行域）、
+# if-addrs（接口枚举——beacon 逐接口定向广播 + 默认 CIDR 推导，tokio 无此 API）、
+# socket2（发现 UDP 口的 SO_REUSEADDR/REUSEPORT 预绑定选项，双进程同机共存）。
+# 双登记见根 workspace.dependencies + xtask 白名单（并入既有 net 条目，单条目规则）。
+mdns-sd = { workspace = true }
+if-addrs = { workspace = true }
+socket2 = { workspace = true }
+# 11-21 大图断连排查过审：net::transport 层直接观测（流错位重同步锁定候选/
+# 解密失败——net 层静默是本次排查盲区，logging-targets.md 已登记 net::transport）。
+tracing = { workspace = true }
+
+# 发现/传输能力 feature 随传输选型落地引入（选型基线见 docs/01 §6、ADR-0002）。
+[features]
+
+[dev-dependencies]
+# criterion 仅基准（benches/loopback.rs 回环往返延迟）；白名单已登记（11-16-m1-net 过审）。
+criterion = { workspace = true }
+# xcontrol-core 仅集成测试（tests/chain.rs、tests/scenarios.rs：mock 编解码链路消费
+# core 的 Session/Dispatcher/InputSink + mock 平台层 RecordingInputSink，
+# docs/08 §1 生产依赖方向仍为 net → proto + config；mock-platform 只进测试树）。
+xcontrol-core = { workspace = true, features = ["mock-platform"] }
+
+# 回环往返延迟基准（docs/08 §4 性能层；criterion 自定义 harness）
+[[bench]]
+name = "loopback"
+harness = false
+
+[lints]
+workspace = true

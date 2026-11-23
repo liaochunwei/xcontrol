@@ -1,0 +1,3 @@
+{"file": "docs/05-platform.md", "reason": "§3 X11 API 契约（XRecord/XTEST/keycode-8）"}
+{"file": "docs/03-input.md", "reason": "§2 keycode-8=HID 与异常表"}
+{"file": ".trellis/spec/rust-platform/platform-code.md", "reason": "平台纪律"}

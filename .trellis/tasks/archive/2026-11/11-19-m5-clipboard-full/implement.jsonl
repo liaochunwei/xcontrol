@@ -1,0 +1,3 @@
+{"file": "docs/04-clipboard.md", "reason": "FR-4.2/4.3 与格式矩阵"}
+{"file": "docs/05-platform.md", "reason": "§1-§4 剪贴板 API 契约"}
+{"file": ".trellis/spec/rust-platform/platform-code.md", "reason": "剪贴板纪律"}

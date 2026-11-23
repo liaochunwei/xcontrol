@@ -1,0 +1,4 @@
+{"file": "docs/05-platform.md", "reason": "§2 Windows API 契约（hook/SendInput/UIPI/虚拟屏）"}
+{"file": "docs/03-input.md", "reason": "§2 scancode→HID 转换表要求与物理键位原则"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "平台门控红线 2 与红线 3"}
+{"file": ".trellis/spec/rust-platform/platform-code.md", "reason": "平台纪律（macos 先例：门控/lint/回环测试手法）"}

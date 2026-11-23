@@ -1,0 +1,4 @@
+{"file": "docs/02-protocol.md", "reason": "§2 逐条对照"}
+{"file": "docs/07-security.md", "reason": "零派生物断言"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "红线"}
+{"file": ".trellis/spec/rust-core/testing.md", "reason": "覆盖门槛"}

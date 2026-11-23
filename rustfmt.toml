@@ -1,0 +1,7 @@
+# docs/08 §2：`cargo +nightly fmt`（CI 强制）。
+# style_edition 为 stable 选项；下方标注 nightly-only 的选项在 stable 下被忽略并告警，不影响 --check。
+style_edition = "2024"
+
+# nightly-only
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"

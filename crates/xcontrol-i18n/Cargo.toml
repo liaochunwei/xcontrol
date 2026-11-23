@@ -1,0 +1,16 @@
+[package]
+name = "xcontrol-i18n"
+description = "轻量文案表框架（FR-6.5）：tr(key) 静态表 zh-CN/en，零依赖"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# 依赖方向（docs/08 §1，M6 FR-6.5 增补）：零依赖纯 std——xcontrol-tray（纯 std
+# 投影面）与 xcontrol-app（gpui UI 层）各自直接依赖；不进 proto/core 红线树
+# （proto/core 不依赖本 crate，check-deps 全树扫描不受影响）。
+[dependencies]
+
+[lints]
+workspace = true

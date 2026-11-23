@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  scripts/windows/msi/xcontrol.wxs — XControl MSI 安装器定义（WiX v3 schema）
+
+  依据：docs/08 §7（产物 msi，Windows）、docs/10-install.md §2.3/§2.4
+  （防火墙预配置 = 安装器以提升权限承载；幂等语义必须在 custom action 中保留）。
+
+  要点：
+  - 安装目标：ProgramFiles64\XControl\（xcontrol-app.exe + xcontrol-cli.exe +
+    scripts/firewall.ps1）。
+  - 防火墙预配置：安装阶段（deferred + Impersonate=no，提升权限）调用随包安装的
+    scripts/windows/firewall.ps1（幂等——Get-NetFirewallRule 查重后 add，docs/10 §2.4）；
+    卸载阶段以 -Uninstall 对称清理（同脚本，删除前查重——可重入）。
+  - 开始菜单快捷方式（xcontrol-app 入口）。
+  - 升级策略：UpgradeCode 固定（升级线），Product Id="*" 每次构建重生成，
+    MajorUpgrade 拒绝降级。
+  - 预处理器变量：candle -dProductVersion=<semver> -dBinDir=<release 目录>
+    -dRepoRoot=<仓库根>（build.ps1 自动注入）。
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+      Id="*"
+      Name="XControl"
+      Language="1033"
+      Version="$(var.ProductVersion)"
+      Manufacturer="XControl"
+      UpgradeCode="8E4A1C50-6B2E-4B7A-9C31-4F2A9D3E5B10">
+
+    <Package
+        InstallerVersion="500"
+        Compressed="yes"
+        InstallScope="perMachine"
+        Description="XControl — LAN keyboard &amp; mouse sharing and clipboard sync"
+        Manufacturer="XControl"/>
+
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
+
+    <MediaTemplate EmbedCab="yes"/>
+
+    <Feature Id="ProductFeature" Title="XControl" Level="1">
+      <ComponentGroupRef Id="ProductBinaries"/>
+      <ComponentGroupRef Id="FirewallScriptGroup"/>
+      <ComponentRef Id="StartMenuShortcut"/>
+    </Feature>
+
+    <!-- 安装/卸载：防火墙预配置与对称清理（提权执行 firewall.ps1——幂等语义在脚本本体）。
+         11-20 check 修正：MSI FileRef 型 EXE custom action（type 34）= CreateProcess
+         直接启动安装的文件——.ps1 不是 Win32 可执行文件，必失败（error 1721）。改为
+         标准两段式：SetProperty（type 51）存完整命令行（powershell.exe 启动器），
+         deferred 型按 Property 取命令行执行（type 50，MSI 文档 "EXE specified by a
+         property value"）。[#FirewallScriptFile]/目录属性在脚本生成期格式化，deferred
+         语义可用。Windows 侧实跑验证仍属移交项（docs/10 §2.6）。 -->
+    <SetProperty
+        Id="FirewallPreconfigureCmd"
+        Value='&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -ExecutionPolicy Bypass -NoProfile -File &quot;[#FirewallScriptFile]&quot;'
+        Before="FirewallPreconfigure"
+        Sequence="execute"/>
+    <CustomAction
+        Id="FirewallPreconfigure"
+        Property="FirewallPreconfigureCmd"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check"/>
+
+    <SetProperty
+        Id="FirewallCleanupCmd"
+        Value='&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -ExecutionPolicy Bypass -NoProfile -File &quot;[#FirewallScriptFile]&quot; -Uninstall'
+        Before="FirewallCleanup"
+        Sequence="execute"/>
+    <CustomAction
+        Id="FirewallCleanup"
+        Property="FirewallCleanupCmd"
+        Execute="deferred"
+        Impersonate="no"
+        Return="ignore"/>
+
+    <InstallExecuteSequence>
+      <Custom Action="FirewallPreconfigure" After="InstallFiles">NOT Installed</Custom>
+      <Custom Action="FirewallCleanup" After="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+
+    <!-- 最小安装 UI（WixUIExtension；无许可页——MIT OR Apache-2.0 随包分发）。 -->
+    <UI>
+      <UIRef Id="WixUI_Minimal"/>
+    </UI>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="XControl">
+          <Directory Id="INSTALLSCRIPTDIR" Name="scripts"/>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="STARTMENUDIR" Name="XControl"/>
+      </Directory>
+    </Directory>
+  </Product>
+
+  <Fragment>
+    <ComponentGroup Id="ProductBinaries">
+      <Component Directory="INSTALLDIR" Id="AppExe" Guid="1E7D3F60-9C2A-4E1B-8D45-3A9B7C6E2011">
+        <File Id="AppExeFile" Name="xcontrol-app.exe" Source="$(var.BinDir)\xcontrol-app.exe" KeyPath="yes" Checksum="yes"/>
+      </Component>
+      <Component Directory="INSTALLDIR" Id="CliExe" Guid="1E7D3F60-9C2A-4E1B-8D45-3A9B7C6E2012">
+        <File Id="CliExeFile" Name="xcontrol-cli.exe" Source="$(var.BinDir)\xcontrol-cli.exe" KeyPath="yes" Checksum="yes"/>
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="FirewallScriptGroup">
+      <Component Directory="INSTALLSCRIPTDIR" Id="FirewallScriptComponent" Guid="1E7D3F60-9C2A-4E1B-8D45-3A9B7C6E2013">
+        <File Id="FirewallScriptFile" Name="firewall.ps1" Source="$(var.RepoRoot)\scripts\windows\firewall.ps1" KeyPath="yes"/>
+      </Component>
+    </ComponentGroup>
+
+    <DirectoryRef Id="STARTMENUDIR">
+      <Component Id="StartMenuShortcut" Guid="1E7D3F60-9C2A-4E1B-8D45-3A9B7C6E2014">
+        <Shortcut
+            Id="AppShortcut"
+            Name="XControl"
+            Description="LAN keyboard &amp; mouse sharing"
+            Target="[INSTALLDIR]xcontrol-app.exe"
+            WorkingDirectory="INSTALLDIR"/>
+        <RemoveFolder Id="RemoveStartMenuDir" Directory="STARTMENUDIR" On="uninstall"/>
+        <RegistryValue Root="HKCU" Key="Software\XControl" Name="shortcut" Type="integer" Value="1" KeyPath="yes"/>
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

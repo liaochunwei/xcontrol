@@ -1,0 +1,4 @@
+{"file": "docs/04-clipboard.md", "reason": "§3 传输流程、§4 变化监听（250ms/changeCount）、§5 防回环三防线"}
+{"file": "docs/05-platform.md", "reason": "§1 macOS 剪贴板 API 契约（arboard + objc2-app-kit）"}
+{"file": "docs/00-requirements.md", "reason": "FR-4.1 验收标准（<200ms/空剪贴板/超时）"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "feature 门控红线"}

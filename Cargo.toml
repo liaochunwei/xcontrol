@@ -1,0 +1,395 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+# cargo-fuzz 脚手架是独立 workspace（11-16-m1-proto：fuzz/Cargo.toml 自带空 [workspace]，
+# 不进 members glob 也不进 check-deps 扫描——libFuzzer/nightly 依赖不进主依赖图）。
+exclude = ["crates/xcontrol-proto/fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# MSRV：1.99（M0 spike 实测修订 2026-11-16：gpui-pre 0.3.12 在 1.92/1.95 编译失败、stable 1.99.1 通过；
+# 原调研"MSRV 1.92"断言有误，见 docs/08 §2 与 ADR-0001 更新记录），rust-toolchain.toml 三平台锁定同版。
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# M0 脚手架阶段零第三方依赖；外部依赖随首个真实实现按 docs/01 §6 基线回填至此。
+# 新增依赖双登记（architecture-rules.md）：① 此处 ② xtask RED_LINE_ALLOWED_DEPS 白名单，
+# 漏 ② 会被 CI 三平台的 `cargo run -p xtask -- check-deps` 闸门拦下。
+[workspace.dependencies]
+# 内部 crate 统一登记（path + version，供 cargo-deny 与发布使用）；依赖方向见 docs/08 §1。
+xcontrol-proto = { path = "crates/xcontrol-proto", version = "0.1.0" }
+xcontrol-config = { path = "crates/xcontrol-config", version = "0.1.0" }
+# --- 第三方（xcontrol-config 首批落地，docs/01 §5/§6、docs/08 §2：配置文件 toml + serde） ---
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+thiserror = "2"
+# --- 第三方（11-16-m1-proto 任务过审：XCP 帧层与消息编解码，docs/02 §4） ---
+# postcard：控制/剪贴板消息序列化（docs/02 §0 选型：稳定 wire format、体积最小）；
+# serde derive 需要直接依赖 serde（postcard 的 serde 前端不提供 derive 宏）。
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+# criterion：仅 xcontrol-proto 的 dev-dep（benches 编解码吞吐，docs/08 §4 性能层）。
+# default-features off：不取 plotters/rayon/is-terminal，收窄 dev 依赖树（check-deps 以 --edges normal,dev 扫描）。
+# 锁定理由（11-16-m1-proto 实证）：criterion 0.7 在 default-features=false + cargo_bench_support
+# 下 dev 依赖树不含 libc/平台传递依赖；criterion 大版本升级可能重新引入（is-terminal→rustix/libc
+# 之类路径），check-deps（fail-closed）会拦截——届时须重新评估 feature 组合，不得直接放开白名单。
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+# dirs 仅供 xcontrol-config 的 `std-paths` feature（平台标准目录解析）使用，
+# 且为可选依赖：其传递依赖（unix libc / windows windows-sys）在 xtask
+# FORBIDDEN_PACKAGES 黑名单内，不得进入 proto/core 的全依赖树。
+dirs = "6"
+# blake3：xcontrol-core 的 session_id 派生（docs/02 §3.3：session_id = BLAKE3(hs_hash)[0..16]，
+# 会话语义属 core；blake3 为纯软实现、无 I/O，不违红线）。默认 feature 即可；
+# 传递树仅 constant_time_eq/cfg-if 纯库，已过 check-deps 全树黑名单扫描。
+blake3 = "1"
+# --- 第三方（11-16-m1-net 任务过审：Noise 加密与回环传输，docs/02 §3、ADR-0002） ---
+# snow：Noise 协议实现（Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s，ADR-0002 决策 2；
+# 内建 nonce 管理/rekey/重放防护，禁止自造 AEAD 层）。default-features off 收窄传递树：
+# snow 的 `std` feature 会被上游 `ring/std` 连带激活 ring（C/asm 后端），本 crate 自身
+# 用 std，不需要 snow 的 no_std 兼容层背书——仅取 XXpsk0 所需三原语 + getrandom：
+# blake2（BLAKE2s）/chacha20poly1305（ChaChaPoly）/curve25519-dalek（25519）均纯软实现，
+# 无 ring/sha2/aes-gcm。getrandom→libc 是 OS 熵源生态惯例（net 是网络 crate，非红线，
+# libc 不进 proto/core 红线树）。
+snow = { version = "0.10", default-features = false, features = [
+    "use-blake2",
+    "use-chacha20poly1305",
+    "use-curve25519",
+    "use-getrandom",
+] }
+# argon2：PSK 派生的内存困难 KDF（docs/02 §3.1 OWASP 基线 m=19MiB t=2 p=1）。
+# default-features off + 仅 alloc（最小可编译组合）：hash_password_into 要求 alloc，
+# 而上游 0.5.x 的 alloc = ["password-hash/alloc"]（非 ?/ 语法）会连带 password-hash
+# （+base64ct，均纯软 no_std 库，不在黑名单）——std 组合只会再多带 password-hash/std，
+# 故取最小。0.6.0 暂不升级（新版本待观察，0.5.3 广泛验证）。
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# --- 第三方（11-17-m2-tcp 任务过审：真实 TCP 传输，docs/02 §1、ADR-0002 决策 1） ---
+# tokio：网络/发现运行时（docs/01 §2：net 归 tokio 多线程执行域；async 边界红线
+# architecture-rules.md 红线 3——tokio 只进网络层，proto/core 永不见 tokio）。
+# default-features off + 按需最小集：rt-multi-thread（生产多线程执行域）+ net（TCP）
+# + io-util（read_exact/write_all 分帧）+ time（握手 5s timeout）+ sync（serve 连接
+# 分发 mpsc）+ macros（#[tokio::main]/#[tokio::test]。全 rt 系功能仅 xcontrol-net
+# 消费）。传递树 mio/windows-sys 属 net 合法平台依赖（红线全树黑名单扫描只针对
+# proto/core，不触 net）；11-17-m2-tcp 实测传递树：mio/pin-project-lite/bytes 等
+# 均不在 FORBIDDEN_PACKAGES。双登记：此处 + xtask RED_LINE_ALLOWED_DEPS。
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "macros",
+    "time",
+    "sync",
+] }
+xcontrol-core = { path = "crates/xcontrol-core", version = "0.1.0" }
+xcontrol-net = { path = "crates/xcontrol-net", version = "0.1.0" }
+xcontrol-input = { path = "crates/xcontrol-input", version = "0.1.0" }
+xcontrol-clipboard = { path = "crates/xcontrol-clipboard", version = "0.1.0" }
+xcontrol-tray = { path = "crates/xcontrol-tray", version = "0.1.0" }
+# 轻量文案表框架（FR-6.5，11-19-m6-release）：零依赖纯 std，tray 投影面与 app UI
+# 层各自直接依赖；不进 proto/core 红线树（check-deps 全树扫描不受影响）。
+xcontrol-i18n = { path = "crates/xcontrol-i18n", version = "0.1.0" }
+# --- 第三方（11-17-m2-input-macos 任务过审：macOS CGEventTap/CGEventPost 输入层，docs/05 §1、ADR-0003） ---
+# core-graphics / core-foundation：servo 绑定（苹果官方框架的薄封装），仅 xcontrol-input 的
+# `macos` feature 消费（feature 门控红线，architecture-rules 红线 2），且依赖再按
+# target = "macos" 二级门控——非 macOS 目标即使误开 feature 也不拉入编译。
+# 版本：0.25 / 0.10 配对基线（docs/01 §6 未钉死版本号；API 签名以 docs.rs 0.25 实测为准，
+# 11-17-m2-input-macos 已逐签名核实：CGEventTap::new 闭包式回调 + CFRunLoop Send/Sync +
+# new_scroll_event 在 `highsierra` feature 后）。事件 tap 的 unsafe FFI 全部封装在这两个
+# crate 内部；本仓代码仅 AXIsProcessTrustedWithOptions 一处自声明 extern（platform/macos.rs）。
+# 传递树含 bitflags-2（CGEventFlags）与 core-foundation-sys（不进 proto/core 红线树，
+# input 不被 core 依赖，全树黑名单扫描不覆盖 input——xtask GATED_CRATES 注释同此）。
+core-graphics = { version = "0.25", features = ["highsierra"] }
+core-foundation = "0.10"
+# --- 第三方（11-17-m2-clipboard-macos 任务过审：macOS 文本剪贴板，docs/05 §1、docs/04 §4/§5） ---
+# arboard：剪贴板读写高层封装（docs/05 §0 矩阵行"剪贴板读写"——mac NSPasteboard /
+# win32 / X11 三 selections / Wayland data-control 各后端统一抽象；FR-4.1 文本路径）。
+# default-features off：默认 image-data 会连带 image/png+tiff+jpeg 解码栈与
+# objc2-core-graphics/windows-sys——M2 只做文本（FR-4.1）未启用；11-19-m5-clipboard-full
+# 起 macos/windows/x11 平台 feature 补开 "image-data"（FR-4.2/4.3，读写 RGBA 内存
+# 形态，与线格式 PNG 字节的互转在本仓公共 png_codec 完成）。image-data 的传递树
+# 增量（mac 目标）：objc2-core-graphics/objc2-core-foundation + image 0.25（tiff
+# 后端）——image 与 png 0.18 已在 lock（gpui-pre→image 0.25.10→png 0.18.1 传递，
+# 同版合并零新增版本）；Linux 目标 arboard image-data 仅 image(png feature)；wayland
+# feature 不用 arboard（直依赖 wl-clipboard-rs，见下）。仅 macos/windows/x11
+# feature + target 双门控（dep:arboard 可选——未开任何平台 feature 不进编译）。
+arboard = { version = "3", default-features = false }
+# objc2-app-kit：NSPasteboard.changeCount 原生轮询（mac 无剪贴板变化通知 API，
+# docs/04 §4；arboard 不暴露 changeCount）+ M5 HTML 挂载（public.html，FR-4.3）。
+# default-features off + std/NSPasteboard——0.3.2 生成绑定中 setString_forType/
+# stringForType/clearContents 为**安全方法**、NSPasteboardTypeHTML 为安全 extern
+# static（objc2 0.6 绑定已消除 msg_send unsafe），mac public.html 写入零 unsafe
+# （11-19-m5-clipboard-full 查证裁定）。仅 macos feature + target 双门控（同
+# core-graphics 待遇）；objc2 系是纯 Rust bindings（无 C 编译步骤），签名已对
+# docs.rs 0.3.2 逐项核实：generalPasteboard()/changeCount() 无 MainThreadMarker，
+# NSPasteboard 非 MainThreadOnly（后台轮询线程合法）。
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSPasteboard",
+] }
+# objc2 / objc2-foundation：M5 mac HTML 挂载的直接依赖（11-19-m5-clipboard-full）。
+# objc2：rc::autoreleasepool——NSPasteboard ObjC 调用纪律（.trellis/spec
+# rust-platform/platform-code.md"macOS 剪贴板要点"：M5 加 ObjC 调用必须包池），
+# std feature 即够。objc2-foundation：NSString::from_str（feature NSString）——
+# public.html 写入的字符串载体；两者与 objc2-app-kit 0.3.2 的传递依赖同版同源
+# （objc2 0.6 / objc2-foundation 0.3 单版本，无版本分裂），仅 macos feature +
+# target 双门控。
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+] }
+# --- 第三方（11-17-m3-input-win 任务过审：Windows 输入层，docs/05 §2、ADR-0003 决策 1） ---
+# windows：微软官方 Win32 bindings（Rust 生成，纯 Rust 无 C 编译步骤，docs/01 §6 平台行
+# "`windows`（win）" 的具体化——docs/01 未钉版本号，取当前 stable 0.62）。消费方：
+# xcontrol-input（LL hook/SendInput）与 xcontrol-clipboard（AddClipboardFormatListener
+# 消息窗口监听，11-17-m3-clipboard-win-x11 并入）的 `windows` feature（feature 门控
+# 红线，architecture-rules 红线 2），且依赖再按 target = "windows" 二级门控——非
+# Windows 目标即使误开 feature 也不拉入编译（同 core-graphics 待遇）。default-features
+# off + feature 集由消费 crate 按需声明（arboard 先例：基座登记在 workspace，feature
+# 选择贴近消费方）；input 侧最小集 = Foundation / LibraryLoader / Threading /
+# KeyboardAndMouse / WindowsAndMessaging，clipboard 侧最小集 = Foundation /
+# DataExchange / WindowsAndMessaging / LibraryLoader / Threading / Graphics_Gdi
+# （0.62 源码逐项核实，见各自 platform/windows.rs 模块文档）。传递树仅 windows-core/
+# windows-strings 等微软自系 bindings，不进 proto/core 红线树（input/clipboard 不被
+# core 依赖，全树黑名单扫描不覆盖——xtask GATED_CRATES 注释同此）。
+windows = { version = "0.62", default-features = false }
+# --- 第三方（11-17-m3-input-x11 任务过审：Linux X11 输入层，docs/05 §3、ADR-0003） ---
+# x11rb：纯 Rust X11 bindings（不依赖 libxcb/X11 C 库；default-features off 时传递树仅
+# x11rb-protocol + gethostname/rustix（连接与 Xauthority 的纯 Rust socket I/O，libc 不进
+# 树）——`allow-unsafe-code` feature 未开则 crate 内部 #![forbid(unsafe_code)]）。
+# 消费方：xcontrol-input（record+xtest）与 xcontrol-clipboard（xfixes 剪贴板监听，
+# 11-17-m3-clipboard-win-x11 并入）的 `x11` feature（feature 门控红线，architecture-rules
+# 红线 2），且依赖再按 target = "linux" 二级门控——非 Linux 目标即使误开 feature 也不
+# 拉入编译（windows crate 待遇）。feature 集为两消费方并集（cargo 共享登记并集语义）：
+# record（XRecord 被动捕获）、xtest（XTEST 注入）、xfixes（XFixesSelectSelectionInput
+# 剪贴板变化监听，docs/05 §3 剪贴板行）。版本取 0.13：与 gpui 传递树中的 x11rb 0.13.2
+# 同版（Cargo.lock 已存在，不引入第二版本）。
+# API 签名逐项对 registry 源码 0.13.2 核实（2026-11-17，见各 platform/x11.rs 模块文档）：
+# xtest_fake_input(type_: u8, detail: u8, time, root, root_x: i16, root_y: i16, deviceid)、
+# record_create_context(...)/record_enable_context -> RecordEnableContextCookie（阻塞式
+# Iterator<Item=Result<EnableContextReply>>，category==5=EndOfData 终止）、
+# xfixes_select_selection_input(window, selection, SelectionEventMask)（Event::Xfixes
+# SelectionNotify 变体经 RustConnection::wait_for_event 到达）、xproto
+# grab_pointer/grab_keyboard/warp_pointer/query_pointer/get_keyboard_mapping/
+# send_event（ClientMessage 停机信号）/intern_atom/create_window。
+# 传递树不在 proto/core 红线树内（input/clipboard 不被 core 依赖，全树黑名单扫描不
+# 覆盖——xtask GATED_CRATES 注释同此）。
+x11rb = { version = "0.13", default-features = false, features = [
+    "record",
+    "xtest",
+    "xfixes",
+] }
+# --- 第三方（11-17-m2-app 任务过审：gpui UI + 日志 + bin 错误处理，docs/06 §1/§6、ADR-0001） ---
+# gpui-kit：gpui 依赖唯一入口（ADR-0001 红线：禁止 gpui-pre/gpui-ce/git 直依赖——
+# 类型必须共享同一版本源）。M2 窗口期 default-features off（spike 已验证最小组合）；
+# 11-18-m4-ui 起开启组件库（default features = component + assets）：Form/Input/Switch/
+# Dropdown/List/Dialog 等 75+ 组件（docs/06 §1 选型），assets 提供组件默认字体/图标。
+# 组件库 gpui-component 0.9.1 的 gpui 依赖同为 gpui-pre =0.3.12——版本源仍单一（check
+# 命令见任务报告）；xtask app 白名单只登记直接依赖 gpui-kit，组件树经其传递（app 为
+# 依赖汇聚点，传递树不参与红线扫描）。
+gpui-kit = { version = "0.9", default-features = true }
+# gpui-tray：托盘集成（11-18-m4-tray 任务过审；docs/06 §1 定稿的 gpui-tray 直连路线，
+# ADR-0001）。default-features off + ["gpui-kit", "menu-state"] = M0 spike 已验证组合
+# （examples/spike-tray/EVIDENCE.md §B）：gpui-kit 后端统一到 gpui-pre 0.3.12 单一版本源
+# （类型与 gpui-kit 共享），menu-state 提供菜单勾选态（MenuItem::checked）。
+# 该依赖是 xcontrol-tray `gpui` feature 的 optional 依赖——仅 xcontrol-app 开启；
+# linux CI 排除 app 后 xcontrol-tray 保持纯 std 编译面（无需 CI exclude 该 crate）。
+# License Apache-2.0；新增传递树 async-channel/log/polling 系均 MIT OR Apache-2.0。
+gpui-tray = { version = "0.3", default-features = false, features = [
+    "gpui-kit",
+    "menu-state",
+] }
+# windows-registry：微软官方注册表 safe 封装（11-18-m4-tray 任务过审，docs/05 §2 自启行
+# ——HKCU Run 键写入/查询/删除）。选它而非 windows crate 的 Win32_System_Registry 面：
+# ① safe API——xcontrol-tray 保持 forbid(unsafe_code)（无需平台绑定层 unsafe 放行）；
+# ② 0.6.1 已在依赖树（gpui-pre-windows 传递），不引入新版本。
+# 仅按 target = "windows" 引入（非 feature 门控——自启是进程级能力，与 UI 平台 feature
+# 解耦）；xtask RED_LINE_ALLOWED_DEPS 同步登记。crate 自身 #![cfg(windows)]，非 windows
+# 目标编译为空。
+windows-registry = "0.6"
+# tracing：结构化日志门面（PRD Requirement 6：子系统命名 app::/session::/net::）。
+# default features（attributes/std）即够；不引 async 桥接。
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+# tracing-subscriber：fmt 层 + EnvFilter（M3 NFR-8 日志任务把 M2 预留的级别化
+# 过滤落地：config [general].log_level + --log-level 覆盖 + XCONTROL_LOG 子系统
+# 指令，net::=debug env 风格）。default-features off 只取 fmt/std/env-filter
+# （不要 tracing-log 桥接）。env-filter 的传递树 matchers→regex-automata/regex-syntax
+# 均纯 Rust、仅进 app/cli 依赖树（不触 proto/core 红线树，11-17-m3-status 过审）。
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "std",
+    "env-filter",
+] }
+# tracing-appender：滚动文件层（M3 NFR-8：daily rotation 写 data_dir/logs/，
+# 前缀 xcontrol.log；保留策略 app 侧自写清理——appender 不带 retention）。
+# 传递树 crossbeam-channel/time 纯软实现，仅进 app 依赖树（不触红线树）。
+tracing-appender = "0.2"
+# serde_json：xcontrol-cli --status --json 的机器可读输出（design.md 定夺：
+# 手写 JSON 的转义负担不值得省，量小、纯 Rust 传递树）。
+serde_json = "1"
+# anyhow：bin 顶层错误处理（error-handling.md 规则 2——main 统一格式化输出；库 crate 禁用）。
+anyhow = "1"
+# --- 第三方（11-19-m6-security 任务过审：OS 钥匙串真接线，docs/07 §3.3） ---
+# keyring：OS 钥匙串统一接口（M0 调研基线 docs/01 §6 即本 crate——选型裁定：
+# 三平台单 API（mac Keychain / win Credential Manager / linux Secret Service），
+# 免三套平台胶水；oo7 纯 DBus 层仅覆盖 linux 且自带 async 运行时负担，不取）。
+# default-features off：按平台启用后端（11-19-m6-security 查树裁定）——
+# apple-native = security-framework（mac）、windows-native = windows-sys（win）、
+# linux = async-secret-service + async-io（Secret Service 经 zbus 4 **纯 Rust**
+# DBus 绑定 + async-io 执行器：免 libdbus C 依赖、免 tokio 进树——对照组
+# sync-secret-service（dbus-secret-service）需系统 libdbus，破坏 mac 侧跨编译
+# 检查；linux-native（内核 keyutils）非 Secret Service 语义，不取）。各 target
+# 只拉自己的平台后端传递树（crate 内 target 门控依赖表）。可选依赖进
+# xcontrol-config 的 `keychain` feature（默认关）：proto/core 红线树零增量，
+# check-deps 默认 feature 面不变；linux 后端经会话总线 DBus（headless 无
+# DBus 时运行时降级 file 回退，docs/07 §3.3）。
+keyring = { version = "3", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "async-secret-service",
+    "async-io",
+    "crypto-rust",
+] }
+# --- 第三方（11-17-m3-discovery 任务过审：发现层，docs/02 §2、ADR-0002 决策 3） ---
+# mdns-sd：mDNS 通告/浏览（docs/02 §2.1：`_xcontrol._tcp.local.` 注册 + TXT；
+# docs/02 §0 选型：mDNS → beacon → 扫描三层发现）。自带后台守护线程 + flume
+# channel（非 tokio 生态，与 net 的 tokio 执行域解耦，桥接见 announce.rs/browse.rs）；
+# log/serde 两个可选依赖不启用（net 层零日志纪律 + TXT 用裸字符串）。传递树
+# fastrand/flume/if-addrs/mio/socket2/socket-pktinfo 均纯软实现或平台 socket
+# 绑定（mio 与 tokio 共享；全树黑名单扫描只针对红线 crate proto/core，不触 net）。
+mdns-sd = "0.22"
+# if-addrs：网络接口枚举（docs/02 §2.1 beacon 须逐接口定向广播；tokio 无接口
+# 枚举 API）。轻量 bindings：unix 走 libc getifaddrs / windows 走 windows-sys
+# （与 mdns-sd 同版本约束 ^0.15，单条目规则不引双版本）。
+if-addrs = "0.15"
+# socket2：发现 UDP socket 的绑定前置选项（SO_REUSEADDR/SO_REUSEPORT）——
+# 主控应答口与从机被动 beacon 监听口同占 UDP 发现端口，双进程同机（演练/
+# 同机双角色部署）需复用绑定共存；不同机部署无冲突、选项无害。mdns-sd 已把
+# socket2 0.6 带入传递树，不新增版本。
+socket2 = "0.6"
+# --- 第三方（11-19-m5-clipboard-full 任务过审：PNG 编解码 + Wayland 剪贴板，docs/04 §2、docs/05 §4） ---
+# png：PNG 编解码（FR-4.2 图片线格式——平台 RGBA 内存形态与 wire PNG 字节互转；
+# xcontrol-clipboard 公共纯逻辑层 png_codec 消费，EchoFilter 图片指纹规范化同样
+# 经其解码，全平台非门控）。**零新增依赖树**：png 0.18.1 已在 lock（gpui-pre→
+# image 0.25.10→png 0.18.1 传递，同版同源无第二版本）；选它而非 image crate 本体
+# （编解码面远大于需求）或手写（zlib/fdeflate 不可手写维护）。传递树
+# bitflags/crc32fast/fdeflate/flate2/miniz_oxide 均已在树纯软实现。
+png = "0.18"
+# wl-clipboard-rs：Wayland 剪贴板读写 + 监听（docs/05 §4 剪贴板行——zwlr_data_control
+# / ext_data_control 协议，Watcher 事件驱动；FR-4.1/4.2/4.3 Wayland 路径）。
+# **必须 0.9.5**：watch 模块（Watcher/ClipboardEvent/CancelHandle）2026-09 落
+# master、0.9.5 首发（0.9.3 及以下无 watch——docs/05 §4 的事件驱动监听不可达；
+# 2026-11-19 对 docs.rs + crates.io 查证）。纯 Rust Wayland 客户端（native_lib/
+# dlopen feature 不开）；wayland-client/backend/protocols(-wlr) 传递树与 gpui 同版
+# 合并；新增包共六个（check-deps 白名单已核）：os_pipe/tree_magic_mini +
+# petgraph 0.8/hashbrown 0.15/foldhash 0.1（tree_magic_mini 的 mime 层级图与哈希
+# 传递——纯软/数据，无 unsafe 底层）。仅 xcontrol-clipboard 的 wayland feature +
+# target = linux 双门控。
+wl-clipboard-rs = { version = "0.9.5", default-features = false }
+# --- 第三方（11-19-m5-wayland 任务过审：Wayland 输入捕获/注入/热键，docs/05 §4、ADR-0003）---
+# ashpd：XDG portals 封装（docs/05 §4.1 portal 路径三件套：InputCapture 捕获会话 +
+# RemoteDesktop 注入会话 + GlobalShortcuts 热键注册 + Clipboard 能力探测）。
+# **零新增版本**：0.13.13 已在 lock（gpui-pre-linux/gpui-base→ashpd 传递 + oo7），
+# 同版合并。feature 集：tokio（zbus 运行时——本仓 tokio 执行域，docs/01 §2；
+# ashpd default 即 tokio）+ input_capture/global_shortcuts/remote_desktop/screencast/
+# clipboard（per-portal 编译门控；screencast 为 remote_desktop 模块的硬依赖——
+# 其 `use super::screencast::Stream` 无 feature 门控，0.13.13 源码核实）。签名逐项对 registry 源码 0.13.13 核实（2026-11-19，
+# 见 platform/wayland.rs 模块文档）：InputCapture::create_session(None, opts) ->
+# (Session, BitFlags<Capabilities>)、zones()/set_pointer_barriers(&[Barrier],
+# zone_set, opts) -> Request<_>、enable/disable/release(ReleaseOptions::
+# set_activation_id/set_cursor_position)、connect_to_eis(&session) -> OwnedFd、
+# receive_activated() -> Stream<Activated{activation_id, cursor_position}>；
+# GlobalShortcuts::create_session/bind_shortcuts(&session,
+# &[NewShortcut::new(id, desc).preferred_trigger("Ctrl+Alt+…")], None, opts)、
+# receive_activated() -> Stream<Activated{shortcut_id}>；RemoteDesktop::
+# create_session/select_devices/start/connect_to_eis（portal v2 起）/available_device_types。
+# **异步边界**：portal DBus 调用只在模块内自建 current-thread runtime 的控制线程上
+# 执行（mdns-sd 自带守护线程先例）；事件路径（reis 同步 API + std mpsc）零 async——
+# 回调线程纪律（platform-code.md）保持。传递树 zbus 5.19.0 已在 lock（gpui 同源），
+# 新增包 nix 0.29/bitvec 系（evdev 传递，系统调用 bindings/纯软实现，不进
+# proto/core 红线树）。仅 xcontrol-input 的 wayland feature + target = linux 双门控。
+# runtime feature：**async-io（tokio 不可取）**——11-19-m6-release 实测：gpui-base
+# （gpui-pre-linux）自身启用 ashpd "async-io"（default 面），本仓若取 "tokio" 则
+# feature 统一后两执行器并存 → ashpd compile_error（"You can't enable both async-io
+# & tokio features at once"）。portal 调用面相应由 tokio current-thread runtime
+# 换 async_io::block_on（wayland.rs portal_block_on/race_timeout）。
+ashpd = { version = "0.13", default-features = false, features = [
+    "async-io",
+    "input_capture",
+    "global_shortcuts",
+    "remote_desktop",
+    "screencast",
+    "clipboard",
+] }
+# async-io：xcontrol-input wayland feature 的 portal 执行器（ashpd/zbus async-io
+# 面的 block_on 泵 + Timer 超时竞速）；已在树（gpui-base→ashpd 传递），零新增版本。
+async-io = "2"
+# reis：纯 Rust libei/libeis 协议实现（docs/01 §6 平台行 `ashpd`+`reis` 的具体化；
+# docs/05 §4.1：InputCapture/RemoteDesktop 的 EIS fd 事件通道）。**同步核心 API
+# 为裁定依据**（default-features off = 不拉 tokio/async-io/calloop——事件路径零
+# async，回调线程纪律保持）：reis::handshake::ei_handshake_blocking(&Context, name,
+# ContextType::Receiver|Sender)（阻塞式协商）、ei::Context::new(UnixStream)（EIS
+# fd 直建）、context.read()/pending_event() -> Option<PendingRequestResult<Event>>
+# + event::EiEventConverter::new(&context, resp).handle_event(ei::Event)/next_event()
+# -> Option<EiEvent>（高层事件：PointerMotion{dx,dy}/PointerMotionAbsolute{dx_absolute,
+# dy_absolute}/Button{button=Linux BTN 码,state}/KeyboardKey{key=Linux evdev 码,state}/
+# ScrollDelta{dx,dy}/ScrollDiscrete{discrete_dx,discrete_dy}/KeyboardModifiers/
+# SeatAdded/DeviceAdded/Frame）；发送侧 ei::Device::interface::<ei::Pointer|
+# PointerAbsolute|Scroll|Button|Keyboard|Text>() 取接口代理发请求（Text.utf8 =
+# Unicode 直发，docs/05 §0 Wayland portal 注入行 CAP_UNICODE ✅ 的来源）。
+# 签名逐项对 crates.io 0.7.1 源码核实（2026-11-19 解包对源，platform/wayland.rs
+# 模块文档同录）。仅 xcontrol-input 的 wayland feature + target = linux 双门控。
+reis = { version = "0.7", default-features = false }
+# evdev：Linux uinput 虚拟设备（docs/05 §4.3 兜底注入行"evdev crate evdev::uinput
+# 模块建虚拟键鼠"的具体化）：VirtualDeviceBuilder::new()?.name()?.with_keys(&keys)?
+# .with_relative_axes(&axes)?.with_absolute_axes(&axes)?.build() -> VirtualDevice +
+# device.emit(&[InputEvent])（EV_SYN 由 crate 内部处理）。XKey→evdev 码翻译复用
+# 本 crate 既有 x11keymap::EVDEV_TABLE（keycode = evdev + 8 同源全表，内核
+# hid-input.c 逐项核对），不建第二张表。依赖 libc + nix 0.29（ioctl/fs/event——
+# uinput ioctl 必经路径；nix/bitvec 为新增包，不进 proto/core 红线树——xtask
+# GATED_CRATES 注释同此）。仅 xcontrol-input 的 wayland feature + target = linux
+# 双门控。
+evdev = { version = "0.13", default-features = false }
+# futures-util：ashpd 信号流的 StreamExt 消费（receive_activated().next()——portal
+# 热键/捕获事件循环）。0.3.34 已在 lock（ashpd/tokio 传递），零新增版本；
+# default-features off + std（不用 async-await 兼容层）。仅 xcontrol-input 的
+# wayland feature + target = linux 双门控。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# wayland-client：uinput ABS 域真实分辨率标定（11-22 边缘回切修复轮——wl_output
+# 枚举全部输出的 geometry + 当前 mode 像素尺寸取并集，替换 build_platform_sink
+# 的 (1920,1080) 硬编码：实机 4K 屏下 1920 标定使 delta 粒度粗一倍且到缘不精确）。
+# **零新增版本/包**：0.31 已在 lock（wl-clipboard-rs 与 gpui 传递树同版合并），
+# 本条只是把既有传递依赖提为 xcontrol-input 的按需直接依赖（default-features off
+# = 不取附加 feature；feature 以图内既有声明为准，加法合并不分裂版本）。查询是
+# 连接-枚举-断开的一次性阻塞 roundtrip（构造点调用，非事件热路径）。仅
+# xcontrol-input 的 wayland feature + target = linux 双门控（同 ashpd/reis/evdev
+# 待遇）；wayland-client 系在 FORBIDDEN_PACKAGES 黑名单内——该扫描只针对
+# proto/core 红线树，input 是 GATED 平台边界 crate，直接依赖经 xtask
+# RED_LINE_ALLOWED_DEPS 白名单过审即合法（登记同见彼处注释）。
+wayland-client = { version = "0.31", default-features = false }
+
+[workspace.lints.rust]
+# unsafe 仅允许出现在平台绑定层（xcontrol-input / xcontrol-clipboard 的 feature 门控模块，
+# docs/08 §2）；默认 deny，需要处必须显式 allow 并附 `// SAFETY:` 不变量注释。
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# CI 以 `-D warnings` 执行（docs/08 §2：clippy::unwrap_used 强制限制非测试代码，
+# 测试代码豁免由 clippy.toml 的 allow-unwrap-in-tests / allow-expect-in-tests 提供）。
+unwrap_used = "warn"
+expect_used = "warn"
+# pedantic 子集（docs/08 §2）：M0 空壳阶段先立最小集，随首个真实 crate 代码逐步扩充。
+map_unwrap_or = "warn"
+
+# gpui 系 crate 在 dev profile 必须全量优化，否则 debug 构建卡顿（docs/01 §6、ADR-0001）。
+# package spec 匹配的是 registry 包名：gpui 框架本体 = `gpui-pre`（lib 名 `gpui`，
+# 11-17-m2-app 落地时按解析出的依赖图修正 spec——M0 预置的 `gpui` spec 永不命中，
+# 会一直产生 "did not match any packages" 告警）；gpui-base 是其数据结构底座。
+[profile.dev.package.gpui-pre]
+opt-level = 3
+
+[profile.dev.package.gpui-base]
+opt-level = 3
+
+[profile.dev.package.gpui-kit]
+opt-level = 3

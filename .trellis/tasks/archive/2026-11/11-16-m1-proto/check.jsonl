@@ -1,0 +1,4 @@
+{"file": "docs/02-protocol.md", "reason": "§8 测试要求对照 + wire 契约逐字节核对"}
+{"file": ".trellis/spec/rust-core/protocol-rules.md", "reason": "fixtures/兼容承诺检查"}
+{"file": ".trellis/spec/rust-core/testing.md", "reason": "覆盖率门槛"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "proto 零 I/O 红线"}

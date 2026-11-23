@@ -1,0 +1,4 @@
+{"file": "docs/08-engineering.md", "reason": "§2 日志规范（tracing/滚动文件/脱敏）"}
+{"file": ".trellis/spec/rust-core/error-handling.md", "reason": "错误/日志纪律"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "依赖边界"}
+{"file": "docs/00-requirements.md", "reason": "NFR-8 验收"}

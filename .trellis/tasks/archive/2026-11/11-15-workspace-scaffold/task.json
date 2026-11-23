@@ -1,0 +1,29 @@
+{
+  "id": "workspace-scaffold",
+  "name": "workspace-scaffold",
+  "title": "Workspace 脚手架与三平台 CI 矩阵",
+  "description": "M0：建 10 个成员（7 lib + 2 bin + xtask）空实现 + rust-toolchain(1.92) + rustfmt/clippy/deny 配置 + GitHub Actions 三平台矩阵（mac arm64 / ubuntu / windows），M0 出口条件",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "csdark",
+  "assignee": "csdark",
+  "createdAt": "2026-11-15",
+  "completedAt": "2026-11-16",
+  "branch": "feat/m0-workspace-scaffold",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "priority": "P0",
+    "dev_type": "chore"
+  }
+}

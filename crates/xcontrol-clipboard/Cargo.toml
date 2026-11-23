@@ -1,0 +1,117 @@
+[package]
+name = "xcontrol-clipboard"
+description = "平台剪贴板抽象 + 同步策略"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# 依赖方向（docs/08 §1）：→ xcontrol-proto, xcontrol-config。
+# xcontrol-proto：ClipAnnounce::DEFAULT_MAX_TOTAL_LEN（16MiB 协商上限基准，FR-4.5）；
+# xcontrol-config：ClipboardConfig 节（max_bytes/scope/formats，FR-4.4/4.5——本任务
+# 消费 DEFAULT_CLIPBOARD_MAX_BYTES 做默认上限一致性对拍）。
+[dependencies]
+xcontrol-proto.workspace = true
+xcontrol-config.workspace = true
+thiserror.workspace = true
+# blake3：写入指纹（blake3 短哈希，docs/04 §5 防线 1 本机回声抑制；纯软实现无 I/O）。
+blake3.workspace = true
+# png：PNG 编解码（11-19-m5-clipboard-full，FR-4.2 图片线格式）。**非平台门控的
+# 公共纯逻辑依赖**（png_codec 模块：RGBA↔PNG 互转；图片回声指纹的 round-trip
+# 规范形 = RGBA 像素，解码 wire PNG 在所有平台都需要——wayland 直通路径的 image
+# 读写虽是 mime 字节直通，指纹仍需解码）。已在 gpui 传递树（0.18.1 同版），零新增包。
+png.workspace = true
+# arboard：剪贴板读写高层封装（docs/05 §0/§1；mac 内部即 NSPasteboard / win 内部即
+# clipboard-win / Linux 内部即 x11rb X11 后端）。可选依赖，由各平台 feature 启用
+# （M2 macos 接线；11-17-m3-clipboard-win-x11 补 windows/x11）——未开任何平台
+# feature 不进编译。default-features off（M2 裁剪 image 栈）；11-19-m5-clipboard-full
+# 起 macos/windows/x11 平台 feature 补开 `image-data`（FR-4.2 图片读写 RGBA 内存
+# 形态：mac 经 NSImage/TIFF、win 经 CF_DIB、x11 经 image/png target；FR-4.3 HTML
+# 的 arboard get/set html 全平台无条件编译、非 feature 门控——mac 写入不用它，
+# 见 platform/macos.rs 的 public.html 路径）。注意 Linux 后端选择：default-features
+# off 同时关闭 arboard 的 `wayland-data-control` feature → `Clipboard::new()` 直落
+# X11 后端（arboard 3.7.0 src/platform/linux/mod.rs：wayland 分支仅在
+# wayland-data-control feature 下编译）——本 crate 的 `x11` feature 语义即
+# "Linux X11 剪贴板"；`wayland` feature 不经 arboard（直依赖 wl-clipboard-rs，见下）。
+arboard = { workspace = true, optional = true, features = ["image-data"] }
+
+# macOS 平台绑定（docs/05 §1）：NSPasteboard.changeCount 原生轮询（mac 无剪贴板
+# 变化通知 API，docs/04 §4；arboard 不暴露 changeCount）+ M5 public.html 挂载
+# （FR-4.3：clearContents + setString_forType(html, NSPasteboardTypeHTML)——0.3.2
+# 绑定为安全方法，零 unsafe；autoreleasepool 纪律见 platform/macos.rs）。依赖按
+# target cfg 门控（非 macOS 目标不进依赖树）；模块本身只按 `macos` feature 门控
+# （architecture-rules 红线 2）——非 macOS 目标误开 feature 会在 platform/macos.rs
+# 导入处编译失败（fail loud，符合红线设计，同 input 先例）。
+# objc2（rc::autoreleasepool）与 objc2-foundation（NSString::from_str）为 M5 HTML
+# 路径的直接依赖，与 objc2-app-kit 0.3.2 传递依赖同版（objc2 0.6 / foundation 0.3）。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { workspace = true, optional = true }
+objc2 = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true }
+
+# Windows 平台绑定（docs/05 §2 剪贴板行）：`AddClipboardFormatListener` +
+# `WM_CLIPBOARDUPDATE`（隐藏消息窗口）+ `GetClipboardSequenceNumber`（变化计数
+# 原语，ClipboardWatch trait 的 changeCount 对应物）。依赖按 target cfg 门控（非
+# Windows 目标不进依赖树）；模块本身只按 `windows` feature 门控（红线 2，同上）。
+# windows crate 基座登记在 workspace（0.62，default-features off），本 crate 按
+# 实际 import 面声明最小 feature 集（0.62.2 源码逐项核实，2026-11-17，见
+# platform/windows.rs 模块文档）：
+# - Win32_Foundation：HWND/HINSTANCE/BOOL/WPARAM/LPARAM/LRESULT/GetLastError/
+#   ERROR_CLASS_ALREADY_EXISTS；
+# - Win32_System_DataExchange：AddClipboardFormatListener/RemoveClipboardFormatListener/
+#   GetClipboardSequenceNumber（0.62 剪贴板 API 归 System::DataExchange 模块）；
+# - Win32_UI_WindowsAndMessaging：RegisterClassW/CreateWindowExW/DestroyWindow/
+#   GetMessageW/DefWindowProcW/PostThreadMessageW/WNDCLASSW/WNDPROC/MSG/
+#   WM_CLIPBOARDUPDATE/WM_QUIT/HWND_MESSAGE；
+# - Win32_System_LibraryLoader：GetModuleHandleW（窗口类 hInstance 实参）；
+# - Win32_System_Threading：GetCurrentThreadId（WM_QUIT 定址，input 先例）；
+# - Win32_Graphics_Gdi：HBRUSH 类型——WNDCLASSW 的 hbrBackground 字段类型归属
+#   Gdi 模块（0.62 生成代码 cfg 门控），结构体构造需要该 feature（本模块不调用
+#   Gdi API，仅类型可达性）。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_Graphics_Gdi",
+] }
+
+# Linux 平台绑定（docs/05 §3/§4 剪贴板行）：x11 = x11rb XFixes 扩展
+# （`xfixes_select_selection_input` → SelectionNotify 事件监听）；wayland =
+# wl-clipboard-rs 直依赖（copy/paste 读写三格式 + watch::Watcher 事件驱动监听，
+# 11-19-m5-clipboard-full——0.9.5 首含 watch 模块）。依赖按 target cfg 门控（非
+# Linux 目标不进依赖树）；模块本身只按 `x11` / `wayland` feature 门控（红线 2，
+# 同上）。x11rb 的 workspace 登记是 record/xtest/xfixes 并集（input 与 clipboard
+# 共享一条 workspace 依赖，cargo feature 并集语义），本模块实际只消费 xfixes——
+# record/xtest 随 workspace 登记带入（同版 0.13 与 gpui 传递树一致，无第二版本）。
+# 纯 Rust bindings（default-features off 不拉 libc/libxcb；allow-unsafe-code 未开
+# 则 crate 内 forbid(unsafe_code)——arboard 的 x11rb 传递依赖同样无 features，
+# 并集后仍零 unsafe）→ platform/x11.rs 保持零 unsafe；wl-clipboard-rs 同为纯 Rust
+# Wayland 客户端（crate 内 deny(unsafe_code)），platform/wayland.rs 零 unsafe。
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { workspace = true, optional = true }
+wl-clipboard-rs = { workspace = true, optional = true }
+
+# 平台 feature 名与模块名固定（docs/08 §3）：平台实现位于 platform/{macos,windows,x11,wayland}.rs。
+# 监听路径（docs/05）：mac changeCount 轮询 250ms / win WM_CLIPBOARDUPDATE /
+# X11 XFixes / Wayland wl-clipboard-rs Watcher。
+# 单选约束（design.md）：平台 feature 互斥——同时开启两个在 lib.rs 编译期断言
+# （compile_error!）报错；arboard 是跨平台共享依赖，macos/windows/x11 feature 都
+# 启用它（image-data feature 并集）；wayland 独立（wl-clipboard-rs）。
+[features]
+macos = ["dep:arboard", "dep:objc2-app-kit", "dep:objc2", "dep:objc2-foundation"]
+windows = ["dep:arboard", "dep:windows"]
+x11 = ["dep:arboard", "dep:x11rb"]
+wayland = ["dep:wl-clipboard-rs"]
+
+# dev-dep：xcontrol-core 仅测试消费——用 M1 的 MockClipboard 对拍 ClipboardWatch
+# trait 语义（design.md 测试策略；docs/08 §1 依赖图无新增生产方向，先例：net 的
+# dev-dep xcontrol-core；mock-platform 只进测试树）。
+[dev-dependencies]
+xcontrol-core = { workspace = true, features = ["mock-platform"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+{"file": "docs/02-protocol.md", "reason": "wire 契约：§4.1 帧格式、§4.2 kind 表、§4.3 CtrlMsg、§4.4/§6 剪贴板、§5 版本协商、§7 错误码"}
+{"file": "docs/03-input.md", "reason": "XKey 码表（§2）与事件语义（§3）、mods 位掩码"}
+{"file": "docs/04-clipboard.md", "reason": "Clip 消息传输语义（§3）"}
+{"file": "docs/05-platform.md", "reason": "Caps 位掩码定义（§0）"}
+{"file": ".trellis/spec/rust-core/protocol-rules.md", "reason": "golden fixtures 与版本兼容规则卡"}
+{"file": ".trellis/spec/rust-core/error-handling.md", "reason": "thiserror/unwrap 禁令"}

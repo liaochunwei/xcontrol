@@ -1,0 +1,29 @@
+{
+  "id": "xcontrol-config",
+  "name": "xcontrol-config",
+  "title": "xcontrol-config：配置模型与 TOML 读写",
+  "description": "M0：配置 schema（docs/01 §5 的 config.toml 结构）+ 版本迁移链 + 校验 + 钥匙串引用存取，先于一切功能",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "csdark",
+  "assignee": "csdark",
+  "createdAt": "2026-11-15",
+  "completedAt": "2026-11-16",
+  "branch": "feat/m0-xcontrol-config",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "priority": "P1",
+    "dev_type": "feature"
+  }
+}

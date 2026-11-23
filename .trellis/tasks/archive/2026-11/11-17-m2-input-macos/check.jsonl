@@ -1,0 +1,4 @@
+{"file": "docs/05-platform.md", "reason": "API 契约逐条核对"}
+{"file": "docs/03-input.md", "reason": "XKey 映射锚点核对"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "门控/async/unsafe 红线"}
+{"file": ".trellis/spec/rust-core/testing.md", "reason": "覆盖门槛"}

@@ -1,0 +1,74 @@
+# XControl release 产物管线（11-17-m3-packaging 起步；docs/08 §7 发布流程的 CI 侧前置）
+#
+# 触发面刻意收窄：仅 tag（v*）push 与手动 workflow_dispatch——常规 push/PR 不跑
+# release 构建，日常 CI 时长不受影响（PRD"CI 时长顾虑"以触发面解决：主 ci.yml
+# 矩阵不含本 workflow）。
+#
+# 产物：三平台 release 裸二进制（未打安装包——dmg/msi/deb/AppImage 属 M6，
+# docs/08 §7；平台 feature 按 target 接线属 M4，docs/08 §3）。
+# - linux 仅出 xcontrol-cli：gpui 系统库缺位，xcontrol-app 在 ubuntu runner 编译期
+#   即失败（与 ci.yml 同一约束，见 ci.yml 头注"延后项"；runner 装机后补 app 产物）。
+# - macOS 产物未签名/公证（Developer ID 属 M6）：使用前按 docs/10-install.md §1.3
+#   本机 ad-hoc 签名（scripts/macos/codesign.sh）。
+# - Windows 产物未做 Authenticode 签名（M6 评估）。
+name: release-artifacts
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # release tag 构建不互相取消（concurrency 组按 ref 隔离，正常互不影响；
+  # 同 ref 重复触发时让新跑排队而非杀掉进行中的构建）。
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  artifacts:
+    name: artifacts (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # build_args 用矩阵字段下发，避免 run 步骤里写跨 shell 的条件语法；
+          # linux 的 --exclude xcontrol-app 与 ci.yml build 步骤同一约束（见文件头注）。
+          - os: macos-14
+            target: aarch64-apple-darwin
+            build_args: --workspace
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            build_args: --workspace --exclude xcontrol-app
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            build_args: --workspace
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与 ci.yml 同一锁定工具链（rust-toolchain.toml 锁 1.99，docs/08 §2）；
+      # release 构建不需要 clippy/rustfmt 组件，minimal profile 即可。
+      - name: Install pinned toolchain (1.99)
+        run: rustup toolchain install 1.99 --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build (release)
+        run: cargo build --release ${{ matrix.build_args }}
+
+      # 裸二进制上传（不含 pdb 等旁挂文件）：每个 pattern 只在对应平台命中，
+      # 其余平台该 pattern 匹配空——union 有文件即可，if-no-files-found 兜底。
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcontrol-${{ matrix.target }}
+          path: |
+            target/release/xcontrol-app
+            target/release/xcontrol-app.exe
+            target/release/xcontrol-cli
+            target/release/xcontrol-cli.exe
+          if-no-files-found: error

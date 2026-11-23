@@ -1,0 +1,31 @@
+[package]
+name = "xcontrol-proto"
+description = "XCP 协议：消息定义、序列化、帧编解码（零平台依赖）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# 分层红线（docs/08 §1）：仅允许 serde/postcard 等序列化依赖；
+# 平台 API / 文件·网络 I/O / tokio 一律禁止，CI 由 `cargo run -p xtask -- check-deps` 机械断言。
+[dependencies]
+# 输入事件为手写定长帧（docs/02 §4.2，热路径零抽象开销）；以下依赖只服务控制/剪贴板消息（postcard）与错误类型。
+serde = { workspace = true, features = ["derive"] }   # CtrlMsg/Clip* derive（postcard 的 serde 前端要求直接依赖）
+postcard = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# criterion 仅基准（benches/codec.rs）；白名单已登记（xtask RED_LINE_ALLOWED_DEPS，11-16-m1-proto 过审）。
+criterion = { workspace = true }
+
+# docs 未为 proto 定义业务 feature；协议 feature 随 docs/02 实现引入并同步 golden fixtures。
+[features]
+
+# 编解码吞吐基准（docs/08 §4 性能层；criterion 自定义 harness）
+[[bench]]
+name = "codec"
+harness = false
+
+[lints]
+workspace = true

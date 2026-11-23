@@ -1,0 +1,5 @@
+{"file": "docs/02-protocol.md", "reason": "§1 连接模型（双 TCP/NODELAY/端口）、§3.2 握手超时、§7 错误码"}
+{"file": "docs/adr/0002-transport-and-discovery.md", "reason": "TCP 选型与限速语义"}
+{"file": "docs/00-requirements.md", "reason": "FR-1.4 验收标准（安全码握手拒绝）"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "net 依赖边界 + tokio 使用范围红线"}
+{"file": ".trellis/spec/rust-core/error-handling.md", "reason": "握手失败折叠/日志纪律"}

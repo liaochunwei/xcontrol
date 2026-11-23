@@ -1,0 +1,7 @@
+# 工具链锁定（docs/08 §2、docs/01 §6）：MSRV 1.99（M0 spike 实测修订 2026-11-16：gpui-pre 0.3.12
+# 在 1.92/1.95 编译失败、stable 1.99.1 通过，见 ADR-0001 更新记录），三平台一致。
+# fmt 使用 nightly（rustfmt.toml 含 nightly-only 选项，docs/08 §2），CI fmt 步骤单独安装。
+[toolchain]
+channel = "1.99"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,4 @@
+{"file": "docs/03-input.md", "reason": "§4 逐条对照"}
+{"file": "docs/00-requirements.md", "reason": "FR-3.x AC"}
+{"file": ".trellis/spec/rust-core/testing.md", "reason": "覆盖门槛"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "红线"}

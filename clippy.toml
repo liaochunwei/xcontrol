@@ -1,0 +1,5 @@
+# docs/08 §2：MSRV 1.99（M0 spike 实测修订，原 1.92 断言有误，ADR-0001）；unwrap/expect 仅测试代码豁免（配合 workspace lints 的
+# clippy::unwrap_used / clippy::expect_used，CI 以 -D warnings 强制）。
+msrv = "1.99"
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

@@ -1,0 +1,32 @@
+[package]
+name = "xcontrol-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.xcontrol-proto]
+path = ".."
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clip_announce"
+path = "fuzz_targets/clip_announce.rs"
+test = false
+doc = false
+bench = false
+
+# 独立 workspace（cargo-fuzz 惯例）：不进主 workspace members，
+# 主 [workspace] 已显式 exclude（防"believes it's in a workspace"错误）。
+[workspace]

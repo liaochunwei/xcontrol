@@ -1,0 +1,126 @@
+[package]
+name = "xcontrol-input"
+description = "平台输入抽象 trait + 平台实现（feature 门控）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# 依赖方向（docs/08 §1）：→ xcontrol-proto, xcontrol-config, xcontrol-core。
+# xcontrol-core：re-export core::sink 的 InputSource/InputSink trait（M1 起两 trait 定义在
+# core 供 mock-platform 回环测试；input 提供平台实现并 re-export，11-17-m2-input-macos 补录）。
+[dependencies]
+xcontrol-proto.workspace = true
+xcontrol-config.workspace = true
+xcontrol-core.workspace = true
+thiserror.workspace = true
+# tracing：wayland 平台模块的 portal/EIS 线程日志（app::/net:: 子系统先例；
+# target 命名 input::wayland——docs/06 §6 子系统风格）。仅 wayland feature
+# 消费，但 tracing 本身零平台依赖、恒编译无妨（workspace 级登记）。
+tracing.workspace = true
+
+# macOS 平台绑定（docs/05 §1）：CGEventTap 捕获 + CGEventPost 注入 + AX 权限检测。
+# 依赖按 target cfg 门控（非 macOS 目标不进依赖树）；模块本身只按 `macos` feature
+# 门控（architecture-rules 红线 2：平台选择只发生在 feature 层）——非 macOS 目标
+# 误开 feature 会在 platform/macos.rs 导入处编译失败（fail loud，符合红线设计）。
+# core-graphics 的 `highsierra` feature 解锁 CGEvent::new_scroll_event（滚轮注入，docs/02 §4.2 kind 0x06）。
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { workspace = true, optional = true }
+core-foundation = { workspace = true, optional = true }
+
+# Windows 平台绑定（docs/05 §2）：WH_KEYBOARD_LL/WH_MOUSE_LL 捕获 + SendInput 注入 +
+# GetCursorPos/GetSystemMetrics 光标与虚拟屏查询。依赖按 target cfg 门控（非 Windows
+# 目标不进依赖树）；模块本身只按 `windows` feature 门控（architecture-rules 红线 2）——
+# 非 Windows 目标误开 feature 会在 platform/windows.rs 导入处编译失败（fail loud，
+# 同 macos 先例）。windows crate 0.62 的 API 按粒度 feature 组织，此处取本模块
+# 实际 import 面的最小集（逐项核实见 platform/windows.rs 模块文档）：
+# - Win32_Foundation：BOOL/HANDLE/LPARAM/LRESULT/WPARAM/POINT/GetLastError/
+#   ERROR_CLASS_ALREADY_EXISTS 等基础类型；
+# - Win32_UI_WindowsAndMessaging：SetWindowsHookExW/GetMessageW/PostThreadMessageW/
+#   RegisterClassW/CreateWindowExW/WNDCLASSW/DispatchMessageW（热键窗口，
+#   M4-hotkeys）/KBDLLHOOKSTRUCT/MSLLHOOKSTRUCT/GetCursorPos/GetSystemMetrics/
+#   WM_*/WH_*/LLKHF_*；
+# - Win32_UI_Input_KeyboardAndMouse：SendInput/INPUT/KEYBDINPUT/MOUSEINPUT/
+#   KEYEVENTF_*/MOUSEEVENTF_*/VK_*/RegisterHotKey/MOD_*（热键，M4-hotkeys）；
+# - Win32_System_Threading：GetCurrentThreadId（PostThreadMessageW(WM_QUIT) 定址）；
+# - Win32_System_LibraryLoader：GetModuleHandleW（hook 安装的 hmod 实参）；
+# - Win32_Graphics_Gdi：HBRUSH 类型——WNDCLASSW.hbrBackground 字段类型归属
+#   （RegisterClassW/WNDCLASSW 的 feature 依赖；剪贴板监听器先例，M4-hotkeys
+#   热键窗口复用同款）。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, optional = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+] }
+
+# Linux X11 平台绑定（docs/05 §3）：x11rb 纯 Rust bindings（XRecord 捕获 + XTEST 注入 +
+# XQueryPointer/warp 光标与屏几何查询 + grab_pointer/grab_keyboard 隐藏本机输入）。
+# 依赖按 target cfg 门控（非 Linux 目标不进依赖树）；模块本身只按 `x11` feature 门控
+# （architecture-rules 红线 2）——非 Linux 目标误开 feature 会在 platform/x11.rs 导入处
+# 编译失败（fail loud，同 macos/win 先例）。feature 集 record/xtest/xfixes（xfixes 为
+# M3 剪贴板任务预留）见 workspace 登记注释；default-features off 时传递树仅
+# x11rb-protocol + gethostname/rustix（纯 Rust socket I/O，无 libc/无 C 编译步骤，
+# 未开 allow-unsafe-code 则 crate 内部 forbid(unsafe_code)）——本平台模块因此保持
+# 零 unsafe。版本 0.13 与 gpui 传递树同版（Cargo.lock 已存在，不引入第二版本）。
+# Linux Wayland 平台绑定（docs/05 §4，11-19-m5-wayland）：ashpd（portal：InputCapture
+# 捕获会话 + RemoteDesktop 注入会话 + GlobalShortcuts 热键 + Clipboard 探测）+
+# reis（EIS fd 同步事件协议，docs/01 §6 平台行 `ashpd`+`reis`）+ evdev（uinput
+# 兜底注入，docs/05 §4.3）+ tokio（mpsc 命令通道——运行时无关原语，无需
+# tokio runtime）+ async-io（portal DBus 调用的执行器：ashpd/zbus 统一为
+# async-io 面后（gpui-base 同源，workspace ashpd 注释），portal futures 由
+# async_io::block_on 泵动 + Timer 超时竞速——11-19-m6-release 从 tokio
+# current-thread runtime 切换）+ futures-util（StreamExt + select! 宏——
+# async-await-macro feature，tokio::select! 的对位替换）。依赖按 target cfg 门控（非
+# Linux 目标不进依赖树）；模块本身只按 `wayland` feature 门控（architecture-rules
+# 红线 2）——非 Linux 目标误开 feature 会在 platform/wayland.rs 导入处编译失败
+# （fail loud，同 macos/win/x11 先例）。ashpd 0.13.13 与 gpui 传递树同版
+# （Cargo.lock 已有，零新增版本）；版本与 feature 依据见 workspace.dependencies
+# 登记注释与 platform/wayland.rs 模块文档。远端实测配方见 platform/wayland.rs。
+# 11-22 边缘回切修复轮增补：wayland-client（wl_output 枚举真实分辨率——uinput
+# ABS 域标定；0.31 已在 lock 零新增版本，登记依据见 workspace.dependencies 注释
+# 与 xtask RED_LINE_ALLOWED_DEPS 条目）。
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { workspace = true, optional = true }
+ashpd = { workspace = true, optional = true }
+reis = { workspace = true, optional = true }
+evdev = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["sync"] }
+async-io = { workspace = true, optional = true }
+futures-util = { workspace = true, features = ["async-await-macro"], optional = true }
+wayland-client = { workspace = true, optional = true }
+
+# 本机跨平台 target check 配方（11-17-m3-input-x11，非 Linux 机器上的验证路径）：
+#
+#   rustup target add x86_64-unknown-linux-gnu
+#   cargo check -p xcontrol-input --features x11 --target x86_64-unknown-linux-gnu
+#
+# x11rb 是纯 Rust（无 C 编译步骤、无 build.rs），交叉 check 无需 CC/系统库；远端 Linux
+# 运行时实测配方见 platform/x11.rs 模块文档与 docs/05 §3.1 移交清单。
+
+# 本机跨平台 target check 配方（11-17-m3-input-win，无 Windows 机器时的验证路径）：
+#
+#   CC_x86_64_pc_windows_msvc=nonexistent-cc \
+#     cargo check -p xcontrol-input --features windows --target x86_64-pc-windows-msvc
+#
+# 前缀 env 使 cc 的编译器探测失败 → blake3（xcontrol-core 传递依赖）的 build.rs
+# 走 NoCompiler 分支回退纯 Rust 内联路径，跳过需要 ml64.exe 的 C/asm 构建；对
+# xcontrol-input 自身编译面零影响（windows crate 是纯 Rust bindings）。Windows
+# 原机构建（CI/发布）不需要该前缀——MSVC 工具链齐备，blake3 走默认 C 实现路径。
+
+# 平台 feature 名与模块名固定（docs/08 §3、.trellis/spec/rust-platform/platform-code.md）：
+# 平台实现位于 platform/{macos,windows,x11,wayland}.rs，由 xcontrol-app 按目标平台自动选择。
+# 本 crate 是唯一预期出现 unsafe（FFI 绑定）的位置之一（docs/08 §2），workspace 级 unsafe deny
+# 在平台模块内显式 allow 并附 SAFETY 注释。
+[features]
+macos = ["dep:core-graphics", "dep:core-foundation"]
+windows = ["dep:windows"]
+x11 = ["dep:x11rb"]
+wayland = ["dep:ashpd", "dep:reis", "dep:evdev", "dep:tokio", "dep:async-io", "dep:futures-util", "dep:wayland-client"]
+
+[lints]
+workspace = true

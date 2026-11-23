@@ -1,0 +1,5 @@
+{"file": "docs/02-protocol.md", "reason": "§3 加密与密钥派生（逐行契约）、§3.2 握手参数、§3.3 session_id"}
+{"file": "docs/adr/0002-transport-and-discovery.md", "reason": "选型决策背景（snow/PSK/无 rustls）"}
+{"file": "docs/07-security.md", "reason": "安全码策略与防爆破要求（§3.2 在线限速）"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "net 依赖边界（仅 proto+config）与 async 边界红线"}
+{"file": ".trellis/spec/rust-core/error-handling.md", "reason": "握手失败不泄露原因的错误规范"}

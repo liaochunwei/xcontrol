@@ -1,0 +1,7 @@
+{"file": "docs/03-input.md", "reason": "对照 §4.6 与 §5 修订后的条款逐条核对实现与测试"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "核查分层红线与 select 取消安全未被破坏"}
+{"file": ".trellis/spec/rust-core/testing.md", "reason": "核查新增分支的单测覆盖与 ignore 纪律"}
+{"file": ".trellis/spec/rust-core/logging-targets.md", "reason": "核查新增日志的 target 与脱敏纪律"}
+{"file": ".trellis/spec/rust-platform/platform-code.md", "reason": "核查平台改动在 feature 门控内、注释与实测记录一致"}
+{"file": ".trellis/spec/rust-platform/macos-input.md", "reason": "核查 mac 平台改动只有只读访问器，未触碰捕获与锚定逻辑"}
+{"file": ".trellis/tasks/11-24-edge-switch-latency-hotkey-return/research/root-cause-analysis.md", "reason": "核查实现没有触碰未验证假设 H1–H3，且 G3（门控+节拍）成组落地"}

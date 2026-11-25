@@ -5,10 +5,37 @@
 version = 2
 # 当前树仅含 workspace 内部 crate（MIT OR Apache-2.0）；引入第三方依赖时
 # 按 docs/01 §6 基线回填（tokio=MIT、gpui=Apache-2.0 等）。
+# PR #1 linux job 实测回填的一批（gpui / zbus 传递树的常见许可，均可再分发）：
+# - Unicode-3.0：unicode-segmentation / ttf-parser / usvg 等文本与字体 crate
+# - BSD-2/3-Clause、0BSD、Zlib、ISC：字体解析与底层库的常见许可
+# - MPL-2.0：inotify / notify 等
+# - CC0-1.0：foldhash 等个别 crate 的公共域声明（PR #1 check 补录）
+# - Apache-2.0 OR MIT AND BSD-3-Clause：curve25519-dalek 系的组合表达
 allow = [
   "MIT",
   "Apache-2.0",
+  "Unicode-3.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "0BSD",
+  "Zlib",
+  "ISC",
+  "MPL-2.0",
+  "CC0-1.0",
+  "Apache-2.0 WITH LLVM-exception",
 ]
+
+[advisories]
+version = 2
+yanked = "warn"
+# unmaintained ≠ 漏洞（2026-11-25 治理裁定）：gpui / zbus 传递树里一批 crate
+# （chrono / instant / ttf-parser / rustybuzz / zbus_names / zvariant 系）被
+# RustSec 标记不再维护，版本收口不在本仓库依赖面内（上游 gpui/zbus 发版才能
+# 解）。0.20.x 的取值是检测范围枚举（all/workspace/transitive/none），"none" =
+# unmaintained 不进 fail-closed 面（PR #1 本地复现：linux host target 剩余 9 条
+# 全是 unmaintained，0 条 vulnerability；CI 首跑时 DB 快照较旧只报 url 一条）。
+# 真实漏洞（vulnerability）保持 fail-closed。
+unmaintained = "none"
 
 [bans]
 multiple-versions = "warn"
@@ -16,10 +43,6 @@ wildcards = "warn"
 deny = []
 skip = []
 skip-tree = []
-
-[advisories]
-version = 2
-yanked = "warn"
 
 [sources]
 unknown-registry = "warn"

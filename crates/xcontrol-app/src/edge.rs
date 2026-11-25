@@ -7,7 +7,8 @@
 //!   `feed(光标点) -> Option<EdgeHit>` 是纯状态机——无 I/O、无平台依赖，
 //!   默认 `cargo test` 全量可测（PRD 要求 4：轮询与判定解耦）。
 //! - **轮询（app 编排职责）**：本模块放 app 而非 core 的原因——光标读取是平台
-//!   I/O（core 零 I/O 红线），50ms 轮询节奏是会话运行时的编排决策；
+//!   I/O（core 零 I/O 红线），10ms 轮询节奏（11-24 起；原 50ms——光标撞边后
+//!   最坏要等 50–60ms 才切换，快速移动表现为撞边冻住）是会话运行时的编排决策；
 //!   session_rt 经 [`poll_edge_sensor` 语义]（见 [`EdgeSensor::poll_cursor`]）把
 //!   平台查询喂进纯判定。
 //! - **平台查询（macos feature 门控）**：复用 xcontrol-input 既有安全封装
@@ -31,8 +32,10 @@
 //!   边界 ≤1 点内（点坐标采样粒度），docs/03 §5 的 ±0px 触发语义在采样层
 //!   靠此容差带稳定命中；1 逻辑点远小于交互可感知距离，不改变「内侧不触发」。
 //! - **去抖（PRD 要求 2 + docs/03 §5 死区）**：触发后闩锁，光标回严格内侧
-//!   才重新武装（当拍不触发）——语义强于文档的 150ms 死区（物理上回内侧
-//!   必然超过 150ms），无需另设计时器。
+//!   才重新武装（当拍不触发）——同一条边的连续命中由闩锁抑制。控制关系变化
+//!   （切入/回切/Home）后的 150ms 防抖在 session_rt 门控层另计
+//!   （`edge_dead_time_elapsed`，11-24）：回切落点贴缘，快速甩动时回内侧再推
+//!   可能远快于 150ms，闩锁单独覆盖不了。
 //!
 //! # 已知限制（M2 范围，M3 布局协商收口）
 //!
@@ -54,9 +57,15 @@ use xcontrol_proto::input::ScreenId;
 /// 避免 app 侧重复定义同形结构）。
 pub type EdgeHit = xcontrol_core::layout::EdgeCrossing;
 
-/// 默认轮询间隔（PRD 要求 2：50ms 量级可配；[`EdgeSensor::poll_interval`] 可读，
-/// 会话循环据此建 ticker）。
-pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// 默认轮询间隔（11-24 起 10ms；[`EdgeSensor::poll_interval`] 可读，会话循环
+/// 据此建 ticker）。主控边缘轮询与工作机受控光标回报共用本常量：原 50ms 下
+/// 光标撞边后最坏要等 50–60ms 才切换（快速移动表现为撞边停住），10ms 把最坏
+/// 切换延迟降到约 10ms。每次是微秒级光标查询（`CGEventGetLocation`）+ 一个
+/// 约 35 字节的回报报文。**节拍与受控期门控必须同进同退**（docs/03 §5 死区）：
+/// macOS 受控期间光标靠每 10ms 输入拍的锚定 warp 冻结，两次回拉之间会冲到屏
+/// 边——轮询提到 10ms 后与回拉近乎同相位，误触发概率上升，故受控期间的主控
+/// 边缘命中由 session_rt 门控一律忽略。
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// 边缘容差（全局点坐标）：贴边 ±1 点内的归一化样本收敛到精确边缘 0.0/1.0。
 ///
@@ -264,7 +273,7 @@ pub struct EdgeSensor {
     frame: ScreenId,
     /// 去抖闩锁。
     latch: Latch,
-    /// 轮询间隔（会话循环建 ticker 用；PRD：50ms 量级可配）。
+    /// 轮询间隔（会话循环建 ticker 用；默认 [`DEFAULT_POLL_INTERVAL`] 10ms）。
     poll_interval: Duration,
     /// 边缘容差（点；默认 [`EDGE_TOLERANCE_POINTS`]，单测可置 0 对照）。
     tolerance: f64,
@@ -445,6 +454,55 @@ pub fn release_warp_point(
     let nx = f64::from(x).clamp(0.0, 1.0);
     let ny = f64::from(y).clamp(0.0, 1.0);
     Some((ox + nx * w, oy + ny * h))
+}
+
+/// 回切落点补偿（11-24 回切行程补偿，纯函数；docs/03 §5 回切第 3 条）：
+/// [`release_warp_point`] 的落点加上 `travel`（主控点；`(dx, dy)`，符号与屏幕
+/// 坐标轴同向——右/下为正），再夹回**落点所在屏**内，四周各留
+/// [`xcontrol_core::session::EDGE_RETURN_INSET`] 换算的点数。
+///
+/// `travel` = 三段在回切时本来会丢失的位移之和：工作机顶边期间被屏幕边界截掉的
+/// 推进量（随回报带回）+ 主控最后转发、在工作机采样之后才到的一批 + 回切触发后
+/// 到本地输入恢复之间被本地拦截的位移。加到落点上，快速甩动回切后光标落点与
+/// 手势连续（原实现落点恒贴缘停在中途，慢速时几像素、快速时几十到上百点）。
+///
+/// 四周留白与 core 的回切落点内缩同源：补偿后的落点不得落到别条边的容差带或
+/// 角落区里（否则回切后立即再触发切换）。`travel` 为 `(0.0, 0.0)` 即原落点。
+///
+/// 防御：屏下标越界 / 非有限归一化坐标 → `None`（同 [`release_warp_point`]，
+/// 不重放，光标停物理鼠标位）；`travel` 非有限或屏几何非正（无法安全夹取）→
+/// 退回**未补偿**的原落点（宁可少补一段，不让落点变成 NaN 或 panic）。
+#[must_use]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+pub fn compensated_release_point(
+    rects: &[ScreenRect],
+    screen: ScreenId,
+    x: f32,
+    y: f32,
+    travel: (f32, f32),
+) -> Option<(f64, f64)> {
+    let base = release_warp_point(rects, screen, x, y)?;
+    let rect = rects.get(usize::from(screen))?;
+    let (tx, ty) = (f64::from(travel.0), f64::from(travel.1));
+    let (ox, oy) = rect.origin;
+    let (w, h) = rect.size;
+    // `f64::clamp` 在 min/max 为 NaN 或 min > max 时 panic——几何非有限/非正一律
+    // 不夹取，退回未补偿的原落点。
+    if !tx.is_finite()
+        || !ty.is_finite()
+        || !(ox.is_finite() && oy.is_finite())
+        || !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0)
+    {
+        return Some(base);
+    }
+    let inset = f64::from(xcontrol_core::session::EDGE_RETURN_INSET);
+    let clamp_axis = |value: f64, origin: f64, size: f64| {
+        value.clamp(origin + inset * size, origin + (1.0 - inset) * size)
+    };
+    Some((
+        clamp_axis(base.0 + tx, ox, w),
+        clamp_axis(base.1 + ty, oy, h),
+    ))
 }
 
 /// 非 `macos` 平台的空实现（受控光标回报仅 mac 部署面有采样源——与
@@ -657,25 +715,48 @@ mod tests {
         );
     }
 
-    /// 角落排除（11-22 第三轮，docs/03 §5）：传感器边界样本落在角落区（两轴
-    /// 同时贴边，容差带收敛后两轴端点值）→ 不触发任何边——角落留给系统热区
-    /// （KDE 触发角专用，边缘=切换）；沿边坐标严格内侧（非角落）照常触发，
-    /// ratio = 沿边归一化值。
+    /// 角落排除（11-22 第三轮，docs/03 §5；11-24 由"两轴同为端点"改为 5% 角落区）：
+    /// 传感器边界样本落在角落区（沿边坐标在角落带内）→ 不触发任何边——角落留给
+    /// 系统热区（KDE 触发角专用，边缘=切换），且不闩锁（None 且武装保持，可连续
+    /// 喂）；角落区外照常触发，ratio = 沿边归一化值。传感器的判定代码不改——它
+    /// 调用的是 core `edge_crossing`。
     #[test]
     fn corner_excluded_and_interior_ratio_preserved() {
-        // L 形布局：A 右缘→B、下缘→C。四角逐一喂入（角落不闩锁——None 且
-        // 武装保持，可连续喂）。
+        // L 形布局（各屏 1000×1000 点）：A 右缘→B、下缘→C。四角逐一喂入。
         let mut sensor =
             EdgeSensor::new(rects_l_shape(), 0, DEFAULT_POLL_INTERVAL).expect("合法布局");
         // 右上角（1000, 0）：右缘有邻居也排除。
-        assert_eq!(sensor.feed((1000.0, 0.0)), None);
+        assert_eq!(sensor.feed((1000.0, 0.0)), None, "右上角");
         // 右下角（1000, 1000）：右/下缘均有邻居（Right 优先候选）仍排除。
-        assert_eq!(sensor.feed((1000.0, 1000.0)), None);
+        assert_eq!(sensor.feed((1000.0, 1000.0)), None, "右下角");
         // 左上角（0, 0）：两缘均无邻居，排除同语义。
-        assert_eq!(sensor.feed((0.0, 0.0)), None);
+        assert_eq!(sensor.feed((0.0, 0.0)), None, "左上角");
         // 左下角（0, 1000）：下缘有邻居（→C）仍排除。
-        assert_eq!(sensor.feed((0.0, 1000.0)), None);
-        // 非角落回归：右缘中点触发，ratio = y = 0.5。
+        assert_eq!(sensor.feed((0.0, 1000.0)), None, "左下角");
+        // 角落带内的**非角点**（沿边坐标 3% / 97%——远在 1 点容差带之外、未收敛
+        // 到端点）：同样排除。旧实现下"离角 1.5 点即触发"，斜着进角落几乎必然
+        // 先在角落外贴到可切换的边。
+        assert_eq!(
+            sensor.feed((1000.0, 30.0)),
+            None,
+            "右缘上端角落带内（ny=0.03）"
+        );
+        assert_eq!(
+            sensor.feed((1000.0, 970.0)),
+            None,
+            "右缘下端角落带内（ny=0.97）"
+        );
+        assert_eq!(
+            sensor.feed((30.0, 1000.0)),
+            None,
+            "下缘左端角落带内（nx=0.03）"
+        );
+        assert_eq!(
+            sensor.feed((970.0, 1000.0)),
+            None,
+            "下缘右端角落带内（nx=0.97）"
+        );
+        // 角落区外回归：右缘中段触发，ratio = y = 0.5。
         assert_eq!(
             sensor.feed((1000.0, 500.0)),
             Some(EdgeHit {
@@ -684,11 +765,51 @@ mod tests {
                 ratio: 0.5,
             })
         );
-        // 角落邻域（沿边坐标未收敛，1 点容差带内恰临界）：998.5 → ny=0.9985
-        // 非端点 → 非角落 → 触发。
-        let mut sensor =
-            EdgeSensor::new(rects_l_shape(), 0, DEFAULT_POLL_INTERVAL).expect("合法布局");
-        assert!(sensor.feed((1000.0, 998.5)).is_some());
+    }
+
+    /// 传感器与 core 共用同一角落比例（11-24，AC9）：传感器判定面直接调用 core
+    /// `edge_crossing`——沿边坐标取 `CORNER_RATIO ± 0.001` 处，传感器命中与否必须
+    /// 与 core 纯函数逐点一致（带内不触发、带外触发）。容差置 0（归一化值精确
+    /// 等于构造比例）；每样本新建传感器（命中会闩锁）。
+    #[test]
+    fn sensor_corner_band_matches_core_ratio() {
+        use xcontrol_core::layout::CORNER_RATIO;
+        let boundary = f64::from(CORNER_RATIO);
+        for along in [
+            CORNER_RATIO - 0.001,
+            CORNER_RATIO + 0.001,
+            1.0 - CORNER_RATIO - 0.001,
+            1.0 - CORNER_RATIO + 0.001,
+        ] {
+            let along_f64 = f64::from(along);
+            let in_band = along_f64 <= boundary || along_f64 >= 1.0 - boundary;
+            for (point, (nx, ny)) in [
+                // A 右缘：沿边坐标 = y。
+                ((1000.0, along_f64 * 1000.0), (1.0, along)),
+                // A 下缘：沿边坐标 = x。
+                ((along_f64 * 1000.0, 1000.0), (along, 1.0)),
+            ] {
+                let mut sensor = EdgeSensor::new(rects_l_shape(), 0, DEFAULT_POLL_INTERVAL)
+                    .expect("合法布局")
+                    .with_tolerance(0.0);
+                let via_sensor = sensor.feed(point);
+                let via_core = edge_crossing(sensor.layout(), 0, nx, ny);
+                assert_eq!(
+                    via_sensor, via_core,
+                    "沿边坐标 {along}：传感器判定必须与 core edge_crossing 一致"
+                );
+                assert_eq!(
+                    via_sensor.is_none(),
+                    in_band,
+                    "沿边坐标 {along}：{}",
+                    if in_band {
+                        "角落带内不触发"
+                    } else {
+                        "角落带外照常触发"
+                    }
+                );
+            }
+        }
     }
 
     /// 归属帧：边界样本的方向按「最近一次严格内侧所在屏」消解——
@@ -781,6 +902,23 @@ mod tests {
         assert_eq!(sensor.layout().len(), 2);
     }
 
+    // —— 节拍（11-24，D7） ——
+
+    /// 默认节拍 10ms：主控边缘轮询与工作机受控光标回报共用
+    /// `DEFAULT_POLL_INTERVAL`——原 50ms 下光标撞边后最坏等 50–60ms 才切换。
+    /// 显式间隔照原值透传（`EdgeSensor::poll_interval` 接口不变）。
+    #[test]
+    fn default_poll_interval_is_10ms() {
+        assert_eq!(DEFAULT_POLL_INTERVAL, Duration::from_millis(10));
+        assert_eq!(
+            sensor_2x1().poll_interval(),
+            DEFAULT_POLL_INTERVAL,
+            "默认构造的传感器读到的即默认节拍"
+        );
+        let custom = EdgeSensor::new(rects_2x1(), 0, Duration::from_millis(33)).expect("合法布局");
+        assert_eq!(custom.poll_interval(), Duration::from_millis(33));
+    }
+
     // —— 受控光标采样（双向边缘回切，docs/03 §5） ——
 
     /// 采样契约：屏内归一化 + 边缘容差带收敛端点值（驻留回报恰 0.0/1.0）。
@@ -835,6 +973,133 @@ mod tests {
         );
     }
 
+    // —— 回切落点补偿（11-24 回切行程补偿，docs/03 §5 回切第 3 条） ——
+
+    /// 浮点点比较：归一化落点经 f32 → f64 换算有末位误差（0.995f32 在 1000 点
+    /// 屏上约 5e-6 点），容差取 1e-3 点。
+    fn assert_point_close(actual: (f64, f64), expected: (f64, f64)) {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-3;
+        assert!(
+            close(actual.0, expected.0) && close(actual.1, expected.1),
+            "落点 {actual:?} ≠ 期望 {expected:?}"
+        );
+    }
+
+    /// 落点补偿：原落点 + 行程向量；零行程 = 原落点（与 `release_warp_point`
+    /// 同值）。行程单位是主控点，符号与屏幕坐标轴同向（右/下为正）。
+    #[test]
+    fn compensated_release_point_adds_travel_to_landing() {
+        let rects = rects_2x1();
+        let inset = f64::from(xcontrol_core::session::EDGE_RETURN_INSET) * 1000.0;
+        // 零行程：原落点不变（主控左缘内侧）。
+        assert_point_close(
+            compensated_release_point(&rects, 0, 0.005, 0.4, (0.0, 0.0)).expect("合法落点"),
+            release_warp_point(&rects, 0, 0.005, 0.4).expect("合法落点"),
+        );
+        // 向右回切（工作机右缘滑出 → 主控左缘落点）+ 顶边行程 120 点、在途 8 点：
+        // 落点沿行进方向前移。
+        assert_point_close(
+            compensated_release_point(&rects, 0, 0.005, 0.4, (128.0, 8.0)).expect("合法落点"),
+            (inset + 128.0, 408.0),
+        );
+        // 向左回切（工作机左缘滑出 → 主控右缘落点）：行程为负，落点离缘内移；
+        // 副屏（origin = 1000）按各自矩形换算。
+        assert_point_close(
+            compensated_release_point(&rects, 1, 0.995, 0.6, (-40.0, -12.5)).expect("合法落点"),
+            (1000.0 + 1000.0 - inset - 40.0, 587.5),
+        );
+        // 横向外侧边：行程落在 y 轴。
+        assert_point_close(
+            compensated_release_point(&rects, 0, 0.3, 0.005, (0.0, 50.0)).expect("合法落点"),
+            (300.0, inset + 50.0),
+        );
+    }
+
+    /// 落点补偿夹回屏内：四周各留 `EDGE_RETURN_INSET` 换算的点数（1000 点屏 =
+    /// 5 点），且**不越过落点所在屏**（即使邻屏在行进方向上）。
+    #[test]
+    fn compensated_release_point_clamps_inside_landing_screen() {
+        let rects = rects_2x1();
+        let inset = f64::from(xcontrol_core::session::EDGE_RETURN_INSET) * 1000.0;
+        let far = (100_000.0, 100_000.0);
+        let back = (-100_000.0, -100_000.0);
+        // 四周留白 = 内缩量换算的点数（左、上）。
+        assert_point_close(
+            compensated_release_point(&rects, 0, 0.005, 0.4, back).expect("合法落点"),
+            (inset, inset),
+        );
+        // 右、下。
+        assert_point_close(
+            compensated_release_point(&rects, 0, 0.005, 0.4, far).expect("合法落点"),
+            (1000.0 - inset, 1000.0 - inset),
+        );
+        // 副屏：夹在副屏自己的矩形内（不越到主屏，也不出屏）。
+        assert_point_close(
+            compensated_release_point(&rects, 1, 0.995, 0.6, back).expect("合法落点"),
+            (1000.0 + inset, inset),
+        );
+        // 落点在屏 0、邻屏 1 在右侧行进方向上：不越过屏 0 右缘。
+        assert_point_close(
+            compensated_release_point(&rects, 0, 0.005, 0.4, (2000.0, 0.0)).expect("合法落点"),
+            (1000.0 - inset, 400.0),
+        );
+        // 留白与 core 回切落点内缩同源：常量改了这里跟着变（不写死 5）。
+        assert_eq!(xcontrol_core::session::EDGE_RETURN_INSET, 0.005);
+    }
+
+    /// 落点补偿的防御面：屏下标越界 / 非有限归一化坐标 → `None`（不重放，同
+    /// `release_warp_point`）；行程非有限 / 屏几何非正 → 退回**未补偿**的原落点
+    /// （不 panic、不产生 NaN 夹取）。
+    #[test]
+    fn compensated_release_point_degrades_to_uncompensated_landing() {
+        let rects = rects_2x1();
+        // 越界屏 / 非有限坐标：None。
+        assert_eq!(
+            compensated_release_point(&rects, 2, 0.005, 0.4, (10.0, 0.0)),
+            None
+        );
+        assert_eq!(
+            compensated_release_point(&rects, 0, f32::NAN, 0.4, (10.0, 0.0)),
+            None
+        );
+        assert_eq!(
+            compensated_release_point(&rects, 0, 0.005, f32::INFINITY, (10.0, 0.0)),
+            None
+        );
+        // 非有限行程：原落点（不补偿）。
+        let base = release_warp_point(&rects, 0, 0.005, 0.4);
+        assert_eq!(
+            compensated_release_point(&rects, 0, 0.005, 0.4, (f32::NAN, 0.0)),
+            base
+        );
+        assert_eq!(
+            compensated_release_point(&rects, 0, 0.005, 0.4, (0.0, f32::INFINITY)),
+            base
+        );
+        // 几何非正：原落点。
+        let degenerate = vec![ScreenRect {
+            origin: (0.0, 0.0),
+            size: (0.0, 1000.0),
+        }];
+        assert_eq!(
+            compensated_release_point(&degenerate, 0, 0.005, 0.4, (100.0, 100.0)),
+            release_warp_point(&degenerate, 0, 0.005, 0.4),
+            "零尺寸屏不夹取、不 panic"
+        );
+        let nan_origin = vec![ScreenRect {
+            origin: (f64::NAN, 0.0),
+            size: (1000.0, 1000.0),
+        }];
+        // NaN 原点：原落点本身 x = NaN（既有行为）——只断言未 panic 且未被夹取、
+        // 未被补偿（y 仍是原落点的 0.4×1000，不是 0.4×1000+100）。
+        let landed = compensated_release_point(&nan_origin, 0, 0.005, 0.4, (100.0, 100.0))
+            .expect("非有限几何仍返回原落点");
+        assert!(
+            landed.0.is_nan() && (landed.1 - 400.0).abs() < 1e-3,
+            "非有限原点不夹取、不补偿（f64::clamp 遇 NaN 边界会 panic）：{landed:?}"
+        );
+    }
+
     // —— 平台接线（macos；默认测试全绿不受影响） ——
 
     /// 本机屏幕布局 → 传感器构建冒烟（纯查询，无需辅助功能权限；默认可跑）。
@@ -857,7 +1122,7 @@ mod tests {
     /// 真实光标轮询冒烟（#[ignore]，PRD AC：打印触边事件，不强制真实切换）。
     ///
     /// 运行：`cargo test -p xcontrol-app --features macos -- --ignored`
-    /// 行为：10s 内每 50ms 读一次真实光标并打印命中——人工把光标推向屏幕
+    /// 行为：10s 内按默认节拍（10ms，11-24 起）读真实光标并打印命中——人工把光标推向屏幕
     /// 邻边（多屏主控）观察触发/去抖/重新武装；单屏主控无邻边，仅验证轮询
     /// 与查询路径不崩溃。会话级 `EdgeCrossing` 上报见 session_rt（门控语义）。
     #[test]
@@ -867,7 +1132,7 @@ mod tests {
             println!("无屏幕（异常环境），跳过冒烟");
             return;
         };
-        let ticks = 200; // 200 × 50ms = 10s 观察窗
+        let ticks = 1000; // 1000 × 10ms（DEFAULT_POLL_INTERVAL）= 10s 观察窗
         for tick in 0..ticks {
             if let Some(hit) = sensor.poll_cursor() {
                 println!("[{tick:03}] 触边：{hit:?}");

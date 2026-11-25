@@ -622,9 +622,9 @@ impl PeerEnd {
                 Notice::LeftControl => {
                     tracing::info!(target: "session::loopback", "退出受控态");
                 }
-                Notice::EdgeReturnedToHost { target } => {
-                    tracing::info!(target: "session::loopback", target,
-                        "受控屏外侧滑出：边缘回切主控（docs/03 §5）");
+                Notice::EdgeReturnedToHost { target, overflow } => {
+                    tracing::info!(target: "session::loopback", target, ?overflow,
+                        "受控屏外侧滑出：边缘回切主控（docs/03 §5；overflow = 回报段回切行程）");
                 }
                 Notice::SwitchRequested { target } => {
                     tracing::info!(target: "session::loopback", target, "对端请求切换");

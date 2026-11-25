@@ -428,8 +428,14 @@ fn check_deps() -> Result<(), String> {
 
     for pkg in RED_LINE_CRATES {
         check_direct_deps_whitelist(&cargo, &root, pkg, &mut violations)?;
-        // 红线 crate 另做全依赖树黑名单扫描（防御纵深，含传递依赖）
-        let tree = cargo_tree_names(&cargo, &root, pkg, &["--edges", "normal,dev"])?;
+        // 红线 crate 另做全依赖树黑名单扫描（防御纵深，含传递依赖）。
+        // **只扫 normal 边**（11-25 裁定，PR #1 windows job 实测）：黑名单 =
+        // 零平台依赖 / 零 I/O 的运行时红线；dev 依赖（criterion 基准工具等）
+        // 不进运行时，且 criterion 在 windows 上传递 windows-sys（walkdir 系）
+        // ——把 dev 树扫进黑名单会把"基准工具在其目标平台上的正常依赖"误报
+        // 成红线违规。dev 依赖本身由上方直接依赖白名单同等审住（criterion
+        // 已过审登记），运行时红线不被稀释。
+        let tree = cargo_tree_names(&cargo, &root, pkg, &["--edges", "normal"])?;
         for name in &tree {
             if FORBIDDEN_PACKAGES.contains(&name.as_str()) {
                 violations.push(format!(

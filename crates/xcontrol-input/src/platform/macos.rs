@@ -3,9 +3,12 @@
 //!
 //! # 权限现实（docs/05 §1）
 //!
-//! 捕获与注入都要求**辅助功能**授权；未授权时系统**静默忽略**（tap 创建成功但回调
-//! 收不到事件、`CGEventPost` 不生效、不报错）——权限检测必须显式独立做
-//! （[`check_accessibility`]），tap 创建成功 ≠ 有权限。
+//! 捕获与注入都要求**辅助功能**授权。未授权时的表现（2026-11-24 部署实测更正）：
+//! 现行 **active tap**（`CGEventTapOptions::Default`，受控吞本地输入需要 Drop 能力）
+//! 的创建**直接被拒**——`CGEventTapCreate` 返回空、[`CaptureSource::start`] 报错；
+//! 注入（`CGEventPost`）不生效、不报错。旧说法"tap 创建成功但回调收不到事件"
+//! 只对 ListenOnly 成立（M2 当时如此）——权限检测仍须显式独立做
+//! （[`check_accessibility`]）。
 //!
 //! # 线程与 async 纪律（architecture-rules 红线 3）
 //!
@@ -243,6 +246,25 @@ fn entry_anchor_clamped(point: (f64, f64)) -> (f64, f64) {
             .1
             .clamp(oy + ANCHOR_EDGE_INSET, oy + h - ANCHOR_EDGE_INSET),
     )
+}
+
+/// 光标相对平移（11-25：回切行程的平滑回放，docs/05 §1.2）：读当前位置并 warp
+/// 到偏移 `(dx, dy)` 之后的点（`CGWarpMouseCursorPosition`，不生成事件——语义
+/// 同受控锚定 warp）。**进程级线程安全 API，不依赖任何实例状态**（Apple 文档，
+/// 自 macOS 10.11 无限制）——回放线程（app `spawn_cursor_replay`）直接调用，
+/// 无需 `CaptureSource`。回放期间物理鼠标的位移照常叠加在 warp 之后的位置上。
+///
+/// # Errors
+/// [`InputError::Platform`]：光标查询或 warp 失败（调用方告警后终止回放）。
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+pub fn shift_cursor(dx: f64, dy: f64) -> Result<(), InputError> {
+    let (x, y) = cursor_location()?;
+    CGDisplay::warp_mouse_cursor_position(CGPoint::new(x + dx, y + dy)).map_err(|error| {
+        InputError::Platform {
+            action: "cursor-warp",
+            reason: format!("CGWarpMouseCursorPosition 失败：{error}"),
+        }
+    })
 }
 
 pub fn cursor_location() -> Result<(f64, f64), InputError> {
@@ -927,12 +949,14 @@ const TAP_EVENTS: [CGEventType; 14] = [
 /// macOS 捕获源（[`InputSource`] 的 mac 实现，docs/05 §1：`CGEventTap` +
 /// CFRunLoop 独立线程）。
 ///
-/// - tap 为 `kCGSessionEventTap` + **ListenOnly**：M2 不拦截主控本地输入
-///   （回调恒返回 [`CallbackResult::Keep`]；拦截留热键 M4）；
+/// - tap 为 `kCGSessionEventTap` + **active（Default）**：受控时吞本地输入
+///   （suppress → [`CallbackResult::Drop`]，KVM 重定向语义），未受控透传——
+///   M2 的 ListenOnly 形态已被受控重定向取代；
 /// - 回调线程只做"kVK→[`XKey`] → mods 位 → `std::sync::mpsc` 投递"，
 ///   **零 async/零 tokio/零锁**（platform-code.md 回调纪律）；
-/// - **未授权时 tap 创建成功但事件被系统静默忽略**（docs/05 §1）——
-///   显式权限检测用 [`check_accessibility`]；
+/// - **未授权时 active tap 的创建直接返回空**（`CGEventTapCreate` → NULL，
+///   2026-11-24 实测，docs/05 §1）——"创建成功但事件被静默忽略"只是 M2
+///   ListenOnly 时代的行为。显式权限检测用 [`check_accessibility`]；
 /// - [`InputSource::poll`] 非阻塞拉取；事件 FIFO 保序（单 channel 天然满足）。
 pub struct CaptureSource {
     receiver: Receiver<InputEvent>,
@@ -1122,9 +1146,15 @@ impl CaptureSource {
             // **跟随物理鼠标移动**（macOS 的指针合成在 HID 层，Session tap 的
             // Drop 吞事件防不住光标移动；hide_cursor/associate 在 macOS 26
             // 非前台进程均失效——探针实测）。**每拍锚定 warp 是"光标冻结"的
-            // 唯一可达实现**：50ms 周期强制光标回锚点 = 视觉静止。此前锚定
-            // 引发的"切入即回切"已由回切免疫窗（RETURN_IMMUNITY_REPORTS）+
-            // 落点死区拆分修掉，锚定不再有回弹副作用。
+            // 唯一可达实现**：会话输入拍（10ms，app `INPUT_POLL_INTERVAL`）每拍
+            // 强制光标回锚点 = 视觉静止（11-24 勘误：此处原记 50ms——回拉一直
+            // 发生在 10ms 输入拍，docs/05 §1.2 同步更正）。此前锚定引发的"切入
+            // 即回切"已由回切免疫窗（core session `RETURN_IMMUNITY_MS`，接管后
+            // 800ms 按时间计；11-24 前按回报条数计）+ 落点死区拆分修掉，锚定
+            // 不再有回弹副作用。回拉是周期性的而非真正冻结，两次回拉之间光标
+            // 若冲到屏边（docs/05 §1.2，按 10ms 拍的算术推算、非实测值），受控
+            // 期间的主控边缘命中由 app 门控一律忽略（11-24，session_rt
+            // `edge_hit_allowed` 只对 `ControlDir::None` 放行）。
             self.pinned.store(true, Ordering::Relaxed);
             if let Err(error) = main.hide_cursor() {
                 tracing::warn!(target: "input::macos", %error, "CGDisplayHideCursor 失败（macOS 26 非前台忽略——光标可见但冻结，已知限制）");
@@ -1177,6 +1207,19 @@ impl CaptureSource {
         if let Err(error) = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x, y)) {
             tracing::warn!(target: "input::macos", %error, "受控光标锚定 warp 失败（下拍重试）");
         }
+    }
+
+    /// 受控光标锚点只读访问（11-24：macOS 主控热键回主控的落点 = 切入锚点，
+    /// docs/03 §4.6）。`Some` = 受控中，锚点已捕获（全局点坐标——受控期间用户
+    /// 所见的光标位置）；`None` = 未受控，或切入时光标查询失败未捕获到锚点
+    /// （调用方据此让光标停在当前位置）。只读 `pin_point`，不改锚定状态；
+    /// 锁中毒处理同 [`CaptureSource::pin_cursor_to_anchor`]。
+    #[must_use]
+    pub fn anchor_point(&self) -> Option<(f64, f64)> {
+        *self
+            .pin_point
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 停止捕获：runloop stop → 回调线程退出 → tap drop（mach port 失效）→ join。

@@ -39,8 +39,20 @@ docs/08 §3 "单平台发布构建由打包脚本固定 `--features`" 的同款�
 scripts/macos/dmg.sh          # 产物 target/pkg/macos/XControl-<版本>.dmg（拖拽安装：含 /Applications 链接）
 ```
 
-TCC 授权注意事项同样适用：**固定路径安装**——.app 移动会破坏已授予的权限
-（[05-platform.md](05-platform.md) §1 打包行）。正式签名（Developer ID + 公证）属
+**应用图标（2026-11-24）**：bundle 带应用图标——`Contents/Resources/AppIcon.icns`，
+`Info.plist` 以 `CFBundleIconFile = AppIcon` 引用（Finder / Dock 不再显示系统默认
+空白图标）。图标是入库产物 `scripts/macos/AppIcon.icns`，`dmg.sh` 只读取它，**打包
+不依赖 swift**；图形与托盘图标同源（环形加中心点、品牌蓝，
+[06-ui.md](06-ui.md) §5.1）。改图形：编辑 `scripts/macos/icon.swift` → 运行
+`scripts/macos/icon.sh` 重新生成 `.icns` → 提交。
+
+**辅助功能授权按签名匹配（2026-11-24 部署实测更正）**：本包是 ad-hoc 签名，TCC
+的辅助功能授权随签名走——同一个 `/Applications/XControl.app` 路径换上新构建后
+授权即失效（主控日志：`主控捕获源启动失败 … CGEventTapCreate 返回空`），与路径
+无关。**每次换装新构建后**都要在系统设置 > 隐私与安全性 > 辅助功能 里为 XControl
+重新开启；未授权启动时应用会请求系统引导框，开启后主控约 1s 自动恢复、不需要
+重启（§1.2）。此前"TCC 按路径记忆、固定路径安装即可保住授权"的说法不准确，已
+更正（[05-platform.md](05-platform.md) §1.3）。正式签名（Developer ID + 公证）属
 CI 发布流程移交项（[05-platform.md](05-platform.md) §1）。
 
 ### 1.2 权限引导：辅助功能
@@ -48,7 +60,9 @@ CI 发布流程移交项（[05-platform.md](05-platform.md) §1）。
 - 主控与从机角色都需要**辅助功能**授权（[05-platform.md](05-platform.md) §0 矩阵、§6 对照表）。
 - 授权路径：系统设置 > 隐私与安全性 > 辅助功能 → 将 xcontrol-app 加入并开启。
 - 向导深链（FR-6.3）：运行时以 `AXIsProcessTrustedWithOptions(kAXTrustedCheckOptionPrompt)` 检测并跳转系统设置（[05-platform.md](05-platform.md) §1）。
-- 未授权的表现：事件 tap 回调被系统**静默忽略**（不报错）——表现为捕获无事件、注入无效，务必先授权（[05-platform.md](05-platform.md) §1）。
+- **启动时的系统引导框（2026-11-24）**：应用启动、角色确定后若未授权，会请求系统引导框并在日志留一条 `warn`（`app::main`：辅助功能未授权：已请求系统引导框……）；两种角色都做。已授权只留一条 `info`。`--headless`（无 UI 运行）**不请求系统引导框**，只留同一条指引的 `warn`（2026-11-25）。
+- **授权后无需重启（2026-11-24）**：主控每秒静默检测一次授权，开启后约 1s 日志出现「主控捕获源已恢复」，热键与捕获转发随即可用。判定成功看这条日志，而不是进程存活。若授权前已靠边缘切换切入过工作机（未授权时边缘切换仍可用，只是不转发输入），恢复前会先自动释放这次控制关系并留一条「授权前已切入：已先释放控制关系，请重新切换」，需要重新切换一次（2026-11-25）。已授权但捕获源仍起不来的告警不会每秒重复：首次立即，之后至多 30s 一条。
+- 未授权的表现：主控侧启动时即有 `主控捕获源启动失败` 告警（active tap 创建被系统拒绝，2026-11-24 实测），热键与捕获转发停用；从机侧注入无效。务必先授权（[05-platform.md](05-platform.md) §1、§1.3）。
 
 ### 1.3 签名与防火墙
 
@@ -237,3 +251,4 @@ xcontrol-cli --status --log-tail 50
 | 2026-11-18 | 初版（任务 11-17-m3-packaging）：三平台安装/防火墙/权限指引；交付 `scripts/windows/firewall.ps1`、`scripts/macos/codesign.sh` |
 | 2026-11-20 | M6 安装包收口（任务 11-19-m6-release）：§1.1 dmg.sh（本机实测）/ §2.1 msi 脚本（WiX，移交实跑）/ §3.1 deb+AppImage 脚本（远端实测）；firewall.ps1 增 `-Uninstall`（MSI 卸载对称清理）；§4 表更新 |
 | 2026-11-20 | m6-release check 修正：`xcontrol.wxs` 防火墙 custom action 由 FileRef 型（type 34 = CreateProcess 直接启动安装文件——.ps1 非 Win32 可执行，必失败 error 1721）改为 SetProperty（type 51 存 powershell.exe 完整命令行）+ Property 型 deferred 执行（type 50）；Windows 侧实跑验证仍为移交项（§2.6）。§1.1/§2.1/§3.1 从源码构建命令补平台 feature（`--features macos/windows/x11`——默认全关，漏传无捕获/注入后端，README 快速开始同步） |
+| 2026-11-24 | 任务 11-24-edge-switch-latency-hotkey-return：§1.1 补应用图标（入库产物 `scripts/macos/AppIcon.icns`，`dmg.sh` 拷入 + `CFBundleIconFile`）；§1.1/§1.2 更正辅助功能授权的说法——**按签名匹配**而非路径（部署实测，换装新构建后需重新授权），并补启动时的系统引导框与主控捕获源自动恢复（实机验收待做，见 [05-platform.md](05-platform.md) §1.3） |

@@ -37,12 +37,12 @@ bit4+ 保留，只能随 minor 提升追加（新增位须在本文表格补录�
 
 | 功能 | API / crate | 要点 |
 | --- | --- | --- |
-| 捕获 | `core-graphics::event::CGEventTap::new`（kCGSessionEventTap）+ `core-foundation` CFRunLoop；回调返回 `Remove` 可吞事件 | 必须辅助功能授权；用 `AXIsProcessTrustedWithOptions(kAXTrustedCheckOptionPrompt)` 检测并引导；未授权时 tap 回调被**静默忽略**（不报错）——权限检测必须显式做 |
+| 捕获 | `core-graphics::event::CGEventTap::new`（kCGSessionEventTap）+ `core-foundation` CFRunLoop；回调返回 `Remove` 可吞事件 | 必须辅助功能授权；用 `AXIsProcessTrustedWithOptions(kAXTrustedCheckOptionPrompt)` 检测并引导；未授权时 tap 回调被**静默忽略**（不报错）——权限检测必须显式做。2026-11-24 部署实测补充：现行 **active tap**（M5 起，受控吞事件需要 Drop 能力）未授权时 `CGEventTapCreate` 直接返回空——`CaptureSource::start` 报错而非静默，见下方 §1.3 |
 | 注入 | `CGEvent` 构造 + `CGEventPost(kCGHIDEventTap)`（`core-graphics`；enigo 的 mac 后端同路径）；**指针定位（rel/abs/warp）走 `CGWarpMouseCursorPosition`**（11-19-m5-layout 实测修订，见 §1.1） | 修饰键用 `CGEventPost` 辅助事件或 flags 合成；Unicode 用 `CGEventKeyboardSetUnicodeString`；鼠标按键/滚轮仍走 CGEventPost（HID） |
 | 剪贴板 | `arboard`（text/image，`image-data` feature）+ `objc2-app-kit` public.html **原样挂载**（11-19-m5-clipboard-full：clearContents + setString_forType(html, NSPasteboardTypeHTML)，0.3.2 绑定为安全方法**零 unsafe**——M2 预留的 allow(unsafe_code) 未被消耗；不经 arboard `set_html`——其模板包装破坏 fragment 读回等价性）；图片 wire PNG↔RGBA 经 `png_codec`（NSImage/TIFF 读回重编码 → 等价判据像素级，docs/04 §2） | changeCount 轮询 250ms（无系统通知 API） |
-| 热键 | 捕获流识别（CGEventTap ListenOnly + `HotkeyFilter`；M4-hotkeys 裁定，docs/03 §4.6） | Carbon `RegisterEventHotKey` **不采用**——捕获识别已覆盖且少一条 Carbon 依赖；ListenOnly 无法吞事件，「不转发」= app 层过滤不产出转发事件（实测冒烟 `capture_hotkey_chain_smoke` PASS，2026-11-18） |
+| 热键 | 捕获流识别（CGEventTap active tap〔`CGEventTapOptions::Default`，M5 起；2026-11-25 更正，此前误记为 ListenOnly〕+ `HotkeyFilter`；M4-hotkeys 裁定，docs/03 §4.6） | Carbon `RegisterEventHotKey` **不采用**——捕获识别已覆盖且少一条 Carbon 依赖；tap 虽能吞事件，热键匹配却在事件过 tap 之后，「不转发」= app 层过滤不产出转发事件（实测冒烟 `capture_hotkey_chain_smoke` PASS，2026-11-18） |
 | 光标 | `CGEventGetLocation`（无需权限）+ tap 事件坐标 | 多屏 `CGGetDisplaysWithRect` |
-| 打包 | 签名（自签起步）+ 固定路径安装（.app 移动会破坏 TCC 授权） | 权限引导页检测 TCC 状态（ad-hoc 自签脚本 `scripts/macos/codesign.sh` 与安装指引见 [10-install.md](10-install.md) §1） |
+| 打包 | 签名（ad-hoc 起步）；**辅助功能授权按签名匹配**（2026-11-24 部署实测：同一 `/Applications/XControl.app` 路径换上新构建后授权即失效，重新授权后恢复——原"固定路径安装，.app 移动会破坏 TCC 授权"的说法不准确，已更正，见 §1.3）；`.app` 带应用图标 `Contents/Resources/AppIcon.icns`（`Info.plist` 的 `CFBundleIconFile` 引用） | 权限引导页检测 TCC 状态；图标为入库产物 `scripts/macos/AppIcon.icns`（`scripts/macos/icon.sh` 生成，`dmg.sh` 打包时拷入）；ad-hoc 自签脚本 `scripts/macos/codesign.sh` 与安装指引见 [10-install.md](10-install.md) §1 |
 
 ### 1.1 macOS 指针定位原语实测记录（11-19-m5-layout，2026-11-19）
 
@@ -80,15 +80,80 @@ M2 的「相对移动经 MouseMoved 投递」行为自本修订起变更（本�
 | `CGAssociateMouseAndMouseCursorPosition(false)` | 调用成功但**光标仍跟随物理鼠标** | 实测（重关联时"跳回物理鼠标位"的行为另见回切落点覆盖修复——associate 后需重放落点 warp） |
 | Session tap（active）吞 `MouseMoved` | **防不住光标移动**（macOS 指针合成在 HID 层，Session tap 下游的吞事件不影响光标合成） | 实测 |
 
-**唯一可达实现 = 每拍锚定 warp**（50ms 周期 `CGWarpMouseCursorPosition` 回
-切入锚点——warp 原语 3/3 亚像素命中见 §1.1）：光标被周期性拉回锚点 = 视觉
-静止。锚点取切入位置**内缩 90pt**（避边缘容差带防传感器边界打转，11-20）。
-光标可见（无法隐藏）为已知代价；锚定 warp 不生成事件（§1.1），无输入副作用。
+**唯一可达实现 = 每拍锚定 warp**（每 10ms 会话输入拍
+`CGWarpMouseCursorPosition` 回切入锚点——2026-11-24 勘误：此处原记 50ms，代码里
+的回拉一直发生在会话输入拍（`INPUT_POLL_INTERVAL` = 10ms）；warp 原语 3/3 亚像素
+命中见 §1.1）：光标被周期性拉回锚点 = 视觉静止。锚点取切入位置**内缩 90pt**
+（避边缘容差带防传感器边界打转，11-20）。光标可见（无法隐藏）为已知代价；
+锚定 warp 不生成事件（§1.1），无输入副作用。
+
+**受控期的两个推论（2026-11-24 补录，任务 11-24-edge-switch-latency-hotkey-return）**：
+
+- **受控期间主控边缘命中由 app 门控忽略**。锚定是周期回拉而非真正冻结：两次回拉
+  之间光标位移若超过锚点到屏边的 90pt（朝该方向约 9000pt/s 以上——按 10ms 拍的
+  算术推算，非实测值），会冲到屏边被边缘传感器命中。`drive_session` 的切入门控
+  因此只对"无人在控"（`ControlDir::None`）放行，受控期间的命中一律丢弃（debug
+  留痕）——否则重复发出的 `EdgeCrossing` 会把工作机光标拉回进入点、释放按键、
+  重置回切免疫窗。主控边缘轮询与锚定回拉同为 10ms 节拍、近乎同相位，**节拍提速
+  与受控期门控必须同进同退**（只提节拍会让误触发更频繁，docs/03 §5"死区"）。
+- **锚点同时是热键回主控的落点**。受控期间用户所见的光标位置即锚点：热键回主控
+  （`ReleaseControl`）时 app 层剥离 core 序列里的落点 warp，把锚点作为
+  `release_point` 在重关联**之后**重放（上表 associate 行记录的"重放落点 warp"路径）
+  ——光标原地解冻，不再跳到屏幕中央（docs/03 §4.6）。锚点不可得（切入时光标查询
+  失败）时光标停物理鼠标位。只读访问器 `CaptureSource::anchor_point`。
 
 **撞缘回锚已删除（11-22 实验证伪）**：其前提"受控 delta 随系统钳位断流"不
 成立——解关联后 HID 事件 delta 为**硬件增量**（与合成光标位置无关，无屏缘
 钳位），受控光标移动不受锚定影响（对照实验：停用锚定后被控光标正常移动）。
 回锚的可见跳变与其存在必要性一并移除。
+
+### 1.3 macOS 辅助功能授权：未授权引导与自动恢复（2026-11-24 实装）
+
+**授权按签名匹配（2026-11-24 部署实测）**：ad-hoc 签名的应用，TCC 的辅助功能
+授权随签名走。实测记录：同一个 `/Applications/XControl.app` 路径换上新构建后，
+主控日志出现 `主控捕获源启动失败 … CGEventTapCreate 返回空（参数或权限被系统
+拒绝）`；旧包当天下午在同一路径正常；在系统设置里重新开启授权后恢复。结论：
+**每次重新打包/换装新构建后都要重新授权**——"固定路径安装即可保住授权"不成立
+（此前 docs/05 §1 打包行、docs/10 §1.1 与 `scripts/macos/dmg.sh` 头注的"按路径
+记忆"说法已更正）。授权路径：系统设置 > 隐私与安全性 > 辅助功能。
+
+**实现**（任务 11-24-edge-switch-latency-hotkey-return R9，FR-6.3；此前弹框能力
+从未被调用，未授权启动只留一条捕获源失败告警，授权后必须重启应用）：
+
+- **启动引导**（`main.rs` 运行时启动路径 `supervise_runtime`：角色确定后、进入
+  host / client 循环之前，每进程一次）→ `hotkey_rt::guide_accessibility_at_startup`：
+  先 `check_accessibility(false)` 静默查询；已授权 → `info!` 留痕；未授权 →
+  `check_accessibility(true)` 请求**系统引导框**（`AXIsProcessTrustedWithOptions`，
+  `kAXTrustedCheckOptionPrompt`）并 `warn!` 留痕。**两种角色都做**（主控要捕获、
+  从机要注入）。托盘角色切换/配置重建走 supervisor 主循环，不重复请求；向导的
+  权限页（实时检测 + 打开系统设置）不变，向导流在向导完成、运行时启动时触发。
+  **`--headless`（无 UI 运行时）只 `warn!` 与指引文案，不请求系统引导框**
+  （2026-11-25；无界面进程不触发系统框）。动作由纯函数 `startup_guide_action`
+  决定，有单测。
+- **自动恢复**（`session_rt::drive_session` 输入拍内）：角色为 Host 且捕获源缺席
+  时，每 `CAPTURE_RETRY_INTERVAL`（1s）静默查询一次（`prompt = false`，未授权
+  期间不刷日志）；变为 Granted 后按纯决策 `capture_recovery_step` 分三步：
+  - 未被控 → 直接重建（`rebuild_capture_source`）；
+  - **名义上处于受控态**（未授权期间没有捕获源，但边缘传感器不需要权限，主控
+    仍可靠它切入）→ **先经 `ReleaseControl` 释放，再重建**（2026-11-25）：
+    `ReleaseAll` 与 `LeaveScreen` 照常下发，落点 warp 剥离（光标不动），日志
+    「授权前已切入：已先释放控制关系，请重新切换」。不释放的话，捕获源一恢复
+    本地输入拦截与转发立即生效，键鼠被送到工作机，而用户并没有在此刻发起切换；
+  - 名义上受控且**共享暂停中** → 推迟到恢复之后（暂停期间对端拒收全部输入帧，
+    此时 `LeaveScreen` 会被丢弃、两端控制状态失配；暂停期间捕获源缺席，本就
+    什么都不转发）。
+  重建成功 `info!` 留痕（日志含「主控捕获源已恢复」）——热键识别与捕获转发随即
+  可用，**不需要重启应用或重建会话**。从机侧不建捕获源，没有对应的恢复逻辑。
+- **失败日志**：会话装配点的首次失败（`hotkey_rt::host_capture_source`）告警是
+  可执行的说法——去系统设置授权，授权后约 1s 自动恢复。会话内的重建走静默形态
+  `try_host_capture_source`：已授权但启动持续失败时，**重试仍每秒一次，告警退避**
+  ——首次立即、之后至多 30s 一条（`CAPTURE_FAILURE_LOG_INTERVAL`，2026-11-25），
+  恢复成功复位并 `info!` 一次。
+
+**待实测**（设计 D15，部署时确认后回写本节）：① 应用已在辅助功能列表里但
+未勾选时，系统引导框是否出现；② 整条链路的实机验收（未授权启动弹引导框 →
+授权后约 1s 主控日志出现捕获源已恢复 → 热键与转发可用；任务 11-24 的 AC11）。
+代码不对引导框的具体形态做假设。
 
 ## 2. Windows
 
@@ -496,6 +561,61 @@ Wayland 会话，环境配方同 §3.1——Xwayland :1 rootless + 自建 rootfu
     3s 超时——不阻断结论不可复现（或系首测时用户在场点击），按超时取证口径
     归移交项；**无人值守三 portal 项统一形态 = `PortalInitError::Timeout`**
     （复跑确认），授权后实际注入落屏验证移交用户在场。
+- **uinput 受控移动注入修订**（2026-11-22 实验记录，2026-11-24 自
+  `platform/wayland.rs` `UinputInjector` 字段注释转录入文档，不新增平台断言）：
+  受控**移动**注入改回 REL（REL_X/REL_Y）——kwin 边缘/角落判定对 ABS 注入路径
+  不响应，REL 路径（物理鼠标同源）实验确认响应；加速由 libinput quirks 对本设备
+  单独关闭（flat），原 11-20 改 ABS 的前提（REL 被 compositor 加速放大）随
+  quirks 消除。`warp` 与 `MouseMoveAbs` 仍走 ABS 绝对定位（落点语义不经加速
+  曲线）——上文"注入主路径"声明的 ABS_X/Y 即为此用。
+- **uinput 位置模型**（2026-11-24，任务 11-24-edge-switch-latency-hotkey-return）：
+  uinput 无"查询真实光标"入口，注入器自己维护的虚拟位置 `virt_x/virt_y`
+  （ABS 轴域）就是位置模型的唯一事实源。三条纪律：
+  1. **回报取自 virt**：受控光标采样（`cursor_normalized`）= `virt / max`——必须
+     与真实光标一致，否则主控的回切判定基于一个与真实光标无关的虚构位置；
+  2. **`warp` 同步 virt**（11-20 跳变根因修复的延续：先写 virt 再发 ABS）；
+     `resync_cursor` 只把真实光标 ABS 定位回 virt、**不改 virt**。注意 `inject`
+     的 `MouseMoveAbs` 分支只发 ABS、**不写 virt**——与 `warp` 不对称，属既有
+     行为（本任务未改）；若将来有主控经 `ForwardInput` 转发 `MouseMoveAbs` 到
+     uinput 工作机（如 EIS 绝对运动捕获源接入转发链），须先补该分支的 virt
+     同步，否则回报与下一条 MoveRel 的起算点都会脱节；
+  3. **`release_all` 保留 virt**：切出/暂停只释放按键，真实光标原地不动——原
+     "虚拟位置复位回屏幕中心"是 11-20 ABS 模式的遗留，现行 REL 注入下不产生
+     任何可见效果，只破坏位置模型（热键切换先产 `ReleaseAll`、随后
+     `EnterScreen{preserve_cursor=1}` 不 warp，回报从此基于虚构位置的根因）。
+     顶边行程在此**清零**（见下条）。
+
+  保持原位切入后的校准钩子 `InputSink::resync_cursor`（core trait 默认无操作，
+  仅 uinput 覆写）：热键/托盘切入瞬间把真实光标定位到上次受控结束的位置（进程
+  启动后首次为屏幕中心）。工作机自己的物理鼠标在未受控期间挪过光标时表现为
+  "跳回上次位置"——这是没有"查询真实光标"入口的平台上的唯一可行解，与
+  docs/02 §4.2 对 `preserve_cursor` 的定义一致。**实机已确认**（2026-11-24，
+  Linux uinput 工作机：热键切入后光标位于上次受控结束的位置，朝主控方向推边
+  可回切——任务 11-24 的 AC3）。
+- **uinput 顶边行程度量**（2026-11-24，回切行程补偿；docs/03 §5 回切第 7 条、
+  docs/02 §4.2「反向回报取值范围扩展到端点之外」）：光标被推出屏幕边界期间，
+  被边界截掉的推进量不再丢失——注入器新增 `overflow_x / overflow_y`（顶边行程，
+  单位 = 控制方转发的 `MouseMoveRel` delta 单位，符号 = 推出方向）：
+  1. **推进**（`inject(MouseMoveRel)` 两轴都经纯函数 `advance_axis`）：虚拟位置
+     仍钳在边界；越过上界累加超出量（正值 = 推出右/下边界），越过下界累加负量
+     （= 推出左/上边界）；严格回到屏内清零；贴边且该轴无位移时**保留**（这一拍
+     只沿另一轴移动，行程须继续随每条回报带出，否则回报退回端点值）；
+  2. **回报**（`cursor_normalized`）：有行程时回报端点之外的值——推出右/下边界
+     回报 `1.0 + 行程`，推出左/上边界回报负值（绝对值 = 行程）；无行程时维持
+     端点收敛逻辑（取值仍在 [0, 1]，与 11-22 契约一致）。主控仍按 `≤ 0` / `≥ 1`
+     判极值，行程随回切通知带出、用于落点补偿（补偿在主控 app 层完成：光标先落
+     在未补偿的贴缘基点，夹取后的补偿量切成 2ms 微步、匀速，由专用线程经
+     `xcontrol_input::shift_cursor`（进程级线程安全 warp，不依赖实例状态）逐步
+     回放，步数 ≤ 30、总时长 ≤ 60ms；docs/03 §5 回切
+     第 7 条）；
+  3. **清零**：`warp`（重新定位，旧行程作废）与 `release_all`（切出后光标停在
+     边上，顶边行程已随触发回切的那条回报交付主控，不带到下一次受控——保持
+     原位切入后光标仍在边上，残留行程会让主控凭空多补一段位移）。
+
+  平台矩阵：只有 uinput 度量行程；macOS / X11 被控端读真实光标、不度量，回报
+  仍为端点值（回切落点没有这部分补偿）。行程精度 = 注入的整数格（REL 小数格
+  累积器的余量成格时才计入，误差 < 1 格）。**实机效果待验收**（mac 主控 + Linux
+  uinput 工作机快速甩动回切后的落点连续性——任务 11-24 的 AC10）。
 
 ## 5. 全局热键统一策略（FR-2.5）
 
@@ -517,8 +637,8 @@ Wayland 会话，环境配方同 §3.1——Xwayland :1 rootless + 自建 rootfu
 
 | 平台 × 角色 | 权限 | 检测方式 | 向导动作 |
 | --- | --- | --- | --- |
-| mac 主控 | 辅助功能 | `AXIsProcessTrusted()` | 深链系统设置 + 等待轮询 |
-| mac 从机 | 辅助功能（注入需要） | 同上 | 同上 |
+| mac 主控 | 辅助功能 | `AXIsProcessTrusted()` | 深链系统设置 + 等待轮询；运行时另有启动时的系统引导框请求与捕获源每秒探测自动恢复（2026-11-24，§1.3） |
+| mac 从机 | 辅助功能（注入需要） | 同上 | 同上（启动时的系统引导框请求两种角色都做） |
 | win 主/从 | 无（提权可选：UIPI） | `IsUserAnAdmin` 分支提示 | 说明框（可选"以管理员运行"） |
 | win 防火墙 | 监听端口入站 | `netsh` 查询规则 | 安装器预配置 |
 | x11 主/从 | $DISPLAY 可用 | 连接测试 | 错误诊断页 |

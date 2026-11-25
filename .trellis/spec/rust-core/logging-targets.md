@@ -43,8 +43,7 @@
 | `net::connect` | xcontrol-app session_rt.rs（从机侧） | 拨号/重连/候选握手失败 |
 | `net::transport` | xcontrol-net transport.rs（crate 内直接打，11-21 过审 tracing 依赖） | 流错位重同步锁定候选（warn）/传输态解密失败（warn）——大图断连排查盲区教训：net 层静默使错位第一因不可见 |
 
-审计结论：`input::` / `clipboard::` 无 target 使用（两 crate 零 tracing 依赖，
-平台层零日志纪律）；M1 遗留的 app::/session::/net:: 三前缀已在本表固化
+审计结论（2026-11-24 复核更正）：`input::` 前缀**已在用**——`input::macos`（platform/macos.rs：tap/锚定/warp 失败 warn、HID 位置探针 info）与 `input::wayland`（platform/wayland.rs：受控光标采样 debug、环境探测日志）合计约 48 处；原"无 target 使用"的结论自平台模块接入 tracing 起即过期。两段式 `input::<platform>` 与三段制并存（统一改名要动约 48 处调用，留待日志面整体整理时处理），新增平台日志沿用并在本表登记。`clipboard::` 仍无 target 使用（M1 遗留的 app::/session::/net:: 三前缀已在本表固化
 （11-21 UX 打磨轮复验补录 `app::settings`——此前漏登记；11-21 大图断连排查
 补录 `net::transport`——net crate 唯一直接日志点，此前全部经 app 层转打）。
 

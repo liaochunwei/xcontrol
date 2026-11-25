@@ -87,11 +87,17 @@
 
 ## 两机 KVM 实测要点（11-20 实机联调定稿）
 
-- **受控注入必须 ABS 虚拟光标**（KDE/Wayland）：REL 位移被 compositor 指针加速放大数倍（小幅移动光标狂奔）。主控维护 virt_x/virt_y 累加 + ABS 直发；**warp 必须同步 virt 坐标**（否则 MoveRel 从陈旧位置起跳——进入后跳变元凶）；uinput ABS 轴 `AbsInfo.resolution` 必填（=0 时 libinput 分类为触屏类，触发角/手势管线不喂——1000 units/mm 惯例）。
+- **受控注入必须 ABS 虚拟光标**（KDE/Wayland；**11-24 勘误**：11-22 起现行代码改回 REL 注入——加速由 libinput quirks 对本设备关闭，见下方「uinput 位置模型纪律」；本条余下内容保留为 11-20 的实测历史）：REL 位移被 compositor 指针加速放大数倍（小幅移动光标狂奔）。主控维护 virt_x/virt_y 累加 + ABS 直发；**warp 必须同步 virt 坐标**（否则 MoveRel 从陈旧位置起跳——进入后跳变元凶）；uinput ABS 轴 `AbsInfo.resolution` 必填（=0 时 libinput 分类为触屏类，触发角/手势管线不喂——1000 units/mm 惯例）。
 - **受控光标策略定稿**：切入瞬间**锁定当前位置**为锚点（每拍 warp 回该点，光标"冻结在切入处"）——比角点锚自然（无边界噪声/无跳底部/视觉语义对）。锚定与触边采样解耦：锚点在屏内侧则传感器安静。
 - **macOS 26 非前台限制（探针实测）**：`CGDisplayHideCursor`/`CGAssociateMouseAndMouseCursorPosition` 对非前台进程**均被忽略**（返回 0 但无效果）——cargo run 裸进程受控时光标可见但冻结。正式 .app 打包（GUI 身份）后预计生效，0.1.x 验证项。
 - **探针方法论**：平台语义怀疑时先写最小 ObjC 探针实测（`clang -framework CoreGraphics probe.m`）——本轮三个"理论正确"的方案（associate 解关联/warp 无事件论/hide 全局生效论）全被探针修正。warp 实测**不产生 MouseMoved 事件**（tap 零输出）。
 - **调试经验**：从机收帧 dump（全帧 head hex）比猜偏移快——第一版观测偏移错（seq 低字节≠kind），第二版才对上；SSH 非交互环境的 PATH/WAYLAND_DISPLAY/XDG_RUNTIME_DIR 三件套每次都要显式。
+
+- **uinput 位置模型纪律（11-24）**：现行代码（`wayland.rs`，11-22）受控移动走 **REL 注入**——代码注释的实测记录：加速由 libinput quirks 对本设备单独关闭（flat）后 REL 不再被放大；kwin 边缘/角落判定对 ABS 注入不响应、对 REL 响应。`virt_x / virt_y` 是位置模型的**唯一事实源**（回报 `cursor_normalized` 与 MoveRel 的起算点都取自它）：`warp` 同步 virt；`release_all` **保留** virt（复位回中心 = `preserve_cursor=1` 的热键切入之后回报基于虚构位置、边缘回切失效）；`InputSink::resync_cursor` 把真实光标 ABS 定位回 virt（保持原位切入后 app 调一次；默认无操作，仅 uinput 覆写）。**已知不对称**：`inject(MouseMoveAbs)` 分支只发 ABS、不同步 virt——当前转发链不产该事件（mac 捕获只产 MoveRel），reis 捕获源会产，接入转发之前必须先补同步。
+- **macOS 受控期门控与节拍耦合（11-24）**：锚点内缩 90pt 只能让**慢速**移动下的传感器安静；快速移动时光标在两次锚定回拉之间照样冲到屏边。因此受控期间的主控边缘命中由 app 门控一律忽略，控制关系变化后另有 150ms 防抖（`session_rt.rs` 的 `edge_hit_allowed` / `edge_dead_time_elapsed`）。边缘轮询与受控回报节拍 `DEFAULT_POLL_INTERVAL`（10ms）与锚定回拉（会话输入拍 `INPUT_POLL_INTERVAL`，同为 10ms）近同相位——**只提节拍会让受控期误触发更频繁，只收紧门控则撞边停滞不变，两者必须同进同退**。锚点同时是热键回主控的落点：`CaptureSource::anchor_point()` 只读，经 `pending_release_warp` 在重关联**之后**重放（先 warp 再重关联会被覆盖，11-22 教训）。
+
+- **uinput 顶边行程度量（11-25）**：`advance_axis`（越界累加被截掉的推进量、回到屏内即清零、贴边且该轴无位移时保留）+ `axis_report`（`overflow < 0` 回报负值、`> 0` 回报 `1.0 + overflow`）；`warp` / `release_all` 清零。回报值因此可以越出 `[0, 1]`。既有取整：`warp` 取 x=1.0 时 `virt = max + 1`，`advance_axis` 对域外起点按边界起算，那 1 格不算行程。
+- **macOS 辅助功能授权按签名匹配（11-24 实测）**：ad-hoc 签名的 .app 重新打包后授权即失效——同一路径、同一 bundle id，`CGEventTapCreate` 直接返回空（"未授权时 tap 创建成功但静默忽略"的旧说法只对 ListenOnly 成立）。引导与恢复：启动时 `guide_accessibility_at_startup`（未授权 → `check_accessibility(true)` 请求系统引导框；`--headless` 只告警不弹框）+ 会话内每秒静默探测、已授权即重建捕获源；恢复前若名义上处于受控态，先 `ReleaseControl`（剥离落点 warp，光标不动），避免授权瞬间本地输入被突然转发到工作机。
 
 ## SSH 部署红线（2026-11-21 实测轮，两坑实踩）
 

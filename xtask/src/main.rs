@@ -264,6 +264,10 @@ const RED_LINE_ALLOWED_DEPS: &[(&str, &[&str])] = &[
             "gpui-kit",
             "thiserror",
             "windows-registry",
+            // 11-25 PR #1 windows job 实测：windows_registry::Error 在 0.6 不可见
+            // （E0603），registry_error 收口函数改点名 windows_result::Error——
+            // windows-registry 0.6.1 的错误类型出处（同版 0.4.x，零新树）。
+            "windows-result",
         ],
     ),
     (

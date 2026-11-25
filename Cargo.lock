@@ -9500,6 +9500,7 @@ dependencies = [
  "gpui-tray",
  "thiserror 2.0.21",
  "windows-registry 0.6.1",
+ "windows-result 0.4.1",
  "xcontrol-i18n",
 ]
 

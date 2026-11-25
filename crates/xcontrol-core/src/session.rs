@@ -60,7 +60,10 @@
 //!   `EnterScreen{target, edge, ratio}`）：进入边从布局图推导
 //!   （[`crate::layout::entry_edge_into`]，无邻边回退 target 左缘 = Next 语义），
 //!   ratio 取 [`crate::layout::SWITCH_ENTRY_RATIO`]（0.5 居中）。被控中
-//!   （`PeerControlsLocal`）不接管（切换门控的镜像防御）。
+//!   （`PeerControlsLocal`）不接管（切换门控的镜像防御）。**切入后的回切触发边
+//!   = 进入边**（受控屏面向主控的边，11-24 更正）——与边缘路径同一定义
+//!   （`ControllingContext.outer_edge`），任何新增接管路径都必须产出相同的
+//!   `outer_edge`。
 //! - **双向边缘回切**（11-21 两机联调反馈 5，docs/03 §5）：受控屏光标位置由
 //!   被控方经 `MouseMoveAbs`（kind 0x04 反向语义，docs/02 §4.2 修订）回报；
 //!   控制方（`LocalControlsPeer`）收到回报**消化为判定输入而非注入**（注入会
@@ -68,13 +71,23 @@
 //!   切出边的对侧，11-22 语义改判）极值回报（对端容差带收敛契约：边缘驻留
 //!   回报恰 0.0/1.0）**且**上次回报以来仍转发过同方向 `MouseMoveRel`（同向
 //!   武装）→ 触发回切 = ReleaseControl 同型释放（`ReleaseAll` +
-//!   `LeaveScreen{mods}`）+ 环绕落点 warp（主控面向屏背向边缘内缩
-//!   [`EDGE_RETURN_INSET`]，ratio 保持）。**角落排除**（11-22 第三轮）：正交
-//!   轴回报也处于极值端点（角落区）不触发——角落留给系统热区（KDE 触发角
-//!   专用），与 [`crate::layout::edge_crossing`] 的切入侧排除对称。**按键门控**
+//!   `LeaveScreen{mods}`）+ 环绕落点 warp（主控面向受控屏的那条边内侧内缩
+//!   [`EDGE_RETURN_INSET`]，ratio 保持）。**回切免疫窗按时间计**
+//!   （[`RETURN_IMMUNITY_MS`]，接管后 800ms；11-24 起与回报频率解耦——原按
+//!   回报条数计，节拍一变窗口跟着变）。**角落排除**（11-22 第三轮；11-24 改为
+//!   角落区）：正交轴回报落在角落带（[`crate::layout::in_corner_band`]）不触发
+//!   ——角落留给系统热区（KDE 触发角专用），与
+//!   [`crate::layout::edge_crossing`] 的切入侧排除共用同一比例。**按键门控**
 //!   （11-22 第三轮）：任意鼠标键按下（[`LocalCmd::MouseButtons`] 位图直通）
 //!   不触发——拖拽中不切换；热键回切不经此判定面。本轮范围裁定：**单跳**
 //!   （受控屏面向主控边 → 主控）；多屏链回邻屏移交后续里程碑（当前部署 2 屏）。
+//!   **回切行程补偿**（11-24，R8）：受控屏回报的取值可到端点之外（docs/02 §4.2
+//!   「反向回报取值范围扩展」）——被控光标顶边期间被屏幕边界截掉的位移；触发
+//!   回切时这段行程经 [`Notice::EdgeReturnedToHost`] 的 `overflow` 字段随通知带出
+//!   （[`beyond_edge`]），序列里的落点 warp 不含补偿，加到落点上由执行层完成
+//!   （主控侧另补在途/丢弃的两段位移，docs/03 §5 回切第 3 条）。
+//! - **Home 的落点**（[`LocalCmd::ReleaseControl`]）：core 产出主屏内侧落点
+//!   warp；macOS 主控在 app 层以切入锚点替换此落点（11-24，docs/03 §4.6）。
 //! - 任何进入 `Disconnected` 的转移统一产出 `ReleaseAll` + 断开通知：断开即
 //!   控制关系终结，已注入按键必须释放（docs/03 §3 防卡键不变量的断开分支）。
 
@@ -207,10 +220,11 @@ pub enum LocalCmd {
     /// 调用方门控：仅 Running 且未共享暂停（Paused 下出站输入帧会被对端拒绝）。
     ForwardInput(InputEvent),
     /// 受控屏光标位置回报（双向边缘回切，11-21 反馈 5；docs/02 §4.2 kind 0x04
-    /// 反向语义）：被控方把受控屏光标归一化位置（容差带收敛端点值契约）回报
-    /// 控制方——判定/回切决策全在对端状态机。内部门控：仅
-    /// `PeerControlsLocal` 且受控目标已知时出站 `MouseMoveAbs{screen: 目标}`，
-    /// 其余无操作；非有限坐标防御丢弃。
+    /// 反向语义）：被控方把受控屏光标归一化位置（容差带收敛端点值契约；光标
+    /// 被推出屏边时为**端点之外**的值，幅值 = 顶边行程——docs/02 §4.2「反向回报
+    /// 取值范围扩展」，11-24）回报控制方——判定/回切决策全在对端状态机。内部
+    /// 门控：仅 `PeerControlsLocal` 且受控目标已知时出站 `MouseMoveAbs{screen:
+    /// 目标}`，其余无操作；非有限坐标防御丢弃。
     ReportControlledCursor {
         /// 受控屏光标归一化 X（对端受控屏空间 0..1）。
         x: f32,
@@ -317,7 +331,10 @@ impl Outbound {
 }
 
 /// 会话通知（状态迁移的对外可见事件；UI/日志/重连策略消费）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 只派生 `PartialEq`：[`Notice::EdgeReturnedToHost`] 的回切行程是浮点字段
+/// （11-24），浮点不满足 `Eq`；全仓没有以 `Notice` 作集合键或要求 `Eq` 的用法。
+#[derive(Debug, Clone, PartialEq)]
 pub enum Notice {
     /// 版本协商完成（含会话 id 与协商 minor）。
     HandshakeComplete {
@@ -340,6 +357,14 @@ pub enum Notice {
     EdgeReturnedToHost {
         /// 被释放的受控屏（全局 id）。
         target: ScreenId,
+        /// 回切行程补偿的**回报段**（11-24，R8；docs/02 §4.2「反向回报取值范围
+        /// 扩展到端点之外」、docs/03 §5 回切第 3 条）：触发回切的那条回报里端点
+        /// 之外的行程 `(dx, dy)`——光标顶在受控屏边期间被屏幕边界截掉的位移，
+        /// 单位 = 本机转发的 `MouseMoveRel` delta 单位（主控的点），符号 = 推出
+        /// 方向（右/下为正，与本机屏幕坐标轴同向）。无越界、或被控端不度量行程
+        /// （macOS / X11）时为 `(0.0, 0.0)`。序列里的落点 warp **不含**这段补偿
+        /// ——执行层把它（连同主控侧另补的在途位移）加到落点上。
+        overflow: (f32, f32),
     },
     /// 对端请求切换到本机（FR-2.5）。
     SwitchRequested {
@@ -608,30 +633,39 @@ impl SessionEvent {
 
 /// 受控屏上下文（控制方视角；双向边缘回切判定输入，11-21 反馈 5）。
 ///
-/// 随 `EdgeCrossing` 接管建立（边缘/热键两条路径都汇于此），随释放（回切/
-/// Home/断开/对端 LeaveScreen）清除。`outer_edge` = **受控屏面向主控的边**
-/// （11-22 用户实测改判：回切走空间连续穿行——主控左缘滑出（向左移动）进入
-/// 受控屏后，用户在其**右缘**（面向主控侧）向右滑出即穿回主控，与"来时
-/// 方向相反、同一条边界穿越"的桌面连续直觉一致；原"外侧边绕回"模型（滑出
-/// 远离主控的边）与直觉相悖，废弃。几何：受控屏面向主控边 = 主控滑出边的
-/// 对侧——`opposite_edge(切出边)`）。
+/// 随 `EdgeCrossing` / `SwitchAck` 接管建立（边缘/热键两条路径都汇于此），随
+/// 释放（回切/Home/断开/对端 LeaveScreen）清除。`outer_edge` = **受控屏面向
+/// 主控的边**：
+/// - 边缘路径 = 主控滑出边的对侧（`opposite_edge(切出边)`）；
+/// - 热键/托盘路径 = 进入边本身（`entry_edge_into` 返回的已是受控屏的进入边，
+///   11-24 更正：原再取一次对侧，得到的是远离主控的边——热键切入后推回面向
+///   主控的边无效、推远离主控的边反而回切的根因）。
+///
+/// 几何语义（11-22 用户实测改判）：回切走空间连续穿行——主控左缘滑出（向左
+/// 移动）进入受控屏后，用户在其**右缘**（面向主控侧）向右滑出即穿回主控，与
+/// "来时方向相反、同一条边界穿越"的桌面连续直觉一致；原"外侧边绕回"模型
+/// （滑出远离主控的边）与直觉相悖，废弃。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ControllingContext {
-    /// 受控屏（全局 id，`EdgeCrossing.target`）。
+    /// 受控屏（全局 id，`EdgeCrossing.target` / `SwitchAck.target`）。
     target: ScreenId,
     /// 受控屏面向主控的边（极值判定与环绕落点共用）。
     outer_edge: ScreenEdge,
-    /// 接管以来的受控屏回报计数（免疫窗输入，11-22 慢速切入回弹修复）。
-    reports_since_takeover: u32,
+    /// 接管时刻（会话时钟毫秒；回切免疫窗的计时起点，11-24 按时间计）。
+    taken_over_ms: u64,
 }
 
-/// 回切免疫窗（受控屏回报条数；~800ms @50ms 采样）：接管后前 N 条回报不触发
-/// 回切——**死区减半历程下的慢速切入回弹修复**（11-22 用户实测；第三轮 1%→
-/// 0.5% 后切入惯性行程更短，本窗是防"切入即回切"的主防线）：死区 5%→1% 后，
-/// 切入惯性只需 1% 行程（2-3 帧 delta）即达极值，慢速切入的持续同向动量直接
-/// 触发"切入即回切"。免疫窗内动量自然消散；刻意回切在稳定期后推缘即可（手感
+/// 回切免疫窗（按时间：接管后 800ms；11-24 起与回报频率解耦——原为 16 条
+/// 回报 × 50ms 采样的等价换算，节拍一变窗口跟着变）：接管后窗内的受控屏回报
+/// 不触发回切——**死区减半历程下的慢速切入回弹修复**（11-22 用户实测；第三轮
+/// 1%→0.5% 后切入惯性行程更短，本窗是防"切入即回切"的主防线）：切入惯性
+/// 只需 1% 行程（2-3 帧 delta）即达极值，慢速切入的持续同向动量直接触发
+/// "切入即回切"。免疫窗内动量自然消散；刻意回切在稳定期后推缘即可（手感
 /// 代价 = 切入后短暂稳定期，与切换防抖 150ms 的放大版同语义）。
-const RETURN_IMMUNITY_REPORTS: u32 = 16;
+///
+/// 判定用回报**到达时刻**（[`Session::step`] 读时钟）与 `taken_over_ms` 之差
+/// （饱和）：差值 < 本常量 = 窗内，≥ 本常量 = 窗外可触发。
+const RETURN_IMMUNITY_MS: u64 = 800;
 
 /// XCP 会话状态机（角色感知；零 I/O，时钟注入，全部产出 [`SessionAction`]）。
 pub struct Session<C: Clock> {
@@ -982,7 +1016,7 @@ impl<C: Clock> Session<C> {
             SessionEvent::HandshakeReady { hs_hash } => self.execute_handshake_ready(hs_hash, now),
             SessionEvent::Frame(payload) => self.execute_frame(payload, now),
             SessionEvent::Timer => self.execute_timer(now),
-            SessionEvent::Local(cmd) => self.execute_local(cmd),
+            SessionEvent::Local(cmd) => self.execute_local(cmd, now),
         }
     }
 
@@ -1009,12 +1043,12 @@ impl<C: Clock> Session<C> {
             FramePayload::Unknown { .. } => Vec::new(),
             // 不达：transition 拒绝 Clip；防御性空。
             FramePayload::Clip { .. } => Vec::new(),
-            FramePayload::Input(event) => self.execute_input(event),
+            FramePayload::Input(event) => self.execute_input(event, now),
             FramePayload::Ctrl(msg) => self.execute_ctrl(msg, now),
         }
     }
 
-    fn execute_input(&mut self, event: InputEvent) -> Vec<SessionAction> {
+    fn execute_input(&mut self, event: InputEvent, now: u64) -> Vec<SessionAction> {
         match event {
             InputEvent::Key { code, state } => {
                 self.injected_mods.apply_key(code, state);
@@ -1028,13 +1062,9 @@ impl<C: Clock> Session<C> {
                 // 受控屏回报复位——「仍有同向移动」窗口 = 上一回报以来）；不匹配
                 // 屏的回报静默消化（武装不动，非受控屏不参与判定）。
                 if self.control_dir == ControlDir::LocalControlsPeer {
-                    // 免疫窗计数（11-22）：受控屏回报递增（foreign 屏不计——
-                    // 静默消化武装不动，与免疫窗无涉）。
-                    if let Some(ctx) = self.controlling.as_mut().filter(|ctx| ctx.target == screen)
-                    {
-                        ctx.reports_since_takeover = ctx.reports_since_takeover.saturating_add(1);
-                    }
-                    return match self.edge_return_actions(screen, x, y) {
+                    // 回切免疫窗按时间计（11-24）：判定取回报到达时刻（`now`）
+                    // 与接管时刻之差，回报本身不再计数（foreign 屏回报不参与判定）。
+                    return match self.edge_return_actions(screen, x, y, now) {
                         Some(actions) => actions,
                         None => {
                             if self.controlling.is_some_and(|ctx| ctx.target == screen) {
@@ -1128,15 +1158,17 @@ impl<C: Clock> Session<C> {
                     && self.control_dir != ControlDir::PeerControlsLocal
                 {
                     self.control_dir = ControlDir::LocalControlsPeer;
-                    // 注意：entry_edge_into 返回的**已是进入边**（对侧转换在
-                    // 该函数内完成）；回切触发边 = 受控屏面向主控的边 = 进入边
-                    // 的反向（ControllingContext 语义），故此处取对侧。
+                    // 回切触发边 = 受控屏面向主控的边 = **进入边**（11-24 更正，
+                    // docs/03 §5）：`entry_edge_into` 返回的已是受控屏的进入边，
+                    // 即 `ControllingContext.outer_edge` 的定义，与边缘路径
+                    // （`opposite_edge(主控滑出边)` 恰为进入边）同值——原再取一次
+                    // 对侧得到的是远离主控的边，热键切入后推回面向主控的边无效。
                     let entry_edge = crate::layout::entry_edge_into(&self.layout, target)
                         .unwrap_or(ScreenEdge::Left);
                     self.controlling = Some(ControllingContext {
                         target,
-                        outer_edge: opposite_edge(entry_edge),
-                        reports_since_takeover: 0,
+                        outer_edge: entry_edge,
+                        taken_over_ms: now,
                     });
                     self.return_armed = false;
                     let mods = self.local_mods.pressed();
@@ -1255,7 +1287,7 @@ impl<C: Clock> Session<C> {
         actions
     }
 
-    fn execute_local(&mut self, cmd: LocalCmd) -> Vec<SessionAction> {
+    fn execute_local(&mut self, cmd: LocalCmd, now: u64) -> Vec<SessionAction> {
         match cmd {
             LocalCmd::Pause => {
                 self.set_paused(true);
@@ -1289,11 +1321,11 @@ impl<C: Clock> Session<C> {
                 // 双向边缘回切上下文（11-21 反馈 5 / 11-22 语义改判）：回切触发
                 // 边 = 受控屏**面向主控的边** = 主控滑出边的对侧（空间连续穿行，
                 // 见 ControllingContext 文档）；同向武装复位——免疫窗（慢速切入
-                // 回弹修复）自接管起计。
+                // 回弹修复，按时间计）自接管起计。
                 self.controlling = Some(ControllingContext {
                     target,
                     outer_edge: opposite_edge(edge),
-                    reports_since_takeover: 0,
+                    taken_over_ms: now,
                 });
                 self.return_armed = false;
                 let mods = self.local_mods.pressed();
@@ -1333,7 +1365,9 @@ impl<C: Clock> Session<C> {
                 let mods = self.local_mods.pressed();
                 // 11-20 回切落点修复：Home 回主控时光标 warp 回主屏**内侧**
                 // （0.5/0.6 略偏下，避开边缘容差带——与 edge_point 死区同源，
-                // 防回切落点立即再触发边缘切换）。
+                // 防回切落点立即再触发边缘切换）。macOS 主控在 app 层以切入
+                // 锚点替换此落点（11-24，docs/03 §4.6：受控期间光标锚定在切入
+                // 处，回主控即原地解冻）。
                 vec![
                     SessionAction::ReleaseAll,
                     self.send_input(InputEvent::LeaveScreen { mods }),
@@ -1402,23 +1436,28 @@ impl<C: Clock> Session<C> {
 
     /// 受控屏外侧滑出回切判定（双向边缘回切，11-21 反馈 5，docs/03 §5）。
     ///
-    /// 输入 = 被控方回报的受控屏光标位置（`MouseMoveAbs` 反向语义）。触发条件
-    /// （全部满足）：
-    /// 1. 本机为控制方且回报屏 = 受控屏（上下文匹配）；
-    /// 2. 坐标有限（协议浮点拒绝语义的防御面）；
-    /// 3. 落在受控屏**外侧边**极值（对端容差带收敛契约：边缘驻留回报恰
+    /// 输入 = 被控方回报的受控屏光标位置（`MouseMoveAbs` 反向语义）与回报到达
+    /// 时刻 `now`。触发条件（全部满足）：
+    /// 1. 回报到达时刻已在回切免疫窗外（[`RETURN_IMMUNITY_MS`]，自接管起按
+    ///    时间计——与回报频率解耦，11-24）；
+    /// 2. 本机为控制方且回报屏 = 受控屏（上下文匹配）；
+    /// 3. 坐标有限（协议浮点拒绝语义的防御面）；
+    /// 4. 落在受控屏**外侧边**极值（对端容差带收敛契约：边缘驻留回报恰
     ///    0.0/1.0——内侧不触发，非极值不触发）；
-    /// 4. **角落排除**（11-22 第三轮，docs/03 §5）：正交轴回报也处于极值端点
-    ///    （光标同时贴两条边 = 角落区）→ 不触发——角落留给系统热区（KDE
+    /// 5. **角落排除**（11-22 第三轮，docs/03 §5；11-24 改为 5% 角落区）：正交轴
+    ///    回报落在角落带（[`crate::layout::in_corner_band`]，与切入侧共用同一
+    ///    比例——光标在屏角的角落区内贴边）→ 不触发——角落留给系统热区（KDE
     ///    触发角专用），回报照常消化、武装照常复位；
-    /// 5. **按键门控**（11-22 第三轮，docs/03 §5）：任意鼠标键按下（拖拽中）
+    /// 6. **按键门控**（11-22 第三轮，docs/03 §5）：任意鼠标键按下（拖拽中）
     ///    → 不触发——回报照常消化；松开后的下一次同向移动再武装；
-    /// 6. 同向武装（上次回报以来仍转发过滑出方向 `MouseMoveRel`——「仍有同
+    /// 7. 同向武装（上次回报以来仍转发过滑出方向 `MouseMoveRel`——「仍有同
     ///    方向移动事件」；边缘驻留无移动不触发）。
     ///
     /// 触发产出 = ReleaseControl 同型释放序列（防卡键顺序 docs/03 §5：
-    /// `ReleaseAll` → `LeaveScreen{mods}`）+ 环绕落点 warp + [`Notice::EdgeReturnedToHost`]，
-    /// 并清除控制关系（周期快照随控制关系终止）。
+    /// `ReleaseAll` → `LeaveScreen{mods}`）+ 环绕落点 warp + [`Notice::EdgeReturnedToHost`]
+    /// （携带回报段回切行程，[`beyond_edge`]；11-24），并清除控制关系（周期快照
+    /// 随控制关系终止）。**回切行程补偿不改变触发条件**：越界的回报值照常按
+    /// `≤ 0` / `≥ 1` 判极值，角落带仍只看沿边坐标。
     ///
     /// 范围裁定（11-21）：**单跳**——外侧边即使有邻居（多屏链 [主控][受控][C]）
     /// 也回主控，链式回邻屏移交后续里程碑（当前部署 2 屏）。
@@ -1427,11 +1466,13 @@ impl<C: Clock> Session<C> {
         screen: ScreenId,
         x: f32,
         y: f32,
+        now: u64,
     ) -> Option<Vec<SessionAction>> {
         let ctx = self.controlling?;
-        // 免疫窗（11-22 慢速切入回弹修复）：接管后前 N 条回报不触发（计数在
-        // execute_input 的回报入口递增；本条含在内——首条=1 ≤ 16 免疫）。
-        if ctx.reports_since_takeover <= RETURN_IMMUNITY_REPORTS {
+        // 免疫窗（11-22 慢速切入回弹修复；11-24 改按时间）：接管后 800ms 内
+        // 到达的回报不触发——判定基准 = 回报到达时刻（step 读时钟）− 接管时刻，
+        // 与回报条数/采样频率无关。
+        if now.saturating_sub(ctx.taken_over_ms) < RETURN_IMMUNITY_MS {
             return None;
         }
         if ctx.target != screen || !x.is_finite() || !y.is_finite() || !self.return_armed {
@@ -1440,10 +1481,11 @@ impl<C: Clock> Session<C> {
         if !at_outer_extreme(ctx.outer_edge, x, y) {
             return None;
         }
-        // 角落排除（11-22 第三轮，docs/03 §5）：正交轴也处于极值端点 = 角落区
-        // （用户明确意图：角落留给系统热区，边缘=切换）——回报照常消化（下方
-        // None 路径随条复位武装，键松开/离角后的下一次同向移动再武装）。
-        if at_orthogonal_extreme(ctx.outer_edge, x, y) {
+        // 角落排除（11-22 第三轮，docs/03 §5；11-24 改为 5% 角落区）：正交轴
+        // 回报落在角落带 = 光标在屏角的角落区内贴边（用户明确意图：角落留给
+        // 系统热区，边缘=切换）——回报照常消化（下方 None 路径随条复位武装，
+        // 键松开/离角后的下一次同向移动再武装）。
+        if orthogonal_in_corner_band(ctx.outer_edge, x, y) {
             return None;
         }
         // 按键门控（11-22 第三轮，docs/03 §5）：任意鼠标键按下（拖文件/拖滚动
@@ -1457,6 +1499,12 @@ impl<C: Clock> Session<C> {
             ScreenEdge::Left | ScreenEdge::Right => sanitize_ratio(y),
             ScreenEdge::Top | ScreenEdge::Bottom => sanitize_ratio(x),
         };
+        // 回切行程补偿（11-24，R8；docs/02 §4.2 反向回报取值范围扩展）：触发
+        // 回切的回报里端点之外的值 = 被控方顶边期间被屏幕边界截掉的位移，解出
+        // 后随通知带出（落点 warp 本身不含补偿，由执行层加到落点上）。上方的
+        // 角落带与落点 ratio 判定不受越界值影响（前者带内即不触发，后者已钳回
+        // [0,1]）；无越界（含被控端不度量行程的端点值回报）时行程为 0。
+        let overflow = (beyond_edge(x), beyond_edge(y));
         let (landing_screen, landing_x, landing_y) = self.edge_return_landing(ctx, ratio);
         self.control_dir = ControlDir::None;
         self.controlling = None;
@@ -1470,16 +1518,22 @@ impl<C: Clock> Session<C> {
                 x: landing_x,
                 y: landing_y,
             },
-            SessionAction::Notice(Notice::EdgeReturnedToHost { target: ctx.target }),
+            SessionAction::Notice(Notice::EdgeReturnedToHost {
+                target: ctx.target,
+                overflow,
+            }),
         ])
     }
 
-    /// 环绕落点（11-21 环绕闭合裁定）：受控屏外侧边滑出 → 主控面向屏的**背向
-    /// 边缘内缩点**（右缘滑出 → 主控左缘内侧 [`EDGE_RETURN_INSET`]，屏幕链
-    /// [主控][受控] 环绕闭合）。落点死区与进入落点同源——背向边缘无邻边时
-    /// （2 屏部署恒真）不可能立即再触发；有邻边时 inset 也在容差带内。
+    /// 环绕落点（11-21 环绕闭合裁定）：受控屏外侧边滑出 → 主控**面向受控屏
+    /// 的那条边**内侧内缩点（[受控][主控] 链：右缘滑出 → 主控左缘内侧
+    /// [`EDGE_RETURN_INSET`]；[主控][受控] 链对称：左缘滑出 → 主控右缘内侧）。
+    /// 落点死区与进入落点同源——内缩在边缘传感器容差带之外，回切后静置不可能
+    /// 立即再触发；持续朝受控屏方向外推的再触发由 app 层切入防抖（session_rt
+    /// `EDGE_SWITCH_DEAD_TIME`）与传感器闩锁承接。
     ///
-    /// 面向屏解析：受控屏面向主控边（外侧边的反向）的邻居且 `owner` = 本机 →
+    /// 落点屏解析：沿 `facing_edge`（= 主控的切出边，即 `outer_edge` 的反向）找
+    /// 受控屏的邻居，且 `owner` = 本机 →
     /// 该屏；缺失回退任一条边的主控邻屏（L 形多邻接），再回退主屏 0（布局
     /// 缺失/热点 Next 语义无邻边的接管路径）。
     fn edge_return_landing(&self, ctx: ControllingContext, ratio: f32) -> (ScreenId, f32, f32) {
@@ -1668,7 +1722,7 @@ const fn opposite_edge(edge: ScreenEdge) -> ScreenEdge {
 /// **与回切落点死区分离（11-22 两轮实测裁定）**：切入落点与回切落点消费面
 /// 不同（被控端 EnterScreen warp vs 主控端释放 warp），语义不共享。
 /// **1% → 0.5%（11-22 第三轮回调）**：切入贴缘衔接与回切落点对称；原 5% 的
-/// 防弹回职责已由回切免疫窗（`RETURN_IMMUNITY_REPORTS`，~800ms）承接——切入
+/// 防弹回职责已由回切免疫窗（`RETURN_IMMUNITY_MS`，按时间 800ms）承接——切入
 /// 惯性在免疫窗内自然消散，死区本身不再承担防弹回，贴缘安全。0.5% = mac
 /// 逻辑宽轴 7.5pt（1512）/ Linux 实机 4K 宽轴 19px（3840，docs/03 §5 KDE
 /// 触发角适配节），距容差带（±1 逻辑点）仍有 7.5 倍余量（mac），不触碰
@@ -1676,11 +1730,15 @@ const fn opposite_edge(edge: ScreenEdge) -> ScreenEdge {
 const EDGE_ENTRY_INSET: f32 = 0.005;
 
 /// 回切落点的**贴缘内缩**（11-22 用户实测：回切落点要求贴缘衔接，5% 感知
-/// "离边缘太远"）：主控面向屏背向边缘内缩——防弹回的真实防线是边缘传感
-/// 器容差带（±1 逻辑点）+ 切换防抖 + 回切免疫窗（`RETURN_IMMUNITY_REPORTS`）。
+/// "离边缘太远"）：主控面向受控屏的那条边内侧内缩——防弹回的真实防线是边缘传感
+/// 器容差带（±1 逻辑点）+ 切换防抖 + 回切免疫窗（`RETURN_IMMUNITY_MS`）。
 /// **1% → 0.5%（11-22 第三轮）**：与切入落点死区同源减半（感知 ~0.5cm），
 /// mac 7.5pt 仍 7.5 倍于容差带，安全余量保持。
-const EDGE_RETURN_INSET: f32 = 0.005;
+///
+/// 11-24 起公开：主控侧的回切落点补偿（app 层把回切行程加到落点上，docs/03 §5
+/// 回切第 3 条）夹回屏内时以**同一内缩量**作四周留白——补偿后的落点不得落到
+/// 别条边的容差带或角落区里。内缩量只此一处定义，执行层不另写比例。
+pub const EDGE_RETURN_INSET: f32 = 0.005;
 
 /// `EnterScreen` 到达点：边上坐标内缩 [`EDGE_ENTRY_INSET`]（Left/Right → x 固定，
 /// y=ratio；Top/Bottom 对称）。
@@ -1716,16 +1774,33 @@ const fn at_outer_extreme(outer: ScreenEdge, x: f32, y: f32) -> bool {
     }
 }
 
-/// 角落区判定（11-22 第三轮角落排除，docs/03 §5）：外侧边极值命中时，**正交
-/// 轴**回报也处于极值端点 → 光标同时贴两条边（角落区）。角落留给系统热区
-/// （KDE 触发角专用，边缘=切换），角落驻留不回切。判定与
-/// [`at_outer_extreme`] 同款精确语义（容差带收敛契约：角落驻留回报两轴恰
-/// 0.0/1.0）——与 [`crate::layout::edge_crossing`] 的角落排除对称（判定面：
-/// 主控切入 + 被控回切两处）。
-const fn at_orthogonal_extreme(outer: ScreenEdge, x: f32, y: f32) -> bool {
+/// 受控屏回报单轴的**端点之外行程**（11-24 回切行程补偿，纯函数；docs/02 §4.2
+/// 「反向回报取值范围扩展到端点之外」）：`v < 0` → `v`（推出左/上边界的行程，
+/// 负值）；`v > 1` → `v − 1`（推出右/下边界的行程，正值）；`[0, 1]` 内 → 0
+/// （无越界——含被控端不度量行程时的端点值回报 0.0/1.0）。单位 = 控制方转发的
+/// `MouseMoveRel` delta 单位，符号与屏幕坐标轴同向，两轴分量可直接相加到落点上。
+/// 非有限值由调用方先行拒绝（[`Session::edge_return_actions`]），本函数不另设防。
+fn beyond_edge(v: f32) -> f32 {
+    if v < 0.0 {
+        v
+    } else if v > 1.0 {
+        v - 1.0
+    } else {
+        0.0
+    }
+}
+
+/// 角落区判定（11-22 第三轮角落排除，docs/03 §5；11-24 由"正交轴恰为端点"
+/// 改为 5% 角落区）：外侧边极值命中时，**正交轴**回报落在角落带
+/// （[`crate::layout::in_corner_band`]——与切入侧
+/// [`crate::layout::edge_crossing`] 共用同一比例 [`crate::layout::CORNER_RATIO`]，
+/// 判定处不另写比例）→ 光标在屏角的角落区内贴边。角落留给系统热区（KDE 触发
+/// 角专用，边缘=切换），角落驻留不回切。垂直外侧边（Left/Right）看沿边坐标 y，
+/// 水平外侧边（Top/Bottom）看 x；非有限值已由调用方先行拒绝。
+const fn orthogonal_in_corner_band(outer: ScreenEdge, x: f32, y: f32) -> bool {
     match outer {
-        ScreenEdge::Left | ScreenEdge::Right => y <= 0.0 || y >= 1.0,
-        ScreenEdge::Top | ScreenEdge::Bottom => x <= 0.0 || x >= 1.0,
+        ScreenEdge::Left | ScreenEdge::Right => crate::layout::in_corner_band(y),
+        ScreenEdge::Top | ScreenEdge::Bottom => crate::layout::in_corner_band(x),
     }
 }
 
@@ -3071,24 +3146,21 @@ mod tests {
     ) {
         session.set_layout(host_layout_2x1());
         session_takeover(session, exit_edge);
-        // 免疫窗预热（11-22 慢速切入回弹修复）：回报计数推过
-        // RETURN_IMMUNITY_REPORTS（非极值回报不触发、随条复位武装）。
-        for _ in 0..=RETURN_IMMUNITY_REPORTS {
-            session
-                .step(SessionEvent::Frame(FramePayload::Input(
-                    InputEvent::MouseMoveAbs {
-                        screen: 1,
-                        x: 0.5,
-                        y: 0.5,
-                    },
-                )))
-                .unwrap();
-        }
+        // 免疫窗预热（11-22 慢速切入回弹修复；11-24 按时间计）：时钟越过
+        // RETURN_IMMUNITY_MS 后才可触发。
+        pass_immunity(session);
         session
             .step(SessionEvent::Local(LocalCmd::ForwardInput(
                 InputEvent::MouseMoveRel { dx, dy },
             )))
             .unwrap();
+    }
+
+    /// 免疫窗预热（11-24，`edge_return_actions` 按时间计）：推进会话时钟越过
+    /// [`RETURN_IMMUNITY_MS`]——接管后到达的极值回报自此可触发回切。直接推进
+    /// 会话持有的 [`TestClock`] 句柄（子模块可见私有字段），调用方无需另持句柄。
+    fn pass_immunity(session: &mut Session<TestClock>) {
+        session.clock.advance(RETURN_IMMUNITY_MS);
     }
 
     /// Host 接管前置（无武装、无布局注入）：EdgeCrossing 切出建立控制方上下文。
@@ -3100,6 +3172,116 @@ mod tests {
                 ratio: 0.5,
             }))
             .unwrap();
+    }
+
+    /// 热键/托盘切换接管前置（11-24，R1）：`Switch` → `SwitchAck{ok}` 两步接管
+    /// （无布局注入；`[主控 | 工作机]` 布局由调用方先行 `set_layout`）。
+    fn switch_takeover(session: &mut Session<TestClock>) {
+        session
+            .step(SessionEvent::Local(LocalCmd::Switch { target: 1 }))
+            .unwrap();
+        session
+            .step(SessionEvent::Frame(FramePayload::Input(
+                InputEvent::SwitchAck {
+                    target: 1,
+                    ok: true,
+                },
+            )))
+            .unwrap();
+        assert_eq!(
+            session.control_dir(),
+            ControlDir::LocalControlsPeer,
+            "Ack 确认后主控接管"
+        );
+    }
+
+    /// AC1（11-24，R1）：热键/托盘切入后的回切触发边 = 受控屏**面向主控的边**
+    /// （= 进入边），与边缘路径一致（docs/03 §5）。`[主控 | 工作机]` 布局经
+    /// `Switch` + `SwitchAck` 接管：工作机**左缘**（面向主控）极值回报 + 同向移动
+    /// → 回切，落主控右缘内侧 0.5%；**远离主控**的边（工作机右缘）极值回报不触发。
+    #[test]
+    fn switch_takeover_return_edge_faces_host() {
+        // —— 面向主控的边（工作机左缘）：极值回报 + 朝主控方向移动 → 回切 ——
+        let mut host = host_session(TestClock::new());
+        ready_running_host(&mut host);
+        host.set_layout(host_layout_2x1());
+        switch_takeover(&mut host);
+        // 免疫窗预热（11-24 按时间计）：接管后 800ms 内的回报不触发。
+        pass_immunity(&mut host);
+        // 朝主控方向（左）移动 → 同向武装。
+        host.step(SessionEvent::Local(LocalCmd::ForwardInput(
+            InputEvent::MouseMoveRel { dx: -3.0, dy: 0.0 },
+        )))
+        .unwrap();
+        let actions = host
+            .step(SessionEvent::Frame(FramePayload::Input(
+                InputEvent::MouseMoveAbs {
+                    screen: 1,
+                    x: 0.0,
+                    y: 0.4,
+                },
+            )))
+            .unwrap();
+        assert_eq!(
+            actions.len(),
+            4,
+            "面向主控边（工作机左缘）极值回报应触发回切（实际 {actions:?}）"
+        );
+        assert_eq!(actions[0], SessionAction::ReleaseAll);
+        assert!(matches!(
+            &actions[1],
+            SessionAction::Send {
+                msg: Outbound::Input(InputEvent::LeaveScreen { .. }),
+                ..
+            }
+        ));
+        assert_eq!(
+            actions[2],
+            SessionAction::WarpPointer {
+                screen: 0,
+                x: 1.0 - EDGE_RETURN_INSET,
+                y: 0.4
+            },
+            "落点 = 主控右缘内侧 EDGE_RETURN_INSET，ratio 保持"
+        );
+        assert_eq!(
+            actions[3],
+            SessionAction::Notice(Notice::EdgeReturnedToHost {
+                target: 1,
+                overflow: (0.0, 0.0),
+            })
+        );
+        assert_eq!(host.control_dir(), ControlDir::None, "控制关系已终结");
+
+        // —— 远离主控的边（工作机右缘）：极值回报 + 同向移动 → 不触发 ——
+        let mut host = host_session(TestClock::new());
+        ready_running_host(&mut host);
+        host.set_layout(host_layout_2x1());
+        switch_takeover(&mut host);
+        pass_immunity(&mut host);
+        // 朝远离主控方向（右）移动 → 同向武装。
+        host.step(SessionEvent::Local(LocalCmd::ForwardInput(
+            InputEvent::MouseMoveRel { dx: 3.0, dy: 0.0 },
+        )))
+        .unwrap();
+        let actions = host
+            .step(SessionEvent::Frame(FramePayload::Input(
+                InputEvent::MouseMoveAbs {
+                    screen: 1,
+                    x: 1.0,
+                    y: 0.4,
+                },
+            )))
+            .unwrap();
+        assert!(
+            actions.is_empty(),
+            "远离主控的边（工作机右缘）极值回报不触发回切（实际 {actions:?}）"
+        );
+        assert_eq!(
+            host.control_dir(),
+            ControlDir::LocalControlsPeer,
+            "控制关系保持"
+        );
     }
 
     /// 面向主控边滑出触发回切：极值回报 + 同向武装 → ReleaseControl 同型释放 +
@@ -3141,7 +3323,10 @@ mod tests {
         );
         assert_eq!(
             actions[3],
-            SessionAction::Notice(Notice::EdgeReturnedToHost { target: 1 })
+            SessionAction::Notice(Notice::EdgeReturnedToHost {
+                target: 1,
+                overflow: (0.0, 0.0),
+            })
         );
         assert_eq!(host.control_dir(), ControlDir::None, "控制关系已终结");
     }
@@ -3154,6 +3339,9 @@ mod tests {
         ready_running_host(&mut host);
         host.set_layout(host_layout_2x1());
         session_takeover(&mut host, ScreenEdge::Left);
+        // 免疫窗预热（11-24 按时间计）：先越过免疫窗——本用例考察的是"未武装"
+        // 这一条独立防线（窗内的极值回报本就因免疫窗不触发，分不清是谁挡的）。
+        pass_immunity(&mut host);
 
         // 驻留极值（cursor 已在边缘但用户未再向外推）：仅消化，不注入不触发。
         let actions = host
@@ -3171,21 +3359,6 @@ mod tests {
         );
 
         // 同向移动 → 武装 → 下一回报触发。
-        host.step(SessionEvent::Local(LocalCmd::ForwardInput(
-            InputEvent::MouseMoveRel { dx: 2.0, dy: 0.0 },
-        )))
-        .unwrap();
-        // 免疫窗预热（11-22）：推过 RETURN_IMMUNITY_REPORTS 后才可触发。
-        for _ in 0..=RETURN_IMMUNITY_REPORTS {
-            host.step(SessionEvent::Frame(FramePayload::Input(
-                InputEvent::MouseMoveAbs {
-                    screen: 1,
-                    x: 0.5,
-                    y: 0.5,
-                },
-            )))
-            .unwrap();
-        }
         host.step(SessionEvent::Local(LocalCmd::ForwardInput(
             InputEvent::MouseMoveRel { dx: 2.0, dy: 0.0 },
         )))
@@ -3251,6 +3424,75 @@ mod tests {
         assert_eq!(actions.len(), 4, "再武装 + 极值 → 触发");
     }
 
+    /// 回切免疫窗按时间（11-24，AC6）：接管后 **799ms** 到达的极值回报不触发，
+    /// **800ms** 起可触发；与回报条数无关（窗内到达多少条回报都不缩短窗口）。
+    #[test]
+    fn edge_return_immunity_window_is_time_based() {
+        assert_eq!(RETURN_IMMUNITY_MS, 800, "免疫窗 = 接管后 800ms");
+        let mut host = host_session(TestClock::new());
+        ready_running_host(&mut host);
+        host.set_layout(host_layout_2x1());
+        session_takeover(&mut host, ScreenEdge::Left); // t=0 接管
+        assert_eq!(host.clock.peek(), 0, "接管时刻 = 会话时钟零点");
+        // 窗内灌 20 条非极值回报（超过原按条数计的 16 条窗）：窗口不随条数推进。
+        for _ in 0..20 {
+            host.step(SessionEvent::Frame(FramePayload::Input(
+                InputEvent::MouseMoveAbs {
+                    screen: 1,
+                    x: 0.5,
+                    y: 0.5,
+                },
+            )))
+            .unwrap();
+        }
+        assert_eq!(
+            host.clock.peek(),
+            0,
+            "回报不推进会话时钟（判定基准 = 回报到达时刻）"
+        );
+
+        // t=799：窗内（799 < RETURN_IMMUNITY_MS）——已同向武装的极值回报不触发。
+        host.clock.advance(RETURN_IMMUNITY_MS - 1);
+        host.step(SessionEvent::Local(LocalCmd::ForwardInput(
+            InputEvent::MouseMoveRel { dx: 3.0, dy: 0.0 },
+        )))
+        .unwrap();
+        let actions = host
+            .step(SessionEvent::Frame(FramePayload::Input(
+                InputEvent::MouseMoveAbs {
+                    screen: 1,
+                    x: 1.0,
+                    y: 0.5,
+                },
+            )))
+            .unwrap();
+        assert!(actions.is_empty(), "799ms 仍在免疫窗内（实际 {actions:?}）");
+        assert_eq!(
+            host.control_dir(),
+            ControlDir::LocalControlsPeer,
+            "控制关系保持"
+        );
+
+        // t=800：窗外——上条回报已复位武装，再武装后极值回报触发。
+        host.clock.advance(1);
+        assert_eq!(host.clock.peek(), RETURN_IMMUNITY_MS);
+        host.step(SessionEvent::Local(LocalCmd::ForwardInput(
+            InputEvent::MouseMoveRel { dx: 3.0, dy: 0.0 },
+        )))
+        .unwrap();
+        let actions = host
+            .step(SessionEvent::Frame(FramePayload::Input(
+                InputEvent::MouseMoveAbs {
+                    screen: 1,
+                    x: 1.0,
+                    y: 0.5,
+                },
+            )))
+            .unwrap();
+        assert_eq!(actions.len(), 4, "800ms 起免疫窗失效，回切触发");
+        assert_eq!(host.control_dir(), ControlDir::None, "控制关系已终结");
+    }
+
     /// 远离主控的边滑出不触发（11-22 语义改判：回切只认面向主控的边；原
     /// "外侧边绕回"模型废弃——空间连续穿行才是用户直觉）：主控左缘切出 →
     /// 触发边 = 受控屏右缘；左缘（远离主控）极值回报无动作。
@@ -3280,63 +3522,10 @@ mod tests {
         );
     }
 
-    /// 角落排除（11-22 第三轮，docs/03 §5）：外侧边极值命中且**正交轴**回报
-    /// 也处于极值端点（光标同时贴两条边 = 角落区）→ 不回切（角落留给系统热
-    /// 区——KDE 触发角专用，边缘=切换）；沿边坐标内侧（非角落）照常触发。
-    /// 垂直与水平外侧边四角语义各验一。
-    #[test]
-    fn edge_return_corner_exclusion() {
-        // —— 垂直外侧边（主控左缘切出 → 触发边 = 受控屏右缘）——
-        let mut host = host_session(TestClock::new());
-        ready_running_host(&mut host);
-        host_controlling_with_outward(&mut host, ScreenEdge::Left, 3.0, 0.0);
-        // 右上角（1.0, 0.0）：正交轴 y 极值 → 角落不回切（回报照常消化）。
-        let actions = host
-            .step(SessionEvent::Frame(FramePayload::Input(
-                InputEvent::MouseMoveAbs {
-                    screen: 1,
-                    x: 1.0,
-                    y: 0.0,
-                },
-            )))
-            .unwrap();
-        assert!(actions.is_empty(), "右上角驻留不回切（实际 {actions:?}）");
-        // 再武装（角落回报随条复位武装）→ 右下角（1.0, 1.0）同样排除。
-        host.step(SessionEvent::Local(LocalCmd::ForwardInput(
-            InputEvent::MouseMoveRel { dx: 3.0, dy: 0.0 },
-        )))
-        .unwrap();
-        let actions = host
-            .step(SessionEvent::Frame(FramePayload::Input(
-                InputEvent::MouseMoveAbs {
-                    screen: 1,
-                    x: 1.0,
-                    y: 1.0,
-                },
-            )))
-            .unwrap();
-        assert!(actions.is_empty(), "右下角驻留不回切（实际 {actions:?}）");
-        // 非角落回归：再武装 + 沿边坐标内侧（y=0.5）→ 照常触发。
-        host.step(SessionEvent::Local(LocalCmd::ForwardInput(
-            InputEvent::MouseMoveRel { dx: 3.0, dy: 0.0 },
-        )))
-        .unwrap();
-        let actions = host
-            .step(SessionEvent::Frame(FramePayload::Input(
-                InputEvent::MouseMoveAbs {
-                    screen: 1,
-                    x: 1.0,
-                    y: 0.5,
-                },
-            )))
-            .unwrap();
-        assert_eq!(actions.len(), 4, "非角落极值照常触发回切");
-        assert_eq!(host.control_dir(), ControlDir::None, "控制关系已终结");
-
-        // —— 水平外侧边（主控下缘切出 → 触发边 = 受控屏上缘）——
-        let mut host = host_session(TestClock::new());
-        ready_running_host(&mut host);
-        host.set_layout(crate::layout::ScreenLayout::new(vec![
+    /// 纵向 2×1 布局 fixture（主控 [2;16] 屏 0 下邻从机屏 1，owner=[1;16]）：
+    /// 水平外侧边回切用例的判定图。
+    fn host_layout_vertical() -> crate::layout::ScreenLayout {
+        crate::layout::ScreenLayout::new(vec![
             ScreenInfo {
                 id: 0,
                 owner: [2; 16],
@@ -3357,72 +3546,161 @@ mod tests {
                 bottom: None,
                 scale: 1.0,
             },
-        ]));
-        host.step(SessionEvent::Local(LocalCmd::EdgeCrossing {
-            target: 1,
-            edge: ScreenEdge::Bottom,
-            ratio: 0.5,
-        }))
-        .unwrap();
-        for _ in 0..=RETURN_IMMUNITY_REPORTS {
-            host.step(SessionEvent::Frame(FramePayload::Input(
-                InputEvent::MouseMoveAbs {
-                    screen: 1,
-                    x: 0.5,
-                    y: 0.5,
-                },
+        ])
+    }
+
+    /// 水平外侧边接管前置：主控下缘切出 → 触发边 = 受控屏上缘（面向主控）。
+    /// 含纵向布局、免疫窗预热与同向（上）武装。
+    fn host_controlling_upward(session: &mut Session<TestClock>) {
+        session.set_layout(host_layout_vertical());
+        session_takeover(session, ScreenEdge::Bottom);
+        pass_immunity(session);
+        session
+            .step(SessionEvent::Local(LocalCmd::ForwardInput(
+                InputEvent::MouseMoveRel { dx: 0.0, dy: -2.5 },
             )))
             .unwrap();
+    }
+
+    /// 受控屏（id 1）的一条回报 → 动作序列（空 = 仅消化）。
+    fn slave_report(session: &mut Session<TestClock>, x: f32, y: f32) -> Vec<SessionAction> {
+        session
+            .step(SessionEvent::Frame(FramePayload::Input(
+                InputEvent::MouseMoveAbs { screen: 1, x, y },
+            )))
+            .unwrap()
+    }
+
+    /// 角落排除（11-22 第三轮，docs/03 §5；11-24 由"正交轴恰为端点"改为 5%
+    /// 角落区）：外侧边极值命中且**正交轴**回报落在角落带 → 不回切（角落留给
+    /// 系统热区——KDE 触发角专用，边缘=切换）；沿边坐标中段（角落区外）照常
+    /// 触发。四个角点、以及**角落带内的非角点**（旧实现下会触发）各验一遍；
+    /// 垂直与水平外侧边各一次。带边界见 `edge_return_corner_band_boundaries`。
+    #[test]
+    fn edge_return_corner_exclusion() {
+        use crate::layout::CORNER_RATIO;
+        let band_mid = CORNER_RATIO / 2.0;
+        // (沿边坐标, 是否回切)：角点 → 否；带内非角点 → 否（11-24）；中段 → 是。
+        for (along, returns) in [
+            (0.0, false),
+            (band_mid, false),
+            (1.0 - band_mid, false),
+            (1.0, false),
+            (0.5, true),
+        ] {
+            // —— 垂直外侧边（主控左缘切出 → 触发边 = 受控屏右缘）：回报 (1.0, along) ——
+            let mut host = host_session(TestClock::new());
+            ready_running_host(&mut host);
+            host_controlling_with_outward(&mut host, ScreenEdge::Left, 3.0, 0.0);
+            let actions = slave_report(&mut host, 1.0, along);
+            assert_eq!(
+                actions.len() == 4,
+                returns,
+                "垂直外侧边 沿边坐标 {along} 的回切判定（实际 {actions:?}）"
+            );
+            if returns {
+                assert_eq!(
+                    actions[2],
+                    SessionAction::WarpPointer {
+                        screen: 0,
+                        x: EDGE_RETURN_INSET,
+                        y: along
+                    },
+                    "落点 = 主控左缘内缩，ratio = 沿边坐标保持"
+                );
+                assert_eq!(host.control_dir(), ControlDir::None, "回切后控制关系终结");
+            } else {
+                assert_eq!(
+                    host.control_dir(),
+                    ControlDir::LocalControlsPeer,
+                    "角落驻留不回切，控制关系保持"
+                );
+            }
+
+            // —— 水平外侧边（主控下缘切出 → 触发边 = 受控屏上缘）：回报 (along, 0.0) ——
+            let mut host = host_session(TestClock::new());
+            ready_running_host(&mut host);
+            host_controlling_upward(&mut host);
+            let actions = slave_report(&mut host, along, 0.0);
+            assert_eq!(
+                actions.len() == 4,
+                returns,
+                "水平外侧边 沿边坐标 {along} 的回切判定（实际 {actions:?}）"
+            );
+            if returns {
+                assert_eq!(
+                    actions[2],
+                    SessionAction::WarpPointer {
+                        screen: 0,
+                        x: along,
+                        y: 1.0 - EDGE_RETURN_INSET
+                    },
+                    "落点 = 主控下缘内缩，ratio = 沿边坐标保持"
+                );
+            }
         }
-        host.step(SessionEvent::Local(LocalCmd::ForwardInput(
-            InputEvent::MouseMoveRel { dx: 0.0, dy: -2.5 },
-        )))
-        .unwrap();
-        // 左上角（0.0, 0.0）：正交轴 x 极值 → 角落不回切。
-        let actions = host
-            .step(SessionEvent::Frame(FramePayload::Input(
-                InputEvent::MouseMoveAbs {
-                    screen: 1,
-                    x: 0.0,
-                    y: 0.0,
-                },
-            )))
-            .unwrap();
-        assert!(actions.is_empty(), "左上角驻留不回切（实际 {actions:?}）");
-        // 再武装 → 右上角（1.0, 0.0）同样排除。
-        host.step(SessionEvent::Local(LocalCmd::ForwardInput(
-            InputEvent::MouseMoveRel { dx: 0.0, dy: -2.5 },
-        )))
-        .unwrap();
-        let actions = host
-            .step(SessionEvent::Frame(FramePayload::Input(
-                InputEvent::MouseMoveAbs {
-                    screen: 1,
-                    x: 1.0,
-                    y: 0.0,
-                },
-            )))
-            .unwrap();
-        assert!(actions.is_empty(), "右上角驻留不回切（实际 {actions:?}）");
-        // 非角落回归：再武装 + 沿边坐标内侧（x=0.5）→ 照常触发。
-        host.step(SessionEvent::Local(LocalCmd::ForwardInput(
-            InputEvent::MouseMoveRel { dx: 0.0, dy: -2.5 },
-        )))
-        .unwrap();
-        let actions = host
-            .step(SessionEvent::Frame(FramePayload::Input(
-                InputEvent::MouseMoveAbs {
-                    screen: 1,
-                    x: 0.5,
-                    y: 0.0,
-                },
-            )))
-            .unwrap();
-        assert_eq!(actions.len(), 4, "水平非角落极值照常触发回切");
+    }
+
+    /// 角落带边界（11-24，AC9）——回切侧**垂直与水平外侧边各验**：沿边坐标落在
+    /// 角落带内（`CORNER_RATIO − 0.001`、`1 − CORNER_RATIO + 0.001`）的极值回报
+    /// 不回切；带外（`CORNER_RATIO + 0.001`、`1 − CORNER_RATIO − 0.001`）照常
+    /// 回切，落点 ratio = 沿边坐标原值。边界值相对常量书写，不测精确端点。
+    #[test]
+    fn edge_return_corner_band_boundaries() {
+        use crate::layout::CORNER_RATIO;
+        let (in_low, out_low) = (CORNER_RATIO - 0.001, CORNER_RATIO + 0.001);
+        let (out_high, in_high) = (1.0 - CORNER_RATIO - 0.001, 1.0 - CORNER_RATIO + 0.001);
+        for (along, returns) in [
+            (in_low, false),
+            (out_low, true),
+            (out_high, true),
+            (in_high, false),
+        ] {
+            // 垂直外侧边：回报 (1.0, along)。
+            let mut host = host_session(TestClock::new());
+            ready_running_host(&mut host);
+            host_controlling_with_outward(&mut host, ScreenEdge::Left, 3.0, 0.0);
+            let actions = slave_report(&mut host, 1.0, along);
+            assert_eq!(
+                actions.len() == 4,
+                returns,
+                "垂直外侧边 沿边坐标 {along}（实际 {actions:?}）"
+            );
+            if returns {
+                assert_eq!(
+                    actions[2],
+                    SessionAction::WarpPointer {
+                        screen: 0,
+                        x: EDGE_RETURN_INSET,
+                        y: along
+                    }
+                );
+            }
+            // 水平外侧边：回报 (along, 0.0)。
+            let mut host = host_session(TestClock::new());
+            ready_running_host(&mut host);
+            host_controlling_upward(&mut host);
+            let actions = slave_report(&mut host, along, 0.0);
+            assert_eq!(
+                actions.len() == 4,
+                returns,
+                "水平外侧边 沿边坐标 {along}（实际 {actions:?}）"
+            );
+            if returns {
+                assert_eq!(
+                    actions[2],
+                    SessionAction::WarpPointer {
+                        screen: 0,
+                        x: along,
+                        y: 1.0 - EDGE_RETURN_INSET
+                    }
+                );
+            }
+        }
     }
 
     /// 按键门控（11-22 第三轮，docs/03 §5）：任意鼠标键按下（拖文件/拖滚动条）
-    /// → 极值回报不回切（回报照常消化——免疫窗计数/武装复位语义不变）；
+    /// → 极值回报不回切（回报照常消化——免疫窗计时/武装复位语义不变）；
     /// 松开后再武装 → 恢复触发。热键回切（ReleaseControl）不经此判定面。
     #[test]
     fn edge_return_gated_while_mouse_button_down() {
@@ -3543,17 +3821,8 @@ mod tests {
             ratio: 0.5,
         }))
         .unwrap();
-        // 免疫窗预热（11-22）：推过 RETURN_IMMUNITY_REPORTS。
-        for _ in 0..=RETURN_IMMUNITY_REPORTS {
-            host.step(SessionEvent::Frame(FramePayload::Input(
-                InputEvent::MouseMoveAbs {
-                    screen: 1,
-                    x: 0.5,
-                    y: 0.5,
-                },
-            )))
-            .unwrap();
-        }
+        // 免疫窗预热（11-24 按时间计）。
+        pass_immunity(&mut host);
         host.step(SessionEvent::Local(LocalCmd::ForwardInput(
             InputEvent::MouseMoveRel { dx: 0.0, dy: -2.5 },
         )))
@@ -3579,23 +3848,14 @@ mod tests {
     }
 
     /// 无布局回退（热点 Next 语义接管路径）：面向屏解析失败 → 落主屏 0
-    /// 背向边缘内缩（语义与布局可用时一致，仅屏 id 兜底）。
+    /// 面向受控屏的那条边内侧内缩（语义与布局可用时一致，仅屏 id 兜底）。
     #[test]
     fn edge_return_landing_falls_back_to_main_screen_without_layout() {
         let mut host = host_session(TestClock::new());
         ready_running_host(&mut host);
         session_takeover(&mut host, ScreenEdge::Left);
-        // 免疫窗预热（11-22）：推过 RETURN_IMMUNITY_REPORTS。
-        for _ in 0..=RETURN_IMMUNITY_REPORTS {
-            host.step(SessionEvent::Frame(FramePayload::Input(
-                InputEvent::MouseMoveAbs {
-                    screen: 1,
-                    x: 0.5,
-                    y: 0.5,
-                },
-            )))
-            .unwrap();
-        }
+        // 免疫窗预热（11-24 按时间计）。
+        pass_immunity(&mut host);
         host.step(SessionEvent::Local(LocalCmd::ForwardInput(
             InputEvent::MouseMoveRel { dx: 2.0, dy: 0.0 },
         )))
@@ -3798,7 +4058,178 @@ mod tests {
         );
         assert_eq!(
             outcome.actions[3],
-            SessionAction::Notice(Notice::EdgeReturnedToHost { target: 1 })
+            SessionAction::Notice(Notice::EdgeReturnedToHost {
+                target: 1,
+                overflow: (0.0, 0.0),
+            }),
+            "端点值回报（无越界 / 被控端不度量行程）：行程为 0"
+        );
+    }
+
+    /// `beyond_edge`（11-24，AC10）：端点之外的值解出行程（左/上为负、右/下为
+    /// 正且超出 1 的部分才是行程），`[0, 1]` 内（含端点值 0.0/1.0）恒 0。
+    #[test]
+    fn beyond_edge_extracts_travel_outside_unit_range() {
+        assert_eq!(beyond_edge(-37.5), -37.5, "左/上边界：负值原样");
+        assert_eq!(beyond_edge(1.25), 0.25, "右/下边界：超出 1 的部分");
+        for inside in [0.0, 1.0, 0.5, 0.001, 0.999] {
+            assert_eq!(beyond_edge(inside), 0.0, "{inside} 在 [0,1] 内无行程");
+        }
+        // 回报精度下的极小越界也是行程（不做容差收敛——收敛起被控端职责）。
+        assert_eq!(beyond_edge(-0.001), -0.001);
+        assert!((beyond_edge(1.001) - 0.001).abs() < 1e-6);
+    }
+
+    /// 回切行程补偿（11-24，AC10 / R8；docs/02 §4.2 反向回报取值范围扩展）：
+    /// 端点之外的回报照常触发回切，越界幅值解出行程并随
+    /// [`Notice::EdgeReturnedToHost`] 的 `overflow` 带出；**落点 warp 不含补偿**
+    /// （仍为主控面向受控屏那条边的内侧内缩点，ratio = 沿边坐标——补偿由执行层
+    /// 加到落点上）。四条外侧边各验一次；无越界的端点值回报行程为 0。
+    #[test]
+    fn edge_return_carries_reported_travel_in_notice() {
+        // (主控切出边, 同向武装 delta, 回报 (x, y), 期望行程, 期望落点 (x, y))
+        let cases = [
+            // 受控屏右缘（面向主控）滑出：x 越过 1 → 行程 = x − 1。
+            (
+                ScreenEdge::Left,
+                (3.0, 0.0),
+                (1.25, 0.4),
+                (0.25, 0.0),
+                (EDGE_RETURN_INSET, 0.4),
+            ),
+            // 受控屏左缘滑出：x 越过 0 → 行程为负。
+            (
+                ScreenEdge::Right,
+                (-3.0, 0.0),
+                (-40.0, 0.6),
+                (-40.0, 0.0),
+                (1.0 - EDGE_RETURN_INSET, 0.6),
+            ),
+        ];
+        for (exit_edge, (dx, dy), (x, y), travel, (landing_x, landing_y)) in cases {
+            let mut host = host_session(TestClock::new());
+            ready_running_host(&mut host);
+            host_controlling_with_outward(&mut host, exit_edge, dx, dy);
+            let actions = slave_report(&mut host, x, y);
+            assert_eq!(actions.len(), 4, "越界回报照常触发回切（实际 {actions:?}）");
+            assert_eq!(
+                actions[2],
+                SessionAction::WarpPointer {
+                    screen: 0,
+                    x: landing_x,
+                    y: landing_y
+                },
+                "落点 warp 不含补偿"
+            );
+            assert_eq!(
+                actions[3],
+                SessionAction::Notice(Notice::EdgeReturnedToHost {
+                    target: 1,
+                    overflow: travel,
+                }),
+                "回报段行程随通知带出"
+            );
+        }
+
+        // 水平外侧边（主控下缘切出 → 受控屏上缘）：y 越过 0 → 行程在 y 轴。
+        let mut host = host_session(TestClock::new());
+        ready_running_host(&mut host);
+        host_controlling_upward(&mut host);
+        let actions = slave_report(&mut host, 0.3, -0.125);
+        assert_eq!(
+            actions[3],
+            SessionAction::Notice(Notice::EdgeReturnedToHost {
+                target: 1,
+                overflow: (0.0, -0.125),
+            }),
+            "受控屏上缘滑出：行程在 y 轴（x 轴无越界为 0）"
+        );
+        // 受控屏下缘（主控上缘切出）：y 越过 1。
+        let mut host = host_session(TestClock::new());
+        ready_running_host(&mut host);
+        host.set_layout(host_layout_vertical());
+        session_takeover(&mut host, ScreenEdge::Top);
+        pass_immunity(&mut host);
+        host.step(SessionEvent::Local(LocalCmd::ForwardInput(
+            InputEvent::MouseMoveRel { dx: 0.0, dy: 2.5 },
+        )))
+        .unwrap();
+        let actions = slave_report(&mut host, 0.3, 1.5);
+        assert_eq!(
+            actions.len(),
+            4,
+            "受控屏下缘越界回报触发回切（实际 {actions:?}）"
+        );
+        assert_eq!(
+            actions[3],
+            SessionAction::Notice(Notice::EdgeReturnedToHost {
+                target: 1,
+                overflow: (0.0, 0.5),
+            })
+        );
+
+        // 无越界（端点值回报——旧工作机 / macOS / X11 被控端）：行程为 0。
+        let mut host = host_session(TestClock::new());
+        ready_running_host(&mut host);
+        host_controlling_with_outward(&mut host, ScreenEdge::Left, 3.0, 0.0);
+        let actions = slave_report(&mut host, 1.0, 0.4);
+        assert_eq!(
+            actions[3],
+            SessionAction::Notice(Notice::EdgeReturnedToHost {
+                target: 1,
+                overflow: (0.0, 0.0),
+            })
+        );
+
+        // 触发条件不因越界值放宽：角落带内的越界回报（沿边坐标 y=0.02）不触发，
+        // 控制关系保持——角落带仍只看沿边坐标。
+        let mut host = host_session(TestClock::new());
+        ready_running_host(&mut host);
+        host_controlling_with_outward(&mut host, ScreenEdge::Left, 3.0, 0.0);
+        let actions = slave_report(&mut host, 1.25, 0.02);
+        assert!(
+            actions.is_empty(),
+            "角落带内的越界回报不回切（实际 {actions:?}）"
+        );
+        assert_eq!(
+            host.control_dir(),
+            ControlDir::LocalControlsPeer,
+            "控制关系保持"
+        );
+    }
+
+    /// 越界回报经真实帧编解码仍解出行程（11-24，AC10）：解码只校验有限性，
+    /// 端点之外的值原样通过——被控方回报 `x = 1.25` 的帧经 `Dispatcher` 喂入
+    /// 主控状态机，通知携带 0.25 的行程（兼容性依据：旧主控忽略幅值、新主控对
+    /// 旧工作机的端点值回报算出 0 行程）。
+    #[test]
+    fn edge_return_travel_survives_wire_roundtrip() {
+        use xcontrol_proto::Message as _;
+        let mut wire = Vec::new();
+        InputEvent::MouseMoveAbs {
+            screen: 1,
+            x: 1.25,
+            y: 0.4,
+        }
+        .encode_frame_into(7, &mut wire)
+        .expect("越界回报帧可编码");
+
+        let mut host = host_session(TestClock::new());
+        ready_running_host(&mut host);
+        host_controlling_with_outward(&mut host, ScreenEdge::Left, 3.0, 0.0);
+        let outcome = {
+            let mut dispatcher = crate::route::Dispatcher::new(&mut host);
+            dispatcher.feed(&wire)
+        };
+        assert_eq!(outcome.fatal, None, "越界值不构成协议违规");
+        assert_eq!(outcome.actions.len(), 4, "帧级回切触发");
+        assert_eq!(
+            outcome.actions[3],
+            SessionAction::Notice(Notice::EdgeReturnedToHost {
+                target: 1,
+                overflow: (0.25, 0.0),
+            }),
+            "行程经 wire 往返保持"
         );
     }
 

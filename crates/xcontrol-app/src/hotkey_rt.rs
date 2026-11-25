@@ -4,8 +4,11 @@
 //!
 //! - **路由（纯逻辑，本模块默认区）**：[`route_host`] / [`route_slave`] 把
 //!   [`HotkeyId`] 翻译为会话层动作（[`HotkeyAction`]）——无 I/O、无平台依赖、
-//!   `cargo test` 全量可测。门控语义与边缘切换门控同型：仅 Running 未暂停、
-//!   未被控时允许切换类动作；Pause 在 Running 内 toggle（paused 态按压 = 恢复）。
+//!   `cargo test` 全量可测。切换类动作门控（[`switch_allowed`]）：仅 Running
+//!   未暂停、未被控（`PeerControlsLocal`）时允许——**受控中（`LocalControlsPeer`）
+//!   照常放行**，回主控/切换是显式意图，不看光标位置；边缘切入门控
+//!   （`session_rt::edge_hit_allowed`，11-24 收紧）则只对"无人在控"放行，两者
+//!   语义不同。Pause 在 Running 内 toggle（paused 态按压 = 恢复）。
 //! - **切换语义（M4 裁定，M5 已闭环）**：
 //!   - **Next/Prev** → `LocalCmd::Switch{target}` = 出站 `SwitchRequest`
 //!     （docs/02 §4.2：主控→目标从机）→ 从机 `ReleaseAll` + `SwitchAck` →
@@ -83,9 +86,19 @@ pub enum HotkeyAction {
     None(&'static str),
 }
 
-/// 切换类动作门控（与 [`crate::session_rt::edge_hit_allowed`] 同语义）：
-/// 仅 Running 未暂停、未被控。热键路由与托盘「直接切换」（FR-2.5 子菜单）
-/// 共用同一门控——切换语义单一出处。
+/// 切换类动作门控：仅 Running 未暂停、未被控（`PeerControlsLocal`）。
+///
+/// **与边缘切入门控 [`crate::session_rt::edge_hit_allowed`] 语义不同**（11-24
+/// G3 起分流，此前两者对 `LocalControlsPeer` 都放行）：
+/// - 本门控对**受控中（`LocalControlsPeer`）照常放行**——热键/托盘的回主控与
+///   切换是显式意图，不依赖光标位置（受控中 Next/Prev/Home = 回主控，托盘
+///   直接切换 = 重发 `SwitchRequest`）；
+/// - 边缘命中在受控中**一律拒绝**：macOS 主控受控期间光标靠周期回拉锚定，
+///   两次回拉之间冲到屏边的命中不是有意滑边（docs/03 §5"死区"）。
+///
+/// 共同点只有状态条件：暂停/非 Running 都拒绝；边缘门控另受鼠标键按下与
+/// 控制关系变化后 150ms 防抖约束。热键路由与托盘「直接切换」（FR-2.5 子菜单）
+/// 共用本门控——切换语义单一出处。
 pub(crate) fn switch_allowed(state: &SessionState, dir: ControlDir) -> bool {
     matches!(state, SessionState::Running { paused: false }) && dir != ControlDir::PeerControlsLocal
 }
@@ -240,25 +253,56 @@ impl<S: InputSink> InputSink for HotkeyFilterSink<S> {
         // 位置语义无涉——直通内层（11-22 被控光标采样走 sink 查询的链条面）。
         self.inner.cursor_normalized()
     }
+
+    fn resync_cursor(&mut self) -> Result<(), SinkError> {
+        // 位置模型校准（11-24）：非注入事件，不经热键匹配——直通内层，否则
+        // 平台覆写（uinput）在过滤层下不可达。
+        self.inner.resync_cursor()
+    }
 }
 
 // ============================================================
 // 平台热键源构建（feature 门控；会话循环 drain）
 // ============================================================
 
-/// 主控捕获源构建（macos：`CaptureSource::start`，PRD 裁定的捕获流识别路径）。
+/// 辅助功能授权指引（日志文案的可执行说法；docs/05 §1、docs/10 §1.2）。
+#[cfg(feature = "macos")]
+const ACCESSIBILITY_GUIDANCE: &str = "系统设置 → 隐私与安全性 → 辅助功能，为 XControl 开启授权";
+
+/// 主控捕获源构建的**静默**形态（macos：`CaptureSource::start`，不记日志）。
+///
+/// 供会话循环的捕获源自动恢复调用（`session_rt::drive_session` 输入拍）：那条路径
+/// 每秒重试一次，失败告警按退避节流（首次立即、之后至多 30s 一条），所以日志由
+/// 调用方决定何时留——用会记日志的 [`host_capture_source`] 的话，已授权但启动
+/// 持续失败时每秒一条告警。
+///
+/// # Errors
+/// [`xcontrol_input::InputError`]：捕获源启动失败——未授权时 `CGEventTapCreate`
+/// 返回空（2026-11-24 部署实测），或 tap 创建之外的线程/runloop 源失败。
+#[cfg(feature = "macos")]
+pub fn try_host_capture_source() -> Result<xcontrol_input::CaptureSource, xcontrol_input::InputError>
+{
+    xcontrol_input::CaptureSource::start()
+}
+
+/// 主控捕获源构建（macos：`CaptureSource::start`，PRD 裁定的捕获流识别路径）——
+/// 会话装配点用（每会话一次，失败即告警）。
 ///
 /// 启动失败告警降级 `None`（输入管线不因捕获不可用中断——error-handling.md
-/// 规则 4；辅助功能未授权时系统静默无事件，docs/05 §1，可用性检测属
-/// `check_accessibility` 的 UI 引导域）。
+/// 规则 4）。失败告警是**可执行的说法**（11-24，R9）：未授权辅助功能时系统的
+/// 表现是 tap 创建被拒（2026-11-24 部署实测：`CGEventTapCreate` 返回空），
+/// 指引用户去系统设置授权，并说明授权后会话循环每秒静默探测、约 1s 内自动
+/// 重建捕获源（`session_rt` 输入拍），无需重启应用。会话内的自动恢复走静默形态
+/// [`try_host_capture_source`]（失败告警在那边退避）。
 #[must_use]
 #[cfg(feature = "macos")]
 pub fn host_capture_source() -> Option<xcontrol_input::CaptureSource> {
-    match xcontrol_input::CaptureSource::start() {
+    match try_host_capture_source() {
         Ok(source) => Some(source),
         Err(error) => {
             tracing::warn!(target: "app::hotkey", %error,
-                "主控捕获源启动失败（热键识别与捕获转发降级停用）");
+                "主控捕获源启动失败（热键识别与捕获转发停用）：请到 {ACCESSIBILITY_GUIDANCE}；\
+                 授权后约 1s 自动恢复，无需重启应用或重建会话");
             None
         }
     }
@@ -270,6 +314,71 @@ pub fn host_capture_source() -> Option<xcontrol_input::CaptureSource> {
 pub fn host_capture_source() -> Option<std::convert::Infallible> {
     None
 }
+
+/// 运行时启动的辅助功能引导的**动作决策**（11-25；纯函数，可单测——平台查询与
+/// 日志在 [`guide_accessibility_at_startup`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+pub(crate) enum StartupGuide {
+    /// 已授权：只 `info!` 留痕。
+    Granted,
+    /// 未授权、有界面（窗口 / 托盘模式）：请求**系统引导框** + `warn!` 留痕。
+    RequestPrompt,
+    /// 未授权、`--headless`（无 UI 运行时，FR-6.4）：只 `warn!` 与指引文案，
+    /// **不请求系统引导框**——无界面进程（服务器 / SSH）弹系统框既无人看，也不
+    /// 该由它触发。
+    WarnOnly,
+}
+
+/// 启动时辅助功能引导该做什么（11-25，纯函数）：已授权只留痕；未授权时
+/// `headless` 决定是否请求系统引导框——有界面请求，无界面只告警。
+#[must_use]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+pub(crate) fn startup_guide_action(granted: bool, headless: bool) -> StartupGuide {
+    match (granted, headless) {
+        (true, _) => StartupGuide::Granted,
+        (false, true) => StartupGuide::WarnOnly,
+        (false, false) => StartupGuide::RequestPrompt,
+    }
+}
+
+/// 运行时启动的辅助功能引导（11-24，R9；docs/05 §1.3）：角色确定后、进入 host /
+/// client 循环之前调用一次——两种角色都需要辅助功能（主控要捕获、从机要注入）。
+///
+/// 先静默查询（`prompt = false`）：已授权 → `info!` 留痕后返回；未授权 → 窗口 /
+/// 托盘模式下以 `prompt = true` 请求**系统引导框**（`AXIsProcessTrustedWithOptions`）
+/// 并 `warn!` 留痕；`--headless`（`headless == true`）只 `warn!` 与指引文案，
+/// 不请求系统引导框（动作见 [`startup_guide_action`]）。此前弹框能力从未被调用，
+/// 未授权启动只留一条捕获源失败告警——用户不知道要去哪里授权。
+///
+/// 平台行为留档：调用返回时授权通常仍未就绪（引导框是异步的），后续生效靠
+/// `session_rt` 的捕获源自动恢复（每秒静默探测）；引导框的具体表现（应用已在
+/// 辅助功能列表里但未勾选时是否出现、是否自动打开系统设置面板）**待实机确认**
+/// （design D15，结论回写 docs/05 §1），代码不对其形态做假设。
+#[cfg(feature = "macos")]
+pub fn guide_accessibility_at_startup(headless: bool) {
+    let granted = xcontrol_input::check_accessibility(false).is_granted();
+    match startup_guide_action(granted, headless) {
+        StartupGuide::Granted => {
+            tracing::info!(target: "app::main", "辅助功能已授权：键鼠捕获/注入可用");
+        }
+        StartupGuide::RequestPrompt => {
+            let _ = xcontrol_input::check_accessibility(true);
+            tracing::warn!(target: "app::main",
+                "辅助功能未授权：已请求系统引导框——请到 {ACCESSIBILITY_GUIDANCE}\
+                 （主控需要它捕获键鼠，从机需要它注入）；主控授权后约 1s 自动恢复捕获源，无需重启应用");
+        }
+        StartupGuide::WarnOnly => {
+            tracing::warn!(target: "app::main",
+                "辅助功能未授权（headless 模式不请求系统引导框）——请到 {ACCESSIBILITY_GUIDANCE}\
+                 （主控需要它捕获键鼠，从机需要它注入）；主控授权后约 1s 自动恢复捕获源，无需重启应用");
+        }
+    }
+}
+
+/// 非 macos 平台的空实现（无辅助功能概念；权限引导属各自平台的检测面）。
+#[cfg(not(feature = "macos"))]
+pub fn guide_accessibility_at_startup(_headless: bool) {}
 
 /// 平台热键注册源聚合（win `RegisterHotKey` / x11 `grab_key`；两端同型注册）。
 ///
@@ -659,6 +768,44 @@ mod tests {
             preserve_cursor: false,
         })
         .unwrap();
+    }
+
+    /// `resync_cursor` 透传（11-24 位置模型校准钩子）：热键过滤层不拦截非注入
+    /// 动作——调用直达内层记录 sink（计数递增），且不触发热键匹配、不产出注入
+    /// 事件、不记为 warp。
+    #[test]
+    fn filter_sink_forwards_resync_cursor() {
+        let set = HotkeySet::from_config(&HotkeysConfig::default()).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sink = HotkeyFilterSink::new(set, RecordingInputSink::new(), tx);
+        sink.resync_cursor().unwrap();
+        sink.resync_cursor().unwrap();
+        assert_eq!(sink.inner.resync_count(), 2, "透传内层（每次调用计一次）");
+        assert!(sink.inner.events().is_empty(), "校准不产出注入事件");
+        assert!(sink.inner.warps().is_empty(), "校准不记为 warp");
+        assert!(
+            rx.try_recv().is_err(),
+            "不经热键匹配（无命中投递；发送端仍在 sink 内，通道未关闭）"
+        );
+    }
+
+    /// 启动时辅助功能引导的动作决策（11-25）：`--headless` **永不请求系统引导框**
+    /// ——未授权只告警（WarnOnly）；窗口 / 托盘模式不变（未授权 → 请求引导框）；
+    /// 已授权只留痕，与运行模式无关。
+    #[test]
+    fn startup_guide_never_requests_system_prompt_in_headless_mode() {
+        assert_eq!(
+            startup_guide_action(false, true),
+            StartupGuide::WarnOnly,
+            "headless + 未授权：只告警，不弹系统引导框"
+        );
+        assert_eq!(
+            startup_guide_action(false, false),
+            StartupGuide::RequestPrompt,
+            "窗口/托盘模式 + 未授权：请求系统引导框（行为不变）"
+        );
+        assert_eq!(startup_guide_action(true, false), StartupGuide::Granted);
+        assert_eq!(startup_guide_action(true, true), StartupGuide::Granted);
     }
 
     /// XKey 语义（热键主键非修饰键）与 HotkeySet 默认键主键一致性冒烟

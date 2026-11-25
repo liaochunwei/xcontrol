@@ -512,7 +512,7 @@ const ZH: &[(&str, &str)] = &[
     ),
     (
         "wizard.perm_mac_hint",
-        "工作机受控需要 macOS「辅助功能」权限（捕获/注入键鼠）。下方为实时检测结果；主控转发无需本权限。",
+        "工作机受控与 macOS 主控都需要「辅助功能」权限：工作机用它注入键鼠，macOS 主控用它捕获键鼠——热键识别与键鼠转发都依赖它，未授权的主控切入后无法转发输入。下方为实时检测结果。",
     ),
     (
         "wizard.ph_allowlist",
@@ -1009,7 +1009,7 @@ const EN: &[(&str, &str)] = &[
     ),
     (
         "wizard.perm_mac_hint",
-        "Acting as a client needs the macOS Accessibility permission (capturing/injecting keyboard & mouse). The status below is detected live; forwarding as a host does not need this permission.",
+        "Both the client and the macOS host need the Accessibility permission: the client uses it to inject keyboard & mouse, the macOS host uses it to capture them. Hotkey recognition and capture-forwarding both rely on it, and an unauthorized host cannot forward input after switching in. The status below is detected live.",
     ),
     (
         "wizard.ph_allowlist",

@@ -7,9 +7,8 @@
 //! 经 `windows-registry`（微软官方 safe 封装）读写——本 crate 保持
 //! `#![forbid(unsafe_code)]`，无需平台绑定层 unsafe 放行。
 
-use std::path::Path;
-
 use windows_registry::CURRENT_USER;
+use windows_result::Error;
 
 use super::{Autostart, AutostartError, RUN_SUBKEY, RUN_VALUE_NAME, run_value_command};
 
@@ -26,8 +25,11 @@ impl RunKeyAgent {
 }
 
 /// windows_registry 错误 → [`AutostartError::Backend`]（`op` 标识操作，
-/// 平台错误文本进 `detail`——可编程区分 + 上下文保留）。
-fn registry_error(op: &'static str, error: windows_registry::Error) -> AutostartError {
+/// 平台错误文本进 `detail`——可编程区分 + 上下文保留）。错误本体 =
+/// [`Error`]（`windows_result::Error`——`windows_registry::Error` 在 0.6 不可
+/// 见，E0603，PR #1 windows job 实测；`pub use windows_result::Result` 未带
+/// `Error`）。
+fn registry_error(op: &'static str, error: Error) -> AutostartError {
     AutostartError::Backend {
         op,
         detail: error.to_string(),
@@ -72,6 +74,8 @@ impl Autostart for RunKeyAgent {
 /// mod.rs 覆盖；此处钉死值名/子键常量与 Run 键规范一致）。
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]

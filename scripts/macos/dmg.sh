@@ -7,7 +7,8 @@
 # 做什么：
 #   1. cargo build --release -p xcontrol-app -p xcontrol-cli（平台 feature 按脚本
 #      固定组合 macos——docs/08 §3"单平台发布构建由打包脚本固定 --features"）；
-#   2. 组装 XControl.app bundle（Info.plist + MacOS 双二进制）；
+#   2. 组装 XControl.app bundle（Info.plist + MacOS 双二进制 + 应用图标
+#      Contents/Resources/AppIcon.icns，Info.plist 经 CFBundleIconFile 引用）；
 #   3. codesign ad-hoc 签名 bundle（--deep 覆盖嵌套二进制——M6 bundle 化后启用，
 #      codesign.sh 头注预告项）；
 #   4. hdiutil create UDZO 压缩 DMG（含 /Applications 链接——拖拽安装惯例）；
@@ -16,8 +17,16 @@
 # 注意：
 #   - 正式签名（Developer ID + 公证）不在本脚本（CI/发布流程移交项，docs/05 §1）；
 #     ad-hoc 已满足本地/直发场景的防火墙授权记忆（docs/10 §1.3）。
-#   - **固定路径安装**：.app 移动会破坏已授予的辅助功能权限（TCC 按路径记忆，
-#     docs/10 §1.1）——安装后不要再挪动 bundle。
+#   - **辅助功能授权按签名匹配**（2026-11-24 部署实测更正，docs/10 §1.1）：ad-hoc
+#     签名的应用，TCC 的辅助功能授权随签名走——同一个 /Applications/XControl.app
+#     路径换上新构建后授权即失效（主控日志：主控捕获源启动失败 …
+#     CGEventTapCreate 返回空），与路径无关。重新打包/重装后在 系统设置 → 隐私与
+#     安全性 → 辅助功能 里为 XControl 重新开启（未授权启动时应用会请求系统引导
+#     框；授权后主控约 1s 自动恢复，无需重启）。此前头注写的"固定路径安装——
+#     .app 移动会破坏授权（TCC 按路径记忆）"不准确，以本条为准。
+#   - 应用图标 = 入库产物 scripts/macos/AppIcon.icns（打包只读取它，不依赖 swift）。
+#     改图形时改 scripts/macos/icon.swift 并跑 scripts/macos/icon.sh 重新生成、
+#     提交新的 .icns（docs/06 §5.1、docs/10 §1.1）。
 #   - 产物路径：target/pkg/macos/XControl-<版本>.dmg（target 已 gitignore）。
 #
 # 用法：scripts/macos/dmg.sh [release|debug]   （默认 release）
@@ -28,6 +37,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 PROFILE="${1:-release}"
+APP_ICON_SRC="scripts/macos/AppIcon.icns"
 
 # workspace 版本（[workspace.package] 段第一处 version，docs/08 §7 semver）。
 VERSION="$(awk '/^\[workspace\.package\]/{flag=1;next} /^\[/{flag=0} flag && /^version *=/{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)"
@@ -69,8 +79,19 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
 cp "$BIN_DIR/xcontrol-app" "$BIN_DIR/xcontrol-cli" "$APP_BUNDLE/Contents/MacOS/"
 
+# 应用图标（docs/06 §5.1 图形、docs/10 §1.1 打包）：入库的 .icns 拷进 Resources，
+# Info.plist 的 CFBundleIconFile 引用（不带扩展名——系统按 .icns/.tiff 等后缀在
+# Resources 里查找）。缺失即失败：不出没有图标的包（Finder / Dock 会显示系统
+# 默认空白图标——2026-11-24 用户反馈）。
+if [ ! -f "$APP_ICON_SRC" ]; then
+    echo "错误：应用图标缺失：$APP_ICON_SRC（重新生成：scripts/macos/icon.sh）" >&2
+    exit 1
+fi
+cp "$APP_ICON_SRC" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+
 # Info.plist：LSMinimumSystemVersion = 15.0（NFR-4 UI 完整体验矩阵，gpui-kit 运行时约束）；
-# 不设 LSUIElement（Dock 图标在位——on_reopen 依赖 Dock 语义，docs/06 §2）。
+# 不设 LSUIElement（Dock 图标在位——on_reopen 依赖 Dock 语义，docs/06 §2）；
+# CFBundleIconFile = AppIcon（应用图标，Resources/AppIcon.icns）。
 cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -82,6 +103,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
     <string>XControl</string>
     <key>CFBundleIdentifier</key>
     <string>com.aixhc.XControl</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleVersion</key>
     <string>$VERSION</string>
     <key>CFBundleShortVersionString</key>
@@ -117,5 +140,6 @@ hdiutil verify "$DMG_OUT"
 echo ""
 echo "完成：$DMG_OUT"
 ls -lh "$DMG_OUT"
-echo "安装注意（docs/10 §1.1）：.app 拖入 /Applications 后固定路径使用——移动 bundle 会破坏"
-echo "已授予的辅助功能权限（TCC 按路径记忆）；正式签名/公证属 CI 发布流程移交项（docs/05 §1）。"
+echo "安装注意（docs/10 §1.1）：本包为 ad-hoc 签名——辅助功能授权按签名匹配，换装新构建后需在"
+echo "系统设置 → 隐私与安全性 → 辅助功能 里为 XControl 重新开启（主控授权后约 1s 自动恢复）；"
+echo "正式签名/公证属 CI 发布流程移交项（docs/05 §1）。"

@@ -36,6 +36,7 @@ These guides help you **ask the right questions before coding**.
 - [ ] You're not sure where to put some logic
 - [ ] You are adding an event kind, JSONL record, RPC payload, or config field
 - [ ] UI / command code starts casting raw payload fields directly
+- [ ] **You're changing the period of a polling / sampling loop** — find the other periodic actions at the same or a near frequency (pin warps, replays, debounce windows): near-in-phase periods change hit probability. Evaluate cadence changes together with the gating that protects them (11-24: raising edge polling to 10ms put it in phase with the 10ms anchor warp)
 
 → Read [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md)
 

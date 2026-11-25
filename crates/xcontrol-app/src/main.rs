@@ -395,6 +395,7 @@ fn run_tcp(
         },
         display_name: resolve_display_name(args.name.as_deref()),
         no_discover: args.no_discover,
+        headless: args.headless,
     };
     let supervisor = runtime.spawn(supervise_runtime(Arc::clone(&bus), rx, deps, initial_mode));
 
@@ -505,6 +506,9 @@ struct RuntimeDeps {
     manual_addr: Option<SocketAddr>,
     display_name: String,
     no_discover: bool,
+    /// CLI `--headless`（无 UI 运行时，FR-6.4）：只影响与界面相关的启动动作
+    /// ——辅助功能引导只告警、不请求系统引导框（`guide_accessibility_at_startup`）。
+    headless: bool,
 }
 
 impl RuntimeDeps {
@@ -624,6 +628,14 @@ async fn supervise_runtime(
             }
         }
     }
+
+    // 运行时启动的辅助功能引导（11-24，R9；FR-6.3，docs/05 §1.3）：角色已定（配置
+    // 驱动启动，或向导完成后按所选角色），进入 host / client 循环之前做一次——
+    // 两种角色都需要辅助功能（主控要捕获、从机要注入）。未授权 → 请求系统引导
+    // 框 + 告警；已授权 → 无动作。仅 macOS 编译面有实现（非 macos 为空函数）；
+    // 每进程一次——托盘角色切换/配置重建走下方的循环，不再重复请求。`--headless`
+    // （无 UI 运行时）不请求系统引导框，只告警（11-25）。
+    xcontrol_app::hotkey_rt::guide_accessibility_at_startup(deps.headless);
 
     // 通告器存活域：主控角色期间存活（host→client 切换即停；收尾兜底停）。
     let mut announcer: Option<Arc<xcontrol_net::Announcer>> = None;

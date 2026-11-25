@@ -27,6 +27,10 @@ impl InputSink for Box<dyn InputSink + Send> {
     fn cursor_normalized(&self) -> Option<(f32, f32)> {
         (**self).cursor_normalized()
     }
+
+    fn resync_cursor(&mut self) -> Result<(), SinkError> {
+        (**self).resync_cursor()
+    }
 }
 
 /// 注入错误（可编程区分；不含敏感信息）。
@@ -72,16 +76,46 @@ pub trait InputSink {
     /// docs/03 §5）：`(x, y)` ∈ [0.0, 1.0]²，边缘驻留收敛到端点值 0.0/1.0
     /// （控制方 `at_outer_extreme` 极值判定的回报契约）。
     ///
+    /// **端点之外的取值（11-24 回切行程补偿，docs/02 §4.2「反向回报取值范围
+    /// 扩展到端点之外」）**：光标被推出屏幕边界期间，度量行程的实现回报端点之外
+    /// 的值——`x < 0` / `y < 0` = 推出左/上边界（绝对值 = 自到达该边以来的累计
+    /// 行程），`x > 1` / `y > 1` = 推出右/下边界（超出 1 的部分 = 行程）；单位是
+    /// 控制方转发的 `MouseMoveRel` delta 单位（即主控的点），光标严格回到屏内
+    /// 即清零。控制方仍按 `≤ 0` / `≥ 1` 判极值，行程随回切通知带出用于落点补偿。
+    /// 不度量行程的实现维持端点值（越界期间恒报 0.0/1.0，控制方算出的行程为 0）
+    /// ——两者对控制方兼容。
+    ///
     /// 默认 `None`（无光标语义的实现——mock/无查询 API 的平台）恒不回报，
     /// 调用方（app 会话循环受控光标回报分支）按 `None` 跳过本拍，零额外
     /// 状态；实现方为纯查询（非阻塞快速返回，同 [`InputSink::inject`] 契约）。
     ///
-    /// 平台矩阵（11-22）：`UinputInjector`（uinput ABS 虚拟光标域换算）/
-    /// `X11Injector`（XQueryPointer root 几何换算）/ `MacInjector`
-    /// （CGEventGetLocation 布局换算）；win 后端暂无（默认 None，回报
-    /// 分支零动作——与被控采样面的平台矩阵一致）。
+    /// 平台矩阵（11-22；行程度量 11-24）：`UinputInjector`（uinput ABS 虚拟光标
+    /// 域换算，**度量行程**）/ `X11Injector`（XQueryPointer root 几何换算）/
+    /// `MacInjector`（CGEventGetLocation 布局换算）；win 后端暂无（默认 None，
+    /// 回报分支零动作——与被控采样面的平台矩阵一致）。
     fn cursor_normalized(&self) -> Option<(f32, f32)> {
         None
+    }
+
+    /// 把真实光标校准到实现的位置模型（保持原位切入后调用一次，11-24）。
+    ///
+    /// 背景：`EnterScreen{preserve_cursor=1}`（热键/托盘切换）不做落点 warp，
+    /// 被控端光标"留在切出时的位置"（docs/02 §4.2）。位置模型为**虚拟**的后端
+    /// （uinput——回报取自注入器自己维护的虚拟位置，无"查询真实光标"入口）
+    /// 此时虚拟位置与真实光标可能不一致（真实光标被本机物理鼠标挪过等），
+    /// 回切判定会基于一个虚构位置——实现覆写本方法，把真实光标定位到虚拟
+    /// 位置（虚拟位置不动），使二者重新对齐。
+    ///
+    /// 默认无操作（`Ok`）：位置模型即真实光标的实现（mac / X11 / win / mock）
+    /// 无需校准——调用方对任意 sink 直接调用即可，无需按后端分支。
+    /// 契约同 [`InputSink::inject`]：非阻塞快速返回；**不产出输入事件流**
+    /// （不触碰已注入按键/按钮的记账）。
+    ///
+    /// # Errors
+    /// [`SinkError::Failed`]（平台调用失败）——实时路径的可忽略错误，调用方
+    /// 告警不中断会话（error-handling.md 规则 4）。
+    fn resync_cursor(&mut self) -> Result<(), SinkError> {
+        Ok(())
     }
 }
 
@@ -95,4 +129,104 @@ pub trait InputSource {
 
     /// 当前修饰键快照（`EnterScreen`/`LeaveScreen`/`ModifierSync` 载荷来源）。
     fn mods(&self) -> Mods;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    /// 只实现三个必需方法的 sink——`resync_cursor` 取 trait 默认实现。
+    struct RequiredOnly;
+
+    impl InputSink for RequiredOnly {
+        fn inject(&mut self, _event: &InputEvent) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn warp(&mut self, _screen: ScreenId, _x: f32, _y: f32) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn release_all(&mut self) -> Result<(), SinkError> {
+            Ok(())
+        }
+    }
+
+    /// 覆写 `resync_cursor` 的计数 sink（共享计数——装箱成 trait 对象后仍可读）。
+    #[derive(Default)]
+    struct CountingSink {
+        resyncs: Arc<AtomicU32>,
+    }
+
+    impl InputSink for CountingSink {
+        fn inject(&mut self, _event: &InputEvent) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn warp(&mut self, _screen: ScreenId, _x: f32, _y: f32) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn release_all(&mut self) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn resync_cursor(&mut self) -> Result<(), SinkError> {
+            self.resyncs.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// `resync_cursor` 失败的 sink（错误透传断言用）。
+    struct FailingResync;
+
+    impl InputSink for FailingResync {
+        fn inject(&mut self, _event: &InputEvent) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn warp(&mut self, _screen: ScreenId, _x: f32, _y: f32) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn release_all(&mut self) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn resync_cursor(&mut self) -> Result<(), SinkError> {
+            Err(SinkError::Failed {
+                action: "resync",
+                reason: "mock".into(),
+            })
+        }
+    }
+
+    /// 默认实现无操作（11-24 位置模型校准钩子）：未覆写的实现调用成功——
+    /// 位置模型即真实光标的后端（mac / X11 / win / mock）无需校准。
+    #[test]
+    fn resync_cursor_default_is_noop() {
+        let mut sink = RequiredOnly;
+        sink.resync_cursor().expect("默认实现恒成功");
+        sink.resync_cursor()
+            .expect("重复调用同样成功（幂等无副作用）");
+        assert_eq!(sink.cursor_normalized(), None, "既有默认方法不受影响");
+    }
+
+    /// Box 透传：`Box<dyn InputSink + Send>`（生产接线形态）的 `resync_cursor`
+    /// 到达内层覆写，错误原样上抛（调用方据此告警，error-handling.md 规则 4）。
+    #[test]
+    fn boxed_sink_forwards_resync_cursor() {
+        let inner = CountingSink::default();
+        let resyncs = Arc::clone(&inner.resyncs);
+        let mut sink: Box<dyn InputSink + Send> = Box::new(inner);
+        sink.resync_cursor().expect("透传成功");
+        sink.resync_cursor().expect("透传成功");
+        assert_eq!(resyncs.load(Ordering::Relaxed), 2, "内层覆写被调两次");
+
+        let mut failing: Box<dyn InputSink + Send> = Box::new(FailingResync);
+        assert!(failing.resync_cursor().is_err(), "内层错误原样上抛");
+    }
 }

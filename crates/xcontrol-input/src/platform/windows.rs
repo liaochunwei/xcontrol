@@ -1545,7 +1545,11 @@ mod tests {
         }
         assert_eq!(
             Mods::from_bits(mods_bits.load(Ordering::Relaxed)).bits(),
-            0b1000_1011,
+            // LCtrl(0)|LMeta(3)|RShift(5)|RMeta(7) = 1|8|32|128（docs/02 §4.2 位表：
+            // bit0-7 = LCtrl/LShift/LAlt/LMeta/RCtrl/RShift/RAlt/RMeta，与
+            // XKey 0xE0–0xE7 偏移一致）。原字面量 0b1000_1011 把 RShift 误写成
+            // bit1——笔误被 windows runner 首跑暴露（本测试只在 windows 编译）。
+            0b1010_1001,
             "LCtrl|LMeta|RShift|RMeta 位组"
         );
     }

@@ -42,7 +42,7 @@ pub use error::InputError;
 #[cfg(feature = "macos")]
 pub use platform::macos::{
     AccessibilityStatus, CaptureSource, DisplayInfo, MacInjector, check_accessibility,
-    cursor_location, display_layout,
+    cursor_location, display_layout, shift_cursor,
 };
 #[cfg(feature = "wayland")]
 pub use platform::wayland::{

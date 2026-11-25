@@ -8,9 +8,9 @@
 //!   transport.recv → 解密明文喂 Dispatcher → SessionAction
 //!   interval.tick  → Dispatcher::on_timer（3s ping / 9s 判死）
 //!   rx_cmd.recv    → LocalCmd（Pause/Resume/Quit）
-//!   edge 轮询(50ms, host+macos) → EdgeSensor::feed → 门控（暂停/被控/鼠标键
-//!   按下，11-22 第三轮）→ LocalCmd::EdgeCrossing
-//!   受控光标回报(50ms, client) → 归一化采样（mac=rects 快照；其余=sink 查询，
+//!   edge 轮询(10ms, host+macos) → EdgeSensor::feed → 门控（暂停/受控中/鼠标键
+//!   按下，11-22 第三轮；控制关系变化后 150ms 防抖，11-24）→ LocalCmd::EdgeCrossing
+//!   受控光标回报(10ms, client) → 归一化采样（mac=rects 快照；其余=sink 查询，
 //!   11-22）→ LocalCmd::ReportControlledCursor
 //! } → SessionAction::Send 编码 → transport.send（Noise 加密 + 分帧）
 //! ```
@@ -1258,13 +1258,48 @@ async fn drive_session(
     let mut last_local_mods = Mods::default();
     #[cfg(feature = "macos")]
     let mut last_suppress = false;
-    // 释放落点缓存（11-22 回切落点覆盖修复）：受控态产出的 `WarpPointer`
-    // （边缘回切/热键回主控）先缓存，`suppress=false` 重关联**之后**重放——
+    // 释放落点缓存（11-22 回切落点覆盖修复）：受控态的回主控落点先缓存，
+    // `suppress=false` 重关联**之后**重放——
     // `CGAssociateMouseAndMouseCursorPosition(true)` 会把光标拉到物理鼠标
     // 当前位置，覆盖 warp 落点（用户实测：回切落点跳到屏幕右侧）；重关联后
     // 重放即最终生效。异常收尾不消费（光标停物理鼠标位，语义自然）。
+    // 来源两路（11-24）：边缘回切 = core `WarpPointer` 换算的全局点**加上回切
+    // 行程补偿**（收帧分支，`compensated_release_point`——回切触发处排空捕获队列
+    // 后立即翻拍重放）；热键回主控 = 切入锚点（热键分支 `apply_home_landing`——
+    // core 的落点 warp 已被 `strip_home_warp` 剥离，不进本缓存的换算）。
     #[cfg(feature = "macos")]
     let mut pending_release_warp: Option<(f64, f64)> = None;
+    // 在途批（11-24 回切行程补偿，R8；docs/03 §5 回切第 3 条）：输入拍每成功发出
+    // 一批，记下发出时刻与批内 `MouseMoveRel` 之和。回切触发时距发出不足
+    // `IN_FLIGHT_WINDOW` 的那一批可能在工作机采样**之后**才到——没算进触发回切的
+    // 那条回报，由主控补到落点上（纯函数 `in_flight_batch`）。
+    #[cfg(feature = "macos")]
+    let mut last_sent_batch: Option<(Instant, (f32, f32))> = None;
+    // 捕获源自动恢复的最近一次探测时刻（11-24，R9）：主控捕获源缺席时每
+    // `CAPTURE_RETRY_INTERVAL` 静默查询一次辅助功能授权，已授权即重建捕获源。
+    #[cfg(feature = "macos")]
+    let mut capture_probe_at: Option<Instant> = None;
+    // 捕获源重建失败告警的退避（11-25）：已授权但捕获源启动持续失败时重试仍每秒
+    // 一次，告警首次立即、之后至多 `CAPTURE_FAILURE_LOG_INTERVAL` 一条；恢复成功
+    // 复位（下次再失败时重新立即告警）。
+    #[cfg(feature = "macos")]
+    let mut capture_failure_logged_at: Option<Instant> = None;
+    // 回切行程的平滑回放队列（11-25 第二轮，R11；macOS 主控）：边缘回切时三段
+    // 丢失行程不再一次性加到落点——快速甩动时一百多点的瞬移，用户实测"直接跳跃"
+    //（第一轮的"10ms 节拍 × 6 大步"也不行：每步 20 点仍是跳）。改为光标先落在
+    // 未补偿的贴缘基点（与它刚才在工作机屏边的位置连续），补偿量经
+    // [`replay_slices`] 切成 2ms 微步（匀速），回切触发处直接交给
+    // [`spawn_cursor_replay`] 专用线程高频回放；期间物理鼠标位移照常叠加。
+    // 回切行程的平滑回放队列（11-25 第二轮，R11；macOS 主控）：边缘回切时三段
+    // 丢失行程不再一次性加到落点——快速甩动时一百多点的瞬移，用户实测"直接跳跃"
+    //（第一轮的"10ms 节拍 × 6 大步"也不行：每步 20 点仍是跳）。改为光标先落在
+    // 未补偿的贴缘基点（与它刚才在工作机屏边的位置连续），补偿量经
+    // [`replay_slices`] 切成 2ms 微步（匀速），回切触发处直接交给
+    // [`spawn_cursor_replay`] 专用线程高频回放；期间物理鼠标位移照常叠加。
+    #[cfg(feature = "macos")]
+    #[allow(unused_assignments)]
+    // 初始值仅在触发分支被覆盖前存在（clippy 无法跨分支看到 `take()` 消费）
+    let mut cursor_replay: Vec<(f64, f64)> = Vec::new();
     // 本机矩形快照（释放落点换算：`WarpPointer` 全局 id → 全局点；sensor 同
     // 源同序，见 edge.rs release_warp_point）。
     #[cfg(feature = "macos")]
@@ -1324,8 +1359,9 @@ async fn drive_session(
     let mut ticker = tokio::time::interval(TIMER_PERIOD);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // 边缘轮询节拍（FR-2.1：传感器自带可配间隔，默认 50ms；无传感器时
-    // ticker 空转——轮询分支在 poll_edge_sensor 内永挂起）。
+    // 边缘轮询节拍（FR-2.1：传感器自带可配间隔，默认 10ms——11-24 起由 50ms
+    // 提速，最坏切换延迟约 50–60ms → 约 10ms；无传感器时 ticker 空转——轮询
+    // 分支在 poll_edge_sensor 内永挂起）。
     let mut edge_ticker = tokio::time::interval(
         edge.as_ref()
             .map_or(DEFAULT_POLL_INTERVAL, EdgeSensor::poll_interval),
@@ -1333,7 +1369,8 @@ async fn drive_session(
     edge_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // 受控光标回报节拍（双向边缘回切，11-21 反馈 5；docs/03 §5）：与主控边缘
-    // 轮询同 50ms 量级；分支条件含采样面存在性——零唤醒。11-22 修复轮：
+    // 轮询共用 DEFAULT_POLL_INTERVAL（10ms，11-24）；分支条件含采样面存在性——
+    // 零唤醒。11-22 修复轮：
     // mac = rects 快照在位（路径不变）；非 macos = sink 查询恒在位（无实现的
     // 后端 cursor_normalized 返回默认 None，查询零动作但节拍照走——uinput/
     // X11 有实现）。
@@ -1349,10 +1386,24 @@ async fn drive_session(
     let mut input_ticker = tokio::time::interval(crate::hotkey_rt::INPUT_POLL_INTERVAL);
     input_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // 控制关系变化沿（11-24，切入防抖的输入，docs/03 §5 死区）：每轮循环顶部
+    // 比对 `session.control_dir()` 与上一轮的值，变化即记 `Instant::now()`。
+    // 放在循环顶部而非各分支内——select 的任一分支（收帧/边缘/热键/托盘/命令）
+    // 引起的变化，以及分支内 `continue` 跳到下一轮的情形，都会在下一轮顶部被
+    // 记到；边缘分支读到的恒是最新值。None = 尚无变化沿（空闲常态，不防抖）。
+    let mut last_control_dir = session.control_dir();
+    let mut control_changed_at: Option<Instant> = None;
+
     // 循环内错误一律 `break Err` 收敛到循环尾部（shutdown + 断开投影上报），
     // 禁止 `?` 早退——早退会跳过传输收尾与 Disconnected 投影，UI 将冻结在
     // 旧状态（如 TCP 写坏后仍显示 Running）。
     let result = loop {
+        // —— 循环顶部：控制关系变化沿（见上）——同步快路径，无 await ——
+        let control_dir_now = session.control_dir();
+        if control_dir_now != last_control_dir {
+            last_control_dir = control_dir_now;
+            control_changed_at = Some(Instant::now());
+        }
         tokio::select! {
             // 收帧：解密 → 喂 Dispatcher（可含多帧）。
             received = transport.recv(&mut wire_buf) => match received {
@@ -1394,18 +1445,117 @@ async fn drive_session(
                     {
                         break Err(error);
                     }
-                    // 释放落点缓存（11-22）：受控态产出的 WarpPointer（边缘
-                    // 回切/热键回主控）换算成全局点缓存，suppress=false 拍在
-                    // 重关联后重放（重关联会覆盖落点，见 pending_release_warp）。
+                    // 位置模型校准（11-24，R2）：保持原位切入（`preserve_cursor=1`，
+                    // 无落点 warp）后，位置模型为虚拟的后端（uinput）把真实光标
+                    // 定位回其虚拟位置——否则回切判定基于一个与真实光标无关的
+                    // 虚构位置。上方动作已应用完毕（`SwitchRequest` 的 ReleaseAll
+                    // 在前一帧、EnterScreen 在本帧，分两次循环迭代），校准时序
+                    // 正确。位置模型即真实光标的后端默认无操作；失败只告警，不
+                    // 打断会话（error-handling.md 规则 4）。
+                    if is_preserved_entry(&outcome.actions)
+                        && let Err(error) = sink.resync_cursor()
+                    {
+                        tracing::warn!(target: "session::rt", %error,
+                            "保持原位切入后的光标校准失败（位置模型可能与真实光标不一致，回切判定或受影响）");
+                    }
+                    // 释放落点缓存（11-22）：受控态产出的 WarpPointer（收帧
+                    // 路径上只有边缘回切——热键回主控的落点在热键分支剥离并
+                    // 改写为切入锚点，11-24）换算成全局点缓存，suppress=false
+                    // 拍在重关联后重放（重关联会覆盖落点，见
+                    // pending_release_warp）。
+                    //
+                    // 回切行程补偿（11-24，R8；docs/03 §5 回切第 3 条）：三段位移在
+                    // 回切时本来会丢失，全部加到落点上——① 工作机顶边期间被屏幕
+                    // 边界截掉的推进量（随回报带回，`Notice::EdgeReturnedToHost`）；
+                    // ② 最后转发的一批若在工作机采样之后才到，没算进触发回切的
+                    // 那条回报（在途批）；③ 触发后到本地输入恢复之间被本地拦截的
+                    // 位移（下方排空的尾批）。落点夹回屏内（四周留
+                    // `EDGE_RETURN_INSET`）。
+                    //
+                    // 排空后立即翻拍：关闭本地输入拦截不再等下一个输入拍（≤10ms）
+                    // ——先把捕获队列里翻拍前被本地拦截的事件排空（位移计入③；
+                    // 事件仍过按键位图与热键过滤，只是不转发），随即翻拍并在
+                    // 重关联之后重放贴缘基点，补偿量由回放队列在后续输入拍
+                    // 逐拍补入（平滑回放）。翻拍之后的新事件原生送达本机。
                     #[cfg(feature = "macos")]
                     if last_suppress
-                        && let Some(action) = outcome.actions.iter().find(|action| {
-                            matches!(action, SessionAction::WarpPointer { .. })
-                        })
-                        && let SessionAction::WarpPointer { screen, x, y } = action
+                        && let Some(landing) = edge_return_of(&outcome.actions)
                     {
-                        pending_release_warp =
-                            crate::edge::release_warp_point(&local_rects, *screen, *x, *y);
+                        let in_flight = in_flight_batch(last_sent_batch.take(), Instant::now());
+                        let mut drained_sum = (0.0, 0.0);
+                        if let Some(capture) = capture.as_mut() {
+                            use xcontrol_core::sink::InputSource as _;
+                            let mut drained = Vec::new();
+                            capture.poll(&mut drained);
+                            drained_sum = sum_mouse_deltas(&drained);
+                            absorb_unforwarded_events(
+                                &drained,
+                                &mut capture_filter,
+                                &hotkey_tx,
+                                &mut mouse_buttons,
+                                &mut mouse_buttons_down,
+                                &mut session,
+                            );
+                        }
+                        let travel = (
+                            landing.report_travel.0 + in_flight.0 + drained_sum.0,
+                            landing.report_travel.1 + in_flight.1 + drained_sum.1,
+                        );
+                        // 平滑回放（11-25 第二轮，R11）：落点取**未补偿**的贴缘基点
+                        // （翻拍后重放的就是它），补偿量（夹取后的终点 − 基点）切成
+                        // 2ms 微步，交给专用线程高频回放——不等输入拍（10ms 一拍
+                        // 的"6 大步"实测仍不顺滑：每步 20 点依然是跳）。失败只告警
+                        // ——回放是观感优化，不打断输入路径。
+                        let base_release = crate::edge::release_warp_point(
+                            &local_rects,
+                            landing.screen,
+                            landing.x,
+                            landing.y,
+                        );
+                        pending_release_warp = base_release;
+                        cursor_replay = replay_slices(
+                            crate::edge::compensated_release_point(
+                                &local_rects,
+                                landing.screen,
+                                landing.x,
+                                landing.y,
+                                travel,
+                            ),
+                            base_release,
+                        );
+                        tracing::info!(target: "app::edge",
+                            report = ?landing.report_travel,
+                            in_flight = ?in_flight,
+                            drained = ?drained_sum,
+                            landing = ?pending_release_warp,
+                            replay_steps = cursor_replay.len(),
+                            replay_total = ?cursor_replay
+                                .iter()
+                                .fold((0.0, 0.0), |(x, y), &(dx, dy)| (x + dx, y + dy)),
+                            "边缘回切落点补偿（回报行程 + 在途批 + 排空批，单位=点；补偿量高频微步回放）");
+                        if let Some(capture) = capture.as_ref() {
+                            // 控制关系已终结 → want = false：翻拍并以补偿落点重放。
+                            // 正常路径下 control_dir 已是 None；万一同一批动作里
+                            // 又建立了新的控制关系，这里按其现值对账（不翻拍）。
+                            reconcile_local_input_suppress(
+                                capture,
+                                &mut pending_release_warp,
+                                &mut last_suppress,
+                                session.control_dir() == ControlDir::LocalControlsPeer,
+                            );
+                        }
+                        if last_suppress {
+                            // 未翻拍（仍在受控）：本次的释放落点作废，不留给下一次
+                            // 释放重放；回放队列同理清空。
+                            pending_release_warp = None;
+                            cursor_replay.clear();
+                        } else {
+                            // 已翻拍（正常路径）：队列交给专用线程高频回放。此后的
+                            // 重新切换、热键切走或会话结束都让光标回到受控锚定 /
+                            // 原生控制，无需此队列（当前设计的收尾路径不残留旧
+                            // 队列——切换前先回主控，回放早已完成）。
+                            spawn_cursor_replay(std::mem::take(&mut cursor_replay));
+                        }
                     }
                     consume_notices(&session, &outcome.actions, &bus);
                     // M5 布局协商接线（docs/02 §4.2）：布局类通知只随帧到达——
@@ -1649,8 +1799,9 @@ async fn drive_session(
             },
 
             // 边缘轮询（FR-2.1/2.2）：读光标 → 判定（含去抖）→ ControlDir/暂停
-            // 门控 → LocalCmd::EdgeCrossing。无传感器（非 macos/无屏/从机）时
-            // 该分支永挂起（poll_edge_sensor 内 pending），零唤醒开销。
+            // 门控 → 控制关系变化后 150ms 防抖（11-24）→ LocalCmd::EdgeCrossing。
+            // 无传感器（非 macos/无屏/从机）时该分支永挂起（poll_edge_sensor 内
+            // pending），零唤醒开销。
             hit = poll_edge_sensor(edge.as_mut(), &mut edge_ticker) => {
                 if let Some(hit) = hit {
                     // 本机物理屏间移动 ≠ 切换（11-20 策略分层）：传感器机制层
@@ -1659,7 +1810,24 @@ async fn drive_session(
                     if usize::from(hit.target) < edge.as_ref().map_or(0, |sensor| sensor.local_screen_count()) {
                         continue;
                     }
-                    if edge_hit_allowed(session.state(), session.control_dir(), mouse_buttons_down) {
+                    // 判定顺序（11-24）：本机屏过滤 → 门控 → 防抖 → EdgeCrossing；
+                    // 两类拒绝都走 debug 留痕（被拒命中不重发：传感器已闩锁，须回
+                    // 内侧再推）。
+                    if !edge_hit_allowed(session.state(), session.control_dir(), mouse_buttons_down) {
+                        // 门控拒绝属常态（暂停/受控中贴边/鼠标键按下）：debug——
+                        // 状态页/托盘已表达暂停态，info 级会在悬停边缘时刷屏
+                        //（11-21 实测反馈）；按键门控 11-22 第三轮（拖拽中不切换）；
+                        // 受控中一律拒绝 11-24（主控光标被锚定，受控期命中无有意
+                        // 滑边——见 edge_hit_allowed 文档）。
+                        tracing::debug!(target: "app::edge", target = hit.target,
+                            edge = ?hit.edge, control_dir = ?session.control_dir(), mouse_buttons_down,
+                            "触边被门控忽略（未运行/共享暂停/受控中/鼠标键按下）");
+                    } else if !edge_dead_time_elapsed(control_changed_at, Instant::now()) {
+                        // 防抖窗内（控制关系变化后不足 150ms）：防回切落点贴缘时
+                        // 快速甩动造成的回弹（docs/03 §5 死区）。
+                        tracing::debug!(target: "app::edge", target = hit.target,
+                            edge = ?hit.edge, "触边被防抖忽略（控制关系变化后 150ms 内）");
+                    } else {
                         tracing::info!(target: "app::edge", target = hit.target,
                             edge = ?hit.edge, ratio = hit.ratio, "光标触边：上报边缘切换");
                         let actions = {
@@ -1690,19 +1858,13 @@ async fn drive_session(
                         {
                             break Err(error);
                         }
-                    } else {
-                        // 门控拒绝属常态（暂停/被控中贴边/鼠标键按下）：debug——
-                        // 状态页/托盘已表达暂停态，info 级会在悬停边缘时刷屏
-                        //（11-21 实测反馈）；按键门控 11-22 第三轮（拖拽中不切换）。
-                        tracing::debug!(target: "app::edge", target = hit.target,
-                            edge = ?hit.edge, mouse_buttons_down,
-                            "触边被门控忽略（未运行/共享暂停/被控中/鼠标键按下）");
                     }
                 }
             },
 
             // 受控光标回报（双向边缘回切，11-21 反馈 5；docs/03 §5）：被控方按
-            // 50ms 节拍采样本机光标 → 归一化 → MouseMoveAbs 出站回报——判定
+            // 10ms 节拍（11-24 起，原 50ms）采样本机光标 → 归一化 → MouseMoveAbs
+            // 出站回报——判定
             // （外侧边极值 + 同向武装）与回切决策全在主控状态机。采样双路径
             // （11-22 修复轮）：mac 走 rects 快照 + CG 查询（现行路径不动），
             // Linux/其他平台走注入 sink 查询（cursor_normalized——此前 Linux
@@ -1739,6 +1901,69 @@ async fn drive_session(
             // 会话输入抽头（FR-2.5/2.x）：平台热键源 drain + mac 主控捕获流
             // 热键识别/转发。全非阻塞（poll/drain 无事件即返回）。
             _ = input_ticker.tick() => {
+                // 捕获源自动恢复（11-24，R9；docs/05 §1.3）：macOS 主控的捕获源只在
+                // 会话装配时创建一次，未授权辅助功能时创建失败（热键识别与捕获
+                // 转发停用）——此前授权后必须重启应用或重建会话。此处每
+                // `CAPTURE_RETRY_INTERVAL` 静默查询一次授权状态（`prompt=false`，
+                // 不弹系统框），已授权即重建捕获源，后续输入拍照常消费。仅 Host
+                // （从机不建捕获源）且 `capture` 缺席时探测。
+                //
+                // 恢复前先解除名义上的受控态（11-25）：未授权期间没有捕获源，但
+                // 边缘传感器不需要权限——主控仍可靠它切入（`LocalControlsPeer`，
+                // 本地输入照常、只是不转发）。捕获源一恢复，本拍随后的对账就会
+                // 打开本地输入拦截并把键鼠转发给工作机，而用户并没有在此刻发起
+                // 切换。所以先经 `ReleaseControl` 释放（`ReleaseAll` 与
+                // `LeaveScreen` 照常下发，落点 warp 剥离、光标不动），再重建
+                // （纯决策 `capture_recovery_step`：共享暂停中推迟到恢复之后）。
+                //
+                // 重建失败的告警退避（11-25）：已授权但启动持续失败时每秒重试
+                // 一次，告警首次立即、之后至多 `CAPTURE_FAILURE_LOG_INTERVAL` 一条
+                // （纯函数 `capture_failure_log_due`）；恢复成功 `info!` 一次。
+                #[cfg(feature = "macos")]
+                if role == Role::Host
+                    && capture.is_none()
+                    && capture_probe_due(capture_probe_at, Instant::now())
+                {
+                    capture_probe_at = Some(Instant::now());
+                    // 未授权：静默返回（每秒一条"仍未授权"只是噪音，启动引导已
+                    // 留痕）。已授权才往下走。
+                    if xcontrol_input::check_accessibility(false).is_granted() {
+                        match capture_recovery_step(session.control_dir(), session.is_paused()) {
+                            // 共享暂停中且名义上受控：对端此刻拒收全部输入帧
+                            // （LeaveScreen 会被丢弃，控制关系在两端失配）——本拍
+                            // 不重建，恢复之后的下个探测间隔再走"释放 + 重建"。
+                            // 暂停期间捕获源缺席，本就什么都不转发。
+                            CaptureRecoveryStep::DeferWhilePaused => {
+                                tracing::debug!(target: "session::rt",
+                                    "辅助功能已授权，但共享暂停中且名义上处于受控态：推迟到恢复后释放控制关系并重建捕获源");
+                            }
+                            step => {
+                                if step == CaptureRecoveryStep::ReleaseThenRebuild {
+                                    let actions =
+                                        release_control_before_capture_recovery(&mut session);
+                                    if !actions.is_empty() {
+                                        if let Err(error) = apply_and_send(
+                                            &mut transport,
+                                            &mut sink,
+                                            &actions,
+                                            &mut out_buf,
+                                            &bus,
+                                        )
+                                        .await
+                                        {
+                                            break Err(error);
+                                        }
+                                        consume_notices(&session, &actions, &bus);
+                                        tracing::info!(target: "session::rt",
+                                            "授权前已切入：已先释放控制关系，请重新切换");
+                                    }
+                                }
+                                rebuild_capture_source(&mut capture, &mut capture_failure_logged_at);
+                            }
+                        }
+                    }
+                }
+
                 // 平台注册源（win/x11）→ 路由通道。
                 let mut hits = Vec::new();
                 hotkey_source.drain(&mut hits);
@@ -1791,25 +2016,29 @@ async fn drive_session(
                     );
                     // 受控吞本地输入（KVM 重定向语义，docs/06 §2）：ControlDir 变化
                     // 即同步 tap 的 suppress 开关（受控 Drop 本地执行；已转换仍转发）。
+                    // 翻拍与释放落点重放的判定抽在 reconcile_local_input_suppress
+                    // （11-24：边缘回切在收帧分支排空后立即翻拍，与本拍共用）。
                     let want_suppress =
                         session.control_dir() == ControlDir::LocalControlsPeer;
-                    if want_suppress != last_suppress {
-                        // 释放落点重放（11-22）：false = 回切/热键回主控——
-                        // 重关联会覆盖此前执行的落点 warp，在此重放缓存的落点
-                        // （见 pending_release_warp 注释）。
-                        let release_point = if want_suppress { None } else { pending_release_warp.take() };
-                        capture.set_suppress_local_input(want_suppress, release_point);
-                        tracing::info!(target: "session::rt", suppress = want_suppress,
-                            "本地输入拦截开关更新（受控重定向）");
-                        last_suppress = want_suppress;
-                    }
+                    reconcile_local_input_suppress(
+                        capture,
+                        &mut pending_release_warp,
+                        &mut last_suppress,
+                        want_suppress,
+                    );
+                    // 回切行程回放（11-25，R11）：队列非空时每拍相对 warp 一步。
+                    // 放在对账之后——已翻到受控（want_suppress）即停止回放：光标
+                    // 已交还给受控锚定，回放不得再推动它。
+                    // 回切行程回放（11-25 第二轮）：回切触发处已把队列交给专用
+                    // 线程高频回放（spawn_cursor_replay），输入拍不再参与——
+                    // 10ms 节拍的"6 大步"实测仍不顺滑。
                     // 受控光标维护（11-20 切入锚定；11-22 撞缘回锚**删除**）：
                     // 每拍 warp 回切入锚点——mac 光标冻结在切入处（macOS 指针
                     // 合成在 HID 层，Session tap 吞事件防不住光标移动；锚定
                     // warp 是"光标冻结"唯一可达实现——11-22 对照实验裁定）。
                     // 回锚的前提（受控 delta 随系统钳位断流）经实验证伪——
                     // 解关联后 HID 事件 delta 为硬件增量，无钳位无断供，回锚
-                    // 与其可见跳变一并删除。物理位移全部转发从机（ABS）。
+                    // 与其可见跳变一并删除。物理位移全部转发从机。
                     if want_suppress {
                         capture.pin_cursor_to_anchor();
                     }
@@ -1844,6 +2073,18 @@ async fn drive_session(
                             }
                         }
                     }
+                    // 在途批（11-24 回切行程补偿）：本批实际发出的 `MouseMoveRel`
+                    // 之和——发出成功后连同发出时刻记下（下方 await 语句原样保留，
+                    // 失败即 break，记录只发生在成功之后）。
+                    let batch_move_sum = sum_mouse_deltas(outbound.iter().filter_map(|action| {
+                        match action {
+                            SessionAction::Send {
+                                msg: xcontrol_core::session::Outbound::Input(event),
+                                ..
+                            } => Some(event),
+                            _ => None,
+                        }
+                    }));
                     if !outbound.is_empty()
                         && let Err(error) = apply_and_send(
                             &mut transport,
@@ -1855,6 +2096,9 @@ async fn drive_session(
                         .await
                     {
                         break Err(error);
+                    }
+                    if !outbound.is_empty() {
+                        last_sent_batch = Some((Instant::now(), batch_move_sum));
                     }
                 }
             },
@@ -1908,7 +2152,8 @@ async fn drive_session(
                     ),
                     Role::Client => crate::hotkey_rt::route_slave(id, session.state()),
                 };
-                let actions = match action {
+                #[cfg_attr(not(feature = "macos"), allow(unused_mut))]
+                let mut actions = match action {
                     HotkeyAction::Switch { target } => {
                         tracing::info!(target: "app::hotkey", hotkey = id.label(), target,
                             "热键切换（SwitchRequest → Ack → EnterScreen 接管闭环，docs/03 §5）");
@@ -1930,17 +2175,24 @@ async fn drive_session(
                         Vec::new()
                     }
                 };
-                // 释放落点缓存（11-22，热键回主控路径——语义同收帧分支）：
-                // 受控态产出的 WarpPointer 缓存到 suppress=false 拍重放。
+                // 热键回主控的落点 = 切入锚点（11-24，R4；docs/03 §4.6）：macOS
+                // 主控受控期间光标锚定在切入处，core 序列里的落点 warp（主屏内侧
+                // 0.5/0.6）会把光标从锚点拽到屏幕中央——有捕获源即剥离；suppress
+                // 尚未翻开（`last_suppress`）时把锚点交给 suppress=false 拍，在
+                // 重关联**之后**重放（重关联会把光标拉到物理鼠标位、覆盖此前执行
+                // 的 warp——11-22 回切落点覆盖修复已验证的路径）。锚点不可得 →
+                // 重放点为空，光标停物理鼠标位；suppress 尚未翻开 → 只剥离不重放。
                 #[cfg(feature = "macos")]
-                if last_suppress
-                    && let Some(action) = actions.iter().find(|action| {
-                        matches!(action, SessionAction::WarpPointer { .. })
-                    })
-                    && let SessionAction::WarpPointer { screen, x, y } = action
+                if matches!(action, HotkeyAction::ReleaseControl)
+                    && let Some(capture) = capture.as_ref()
                 {
-                    pending_release_warp =
-                        crate::edge::release_warp_point(&local_rects, *screen, *x, *y);
+                    let stripped = strip_home_warp(&mut actions);
+                    apply_home_landing(
+                        &mut pending_release_warp,
+                        stripped,
+                        last_suppress,
+                        capture.anchor_point(),
+                    );
                 }
                 if let Err(error) = apply_and_send(
                     &mut transport,
@@ -2146,14 +2398,419 @@ fn run_local<C: xcontrol_core::clock::Clock>(
     }
 }
 
-/// 边缘命中是否允许上报（ControlDir 暂停语义 + 按键门控，FR-2.1 + PRD 收敛
-/// 项 3 + 11-22 第三轮）：仅 **Running 且未共享暂停、且未被控、且无鼠标键按下**
-/// 时允许。
+/// 识别"保持原位切入"（11-24，R2；docs/03 §5 热键闭环，纯函数）：动作序列产出
+/// [`Notice::EnteredControl`]（本机进入受控）且**不含**落点 warp——即
+/// `EnterScreen{preserve_cursor=1}` 路径（热键/托盘切换：被控端光标留在切出时
+/// 的位置）。边缘切入的序列含 `WarpPointer`（定位到进入点），不属此类。
 ///
-/// - `PeerControlsLocal`（收到对端 `EnterScreen`，本机被控）→ 拒绝：被控中
-///   本机光标不驱动切换；对端 `LeaveScreen` 复位 `ControlDir::None` 后恢复；
-/// - `LocalControlsPeer`（本机已切出）→ 允许：本机光标滑边 = 本机要控制对端
-///   （多屏链式切换 FR-2.2 的 M3 路由基础）；连续误触发由传感器去抖闩锁抑制；
+/// 消费面：`drive_session` 收帧分支在动作应用成功后据此调用一次
+/// [`InputSink::resync_cursor`]（位置模型校准）。
+#[must_use]
+fn is_preserved_entry(actions: &[SessionAction]) -> bool {
+    let entered = actions
+        .iter()
+        .any(|action| matches!(action, SessionAction::Notice(Notice::EnteredControl { .. })));
+    let warped = actions
+        .iter()
+        .any(|action| matches!(action, SessionAction::WarpPointer { .. }));
+    entered && !warped
+}
+
+/// 剥离动作序列里的落点 warp（11-24，R4 / design D8；纯函数）：热键回主控
+/// （`ReleaseControl`）序列 = `ReleaseAll` + `LeaveScreen` + core 的落点 warp
+/// （主屏内侧 0.5/0.6）。macOS 主控以切入锚点替换该落点——先剥离（否则下方
+/// `apply_and_send` 会立即把光标从锚点拽到屏幕中央），锚点留到 suppress=false
+/// 拍重放。返回是否剥离到（序列不含 warp = 状态机未产出回主控序列）。
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+fn strip_home_warp(actions: &mut Vec<SessionAction>) -> bool {
+    let before = actions.len();
+    actions.retain(|action| !matches!(action, SessionAction::WarpPointer { .. }));
+    actions.len() != before
+}
+
+/// 热键回主控的落点重放判定（11-24，纯函数；[`strip_home_warp`] 的配套）：决定
+/// 是否改写 suppress=false 拍的重放缓存 `pending`，以及改写成什么。
+///
+/// - 未剥离到（动作序列不含落点 warp）→ 不动；
+/// - suppress 尚未翻开（`suppress_open == false`：接管后一个输入拍内就按了回
+///   主控，没有翻拍可承接重放）→ 不动——只剥离，光标原地不动；
+/// - 其余 → `pending` 置为 `anchor`：`Some` = 切入锚点（重关联后重放，光标
+///   停在受控期间所见位置）；`None` = 锚点不可得（切入时光标查询失败）——
+///   缓存清空，光标停物理鼠标位。
+///
+/// 返回是否改写了缓存。
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+fn apply_home_landing(
+    pending: &mut Option<(f64, f64)>,
+    stripped: bool,
+    suppress_open: bool,
+    anchor: Option<(f64, f64)>,
+) -> bool {
+    if !stripped || !suppress_open {
+        return false;
+    }
+    *pending = anchor;
+    true
+}
+
+// —— 回切行程补偿（11-24，R8 / AC10；design D13） ——
+
+/// 边缘回切的落点素材（收帧动作序列解出）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+struct EdgeReturnLanding {
+    /// core 落点 warp 的屏（本机 rects 下标）。
+    screen: ScreenId,
+    /// core 落点 warp 的归一化 X（未含补偿）。
+    x: f32,
+    /// core 落点 warp 的归一化 Y（未含补偿）。
+    y: f32,
+    /// 回报段行程（[`Notice::EdgeReturnedToHost`] 的 `overflow`，主控点）。
+    report_travel: (f32, f32),
+}
+
+/// 从收帧动作序列识别**边缘回切**并取出落点素材（纯函数）：序列须同时含
+/// [`Notice::EdgeReturnedToHost`]（回切的确凿标志——同批的 `WarpPointer` 就是它的
+/// 环绕落点）与 `WarpPointer`；缺一不算（热键回主控的落点 warp 已在热键分支
+/// 剥离，不会误入）。消费面：`drive_session` 收帧分支的落点补偿与立即翻拍。
+#[must_use]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+fn edge_return_of(actions: &[SessionAction]) -> Option<EdgeReturnLanding> {
+    let report_travel = actions.iter().find_map(|action| match action {
+        SessionAction::Notice(Notice::EdgeReturnedToHost { overflow, .. }) => Some(*overflow),
+        _ => None,
+    })?;
+    let (screen, x, y) = actions.iter().find_map(|action| match action {
+        SessionAction::WarpPointer { screen, x, y } => Some((*screen, *x, *y)),
+        _ => None,
+    })?;
+    Some(EdgeReturnLanding {
+        screen,
+        x,
+        y,
+        report_travel,
+    })
+}
+
+/// 在途批窗口（design D13）：主控每 10ms 转发一批，工作机每 10ms 采样一次并回报。
+/// 回切触发时（回报到达主控的时刻），距发出不足本窗口的那一批可能是在工作机
+/// 采样**之后**才到并注入的——没算进触发回切的那条回报。窗口取往返时延量级
+/// （局域网单程约 1ms，3ms 覆盖到约 1.5ms 单程）；一批之内至多一批落窗（批间隔
+/// 10ms 远大于窗口）。宁多补不漏补：实际已计入的那批最多让落点多走一批的位移
+/// （10ms 的移动量），漏补则落点停在中途。
+const IN_FLIGHT_WINDOW: Duration = Duration::from_millis(3);
+
+/// 在途批判定（11-24，纯函数）：最近一次成功发出的批（发出时刻，批内鼠标位移
+/// 和）中，发出时刻距 `now` 不足 [`IN_FLIGHT_WINDOW`] 的计入补偿，否则不计。
+/// `None`（本会话尚未发出过批）→ `(0.0, 0.0)`。发出时刻晚于 `now`（不应出现）
+/// 时 `Instant::duration_since` 饱和为零，不 panic。
+#[must_use]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+fn in_flight_batch(last: Option<(Instant, (f32, f32))>, now: Instant) -> (f32, f32) {
+    match last {
+        Some((sent_at, sum)) if now.duration_since(sent_at) < IN_FLIGHT_WINDOW => sum,
+        _ => (0.0, 0.0),
+    }
+}
+
+/// 一批捕获/转发事件里的鼠标位移求和（11-24，纯函数）：逐条累加 `MouseMoveRel`
+/// 的 `(dx, dy)`（主控点，符号与屏幕坐标轴同向），其余事件不计。
+#[must_use]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+fn sum_mouse_deltas<'a>(events: impl IntoIterator<Item = &'a InputEvent>) -> (f32, f32) {
+    let (mut dx, mut dy) = (0.0_f32, 0.0_f32);
+    for event in events {
+        if let InputEvent::MouseMoveRel {
+            dx: event_dx,
+            dy: event_dy,
+        } = event
+        {
+            dx += *event_dx;
+            dy += *event_dy;
+        }
+    }
+    (dx, dy)
+}
+
+/// 高频微步回放（11-25 第二轮，R11；用户实测"6 步低频回放仍不顺滑"后改为
+/// 惯性滑动式）：每步 2ms、匀速——积压行程是"被钳住之前正在发生的运动"，
+/// 恢复交付时按原始速度分小步，每步只有 1 点上下，视觉上是连续运动而非跳变。
+const RETURN_REPLAY_STEP: Duration = Duration::from_millis(2);
+
+/// 单步的位移下限（点，防饿死）：行程极小时步长不至于小到无法感知；
+/// 上限由总步数封顶推出（`RETURN_REPLAY_MAX_STEPS` × 步长 ≥ 行程）。
+const RETURN_REPLAY_MIN_STEP: f64 = 1.0;
+
+/// 回放总步数上限（11-25 第二轮，R11）：总时长 = 步数 × [`RETURN_REPLAY_STEP`] ≤
+/// 60ms。行程超出"原始速度 × 总时长"时，步长等比例放大（仍匀速——位移越大
+/// 说明被钳住之前甩得越快，恢复交付也越快，方向一致）。
+const RETURN_REPLAY_MAX_STEPS: usize = 30;
+
+/// 回放总时长（11-25 第二轮）：回放在这个量级内完成——原始速度由
+/// "总位移 ÷ 本时长"定义，时长越长、回放越慢、越像惯性。
+const RETURN_REPLAY_DURATION: Duration = Duration::from_millis(60);
+
+/// 回切行程的回放切片（11-25；纯函数）：把"补偿终点 − 贴缘基点"的位移按
+/// **匀速**切成微步（速度 = 总位移 ÷ [`RETURN_REPLAY_DURATION`]，即"被钳住之前
+/// 那一下"的平均速度——快甩快回，慢推慢回）。三个约束同时成立：步数 ≤
+/// [`RETURN_REPLAY_MAX_STEPS`]（总时长 ≤ 60ms）、单步 ≥ [`RETURN_REPLAY_MIN_STEP`]、
+/// 各步之和恒等于总位移（望远镜求和，无舍入漂移）。
+/// **逆序存放**——队列以 `pop()` 出步，弹出顺序即回放顺序。
+///
+/// 返回空队列（不回放）：终点或基点缺失（屏下标越界 / 非有限坐标）、总位移为零
+/// 或非有限。
+#[must_use]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+fn replay_slices(compensated: Option<(f64, f64)>, base: Option<(f64, f64)>) -> Vec<(f64, f64)> {
+    let (Some((end_x, end_y)), Some((base_x, base_y))) = (compensated, base) else {
+        return Vec::new();
+    };
+    let (total_x, total_y) = (end_x - base_x, end_y - base_y);
+    if !total_x.is_finite() || !total_y.is_finite() || (total_x == 0.0 && total_y == 0.0) {
+        return Vec::new();
+    }
+    let magnitude = (total_x * total_x + total_y * total_y).sqrt();
+    if magnitude <= 0.0 {
+        return Vec::new();
+    }
+    // 名义步长 = 原始速度 × 单步时长（快甩大步、慢推小步）；夹进 [MIN_STEP,
+    // 行程/最大步数]——下限防饿死，上限同时封住步数（≤ MAX_STEPS）与总时长。
+    let step_len = ((magnitude / RETURN_REPLAY_DURATION.as_secs_f64())
+        * RETURN_REPLAY_STEP.as_secs_f64())
+    .clamp(
+        RETURN_REPLAY_MIN_STEP,
+        (magnitude / RETURN_REPLAY_MAX_STEPS as f64).max(RETURN_REPLAY_MIN_STEP),
+    );
+    let steps = ((magnitude / step_len).ceil() as usize).clamp(1, RETURN_REPLAY_MAX_STEPS);
+    let mut slices = Vec::with_capacity(steps);
+    let mut reached = 0.0;
+    for step in 1..=steps {
+        let now = (step as f64 / steps as f64 * magnitude).min(magnitude);
+        let t = now - reached;
+        slices.push((total_x * (t / magnitude), total_y * (t / magnitude)));
+        reached = now;
+    }
+    slices.reverse();
+    slices
+}
+
+/// 回放消费线程（11-25 第二轮，R11）：每 [`RETURN_REPLAY_STEP`] 相对 warp 一步，
+/// 队列空即退出（生命周期 = 一次回放，约 60ms）。warp 是进程级线程安全 API
+/// （`xcontrol_input::shift_cursor`，不依赖任何实例状态），线程只做"warp +
+/// sleep"，无锁无共享可变状态（回调线程纪律的同型约束）；warp 失败即终止
+/// （语义：光标停在当前位置）。
+#[cfg(feature = "macos")]
+fn spawn_cursor_replay(replay: Vec<(f64, f64)>) {
+    if replay.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("xcontrol-return-replay".into())
+        .spawn(move || {
+            for (dx, dy) in replay {
+                if let Err(error) = xcontrol_input::shift_cursor(dx, dy) {
+                    tracing::warn!(target: "app::edge", %error,
+                        "回切行程回放中止（本步光标平移失败）：光标停在当前位置");
+                    break;
+                }
+                std::thread::sleep(RETURN_REPLAY_STEP);
+            }
+        });
+}
+
+/// 本地输入拦截开关对账 + 释放落点重放（11-24 自输入拍抽出，纯接线函数；边缘
+/// 回切的"排空后立即翻拍"与输入拍两处共用——翻拍语义单一出处）。
+///
+/// `want_suppress`（= 当前是否受控中）与 `last_suppress`（tap 的现态）不同才动作：
+///
+/// - 翻到受控（`true`）：开本地输入拦截（`CaptureSource` 内部捕获锚点、解关联）；
+/// - 翻回本地（`false`）：**释放落点重放**（11-22 回切落点覆盖修复）——重关联会把
+///   光标拉到物理鼠标当前位置、覆盖此前执行的落点 warp，所以把缓存的落点
+///   （`pending_release_warp`，边缘回切 = 补偿后的落点 / 热键回主控 = 切入锚点）
+///   交给 `set_suppress_local_input` 在重关联**之后**重放；缓存为空 = 不做落点
+///   定位，光标停物理鼠标位。
+///
+/// 状态一致时不动（幂等）：输入拍每 10ms 调一次，只有控制关系变化的那一拍翻拍。
+#[cfg(feature = "macos")]
+fn reconcile_local_input_suppress(
+    capture: &xcontrol_input::CaptureSource,
+    pending_release_warp: &mut Option<(f64, f64)>,
+    last_suppress: &mut bool,
+    want_suppress: bool,
+) {
+    if want_suppress == *last_suppress {
+        return;
+    }
+    let release_point = if want_suppress {
+        None
+    } else {
+        pending_release_warp.take()
+    };
+    capture.set_suppress_local_input(want_suppress, release_point);
+    tracing::info!(target: "session::rt", suppress = want_suppress,
+        "本地输入拦截开关更新（受控重定向）");
+    *last_suppress = want_suppress;
+}
+
+/// 回切触发后排空的那批捕获事件的善后（11-24，design D13；macOS 主控）：这些
+/// 事件在翻拍前已被 tap 本地拦截（Drop），而控制关系已终结——**不转发**，但照常
+/// 过两道与转发无关的面，语义与输入拍一致：
+///
+/// - 鼠标按键位图（切入门控读数 + 状态机回切门控的 `LocalCmd::MouseButtons`
+///   镜像，变化沿才发）——位图不因排空而漏记一次按下/抬起；
+/// - 捕获流热键过滤（命中 → 投路由通道；尾巴吞）——与不排空、留到下一输入拍
+///   处理的结果相同（那时同样不转发），只是提前。
+///
+/// 鼠标位移之和由调用方经 [`sum_mouse_deltas`] 计入落点补偿，这里不消费。
+#[cfg(feature = "macos")]
+fn absorb_unforwarded_events(
+    events: &[InputEvent],
+    capture_filter: &mut HotkeyFilter,
+    hotkey_tx: &mpsc::UnboundedSender<HotkeyId>,
+    mouse_buttons: &mut u8,
+    mouse_buttons_down: &mut bool,
+    session: &mut Session<SystemClock>,
+) {
+    for event in events {
+        track_mouse_buttons(mouse_buttons, event);
+    }
+    let now_mouse_down = *mouse_buttons != 0;
+    if now_mouse_down != *mouse_buttons_down {
+        *mouse_buttons_down = now_mouse_down;
+        let mut dispatcher = Dispatcher::new(session);
+        if let Err(error) = dispatcher.on_local(LocalCmd::MouseButtons {
+            any_down: now_mouse_down,
+        }) {
+            tracing::warn!(target: "session::rt", %error,
+                "MouseButtons 被状态机拒绝（跳过）");
+        }
+    }
+    for event in events {
+        match capture_filter.feed(event) {
+            FilterOutcome::Hit(id) => {
+                tracing::info!(target: "app::hotkey", hotkey = id.label(),
+                    source = "capture", "热键命中（捕获层识别，回切排空批，事件不转发）");
+                let _ = hotkey_tx.send(id);
+            }
+            FilterOutcome::HitTail => {}
+            FilterOutcome::Forward => {}
+        }
+    }
+}
+
+/// 捕获源自动恢复的探测间隔（11-24，R9；design D15）：未授权期间每秒静默查询
+/// 一次授权状态，授权后约 1s 内恢复。
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 捕获源恢复探测是否到期（11-24，纯函数）：距上次探测满
+/// [`CAPTURE_RETRY_INTERVAL`]（或本会话尚未探测过）→ 到期。
+#[must_use]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+fn capture_probe_due(last_probe: Option<Instant>, now: Instant) -> bool {
+    last_probe.is_none_or(|at| now.duration_since(at) >= CAPTURE_RETRY_INTERVAL)
+}
+
+/// 捕获源重建失败告警的退避间隔（11-25）：**重试本身仍每秒一次**（恢复要快，
+/// 未授权 → 已授权的转换、或一次性的启动失败都要尽快接上），只让**告警**退避
+/// ——已授权但捕获源启动持续失败时，否则每个探测间隔一条。
+const CAPTURE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 捕获源重建失败是否该留一条告警（11-25，纯函数）：首次失败立即告警；此后距上次
+/// 告警满 [`CAPTURE_FAILURE_LOG_INTERVAL`] 才再告警一次。`None` = 尚未告警过（或
+/// 上次恢复成功后已复位）→ 到期。
+#[must_use]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+fn capture_failure_log_due(last_logged: Option<Instant>, now: Instant) -> bool {
+    last_logged.is_none_or(|at| now.duration_since(at) >= CAPTURE_FAILURE_LOG_INTERVAL)
+}
+
+/// 捕获源恢复前释放名义上的控制关系（11-25；macOS 主控，`drive_session` 输入拍的
+/// 捕获源自动恢复调用）。未授权期间没有捕获源，但边缘传感器不需要权限——主控
+/// 仍可靠它切入（`LocalControlsPeer`，本地输入照常、只是不转发）。授权后捕获源
+/// 一恢复，同一拍的本地输入拦截与转发立即生效，键鼠被送到工作机，而用户并没有
+/// 在此刻发起切换——所以恢复前先经 `ReleaseControl` 释放：`ReleaseAll` 与
+/// `LeaveScreen` 照常产出，**落点 warp 剥离**（光标不动，做法同热键回主控的
+/// [`strip_home_warp`]）。未被控（或状态机拒绝）时产出空序列，调用方不必发送。
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+fn release_control_before_capture_recovery<C: xcontrol_core::clock::Clock>(
+    session: &mut Session<C>,
+) -> Vec<SessionAction> {
+    let mut actions = run_local(session, LocalCmd::ReleaseControl);
+    strip_home_warp(&mut actions);
+    actions
+}
+
+/// 捕获源自动恢复在重建之前要做的事（11-25；纯决策
+/// [`capture_recovery_step`] 的结果）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+enum CaptureRecoveryStep {
+    /// 未被控：直接重建。
+    Rebuild,
+    /// 名义上处于受控态：先释放控制关系（[`release_control_before_capture_recovery`]），
+    /// 再重建。
+    ReleaseThenRebuild,
+    /// 名义上受控且**共享暂停中**：本拍不重建，推迟到恢复之后——暂停期间对端拒收
+    /// 全部输入帧（`LeaveScreen` 会被丢弃，core `PausedReject`：拒帧不断连），
+    /// 此时释放只会让两端控制状态失配；而捕获源仍缺席，暂停期间本就什么都不转发。
+    DeferWhilePaused,
+}
+
+/// 捕获源自动恢复在重建之前要做的事（11-25，纯函数）：未被控直接重建；名义上受控
+/// 先释放；名义上受控且共享暂停中推迟。
+#[must_use]
+#[cfg_attr(not(feature = "macos"), allow(dead_code))]
+fn capture_recovery_step(control_dir: ControlDir, paused: bool) -> CaptureRecoveryStep {
+    match (control_dir == ControlDir::LocalControlsPeer, paused) {
+        (false, _) => CaptureRecoveryStep::Rebuild,
+        (true, false) => CaptureRecoveryStep::ReleaseThenRebuild,
+        (true, true) => CaptureRecoveryStep::DeferWhilePaused,
+    }
+}
+
+/// 重建主控捕获源并留痕（11-25；捕获源自动恢复用——调用方已确认辅助功能已授权、
+/// 且名义上的受控态已解除或已推迟）：成功 → `info!` 一次、失败告警的退避复位；
+/// 失败 → 告警按 [`capture_failure_log_due`] 退避（重试仍每个探测间隔一次）。
+#[cfg(feature = "macos")]
+fn rebuild_capture_source(
+    capture: &mut Option<xcontrol_input::CaptureSource>,
+    failure_logged_at: &mut Option<Instant>,
+) {
+    match crate::hotkey_rt::try_host_capture_source() {
+        Ok(source) => {
+            *capture = Some(source);
+            *failure_logged_at = None;
+            tracing::info!(target: "session::rt",
+                "主控捕获源已恢复（辅助功能已授权）：热键识别与捕获转发可用，无需重启应用或重建会话");
+        }
+        Err(error) => {
+            if capture_failure_log_due(*failure_logged_at, Instant::now()) {
+                *failure_logged_at = Some(Instant::now());
+                tracing::warn!(target: "session::rt", %error,
+                    "主控捕获源重建失败（辅助功能已授权，但捕获源启动不了）：\
+                     热键识别与捕获转发停用；每秒静默重试，恢复后留痕\
+                     （本告警至多 30s 一条）");
+            }
+        }
+    }
+}
+
+/// 边缘命中是否允许上报（ControlDir 门控 + 暂停语义 + 按键门控，FR-2.1 + PRD
+/// 收敛项 3 + 11-22 第三轮 + 11-24 死区落地）：仅 **Running 且未共享暂停、且
+/// 无人在控、且无鼠标键按下**时允许。
+///
+/// - `control_dir == None`（11-24 收紧：原为 `!= PeerControlsLocal`，对
+///   `LocalControlsPeer` 放行）：
+///   - `PeerControlsLocal`（收到对端 `EnterScreen`，本机被控）→ 拒绝：被控中
+///     本机光标不驱动切换；对端 `LeaveScreen` 复位 `ControlDir::None` 后恢复；
+///   - `LocalControlsPeer`（本机已切出、正在控制对端）→ **拒绝**：受控期间
+///     主控光标被锚定在切入处（macOS，docs/05 §1.2），不存在有意滑边；两次
+///     锚定回拉之间光标会冲到屏边，被传感器命中后重复发出的 `EdgeCrossing`
+///     会让状态机重发 `LeaveScreen` + `EnterScreen`——工作机光标被拉回进入
+///     点、按键被释放、回切免疫窗被重置。原放行的理由是"受控中链式滑边"
+///     （FR-2.2 的 M3 路由基础），链式切换尚未实现；将来若实现，应走显式
+///     意图（热键/托盘），或只在光标能被真正冻结的平台上另开入口；
 /// - `mouse_buttons_down`（11-22 第三轮，docs/03 §5）→ 拒绝：拖文件/拖滚动条
 ///   时滑到边缘被切换会中断拖拽——任意鼠标键按下不切入（上报被丢弃，传感
 ///   器已闩锁：松开后须回内侧再推，防按键释放瞬间残留贴边误触发）。热键切换
@@ -2167,8 +2824,24 @@ fn edge_hit_allowed(
     mouse_buttons_down: bool,
 ) -> bool {
     matches!(state, SessionState::Running { paused: false })
-        && control_dir != ControlDir::PeerControlsLocal
+        && control_dir == ControlDir::None
         && !mouse_buttons_down
+}
+
+/// 控制关系变化后的切入防抖窗（11-24，docs/03 §5"死区"条款落地）：任意变化沿
+/// （切入/回切/热键回主控/对端 LeaveScreen）之后本窗内的主控边缘命中一律忽略。
+///
+/// 背景：回切落点贴着主控屏缘（内缩 0.5%，mac 约 7.5pt），回切瞬间用户仍在朝
+/// 同方向快速甩动——落点再一次触边会把刚回到的主控立即切回工作机（回弹）。
+/// 传感器的去抖闩锁覆盖不了这一段（落点在严格内侧，闩锁已重新武装）。
+const EDGE_SWITCH_DEAD_TIME: Duration = Duration::from_millis(150);
+
+/// 防抖窗是否已过（11-24，纯函数）：`control_changed_at` 为最近一次控制关系
+/// 变化沿的时刻；距该沿不足 [`EDGE_SWITCH_DEAD_TIME`] → 未过（命中忽略），
+/// 达到即过。`None` = 本会话尚未观测到变化沿（空闲常态）→ 恒过。
+#[must_use]
+fn edge_dead_time_elapsed(control_changed_at: Option<Instant>, now: Instant) -> bool {
+    control_changed_at.is_none_or(|changed| now.duration_since(changed) >= EDGE_SWITCH_DEAD_TIME)
 }
 
 /// 鼠标按键位图位（11-22 第三轮按键门控的跟踪面，docs/03 §5）：协议按钮
@@ -2251,21 +2924,6 @@ fn sample_controlled_cursor(
     crate::edge::controlled_cursor_normalized(rects, local, point)
 }
 
-/// 受控期光标维护（mac 10ms 拍；11-20 切入锚定 + 11-22 撞缘回锚的组合面）：
-/// 光标接近硬边缘且本拍移动朝缘 → warp 到对侧边缘内侧并迁移锚点
-/// （[`xcontrol_input::CaptureSource::reanchor_controlled_cursor`]；回锚 warp
-/// 的事件被捕获层伪影滤除吸收，不注入被控端）；否则维持切入锚定
-/// （[`xcontrol_input::CaptureSource::pin_cursor_to_anchor`]）。
-///
-/// 闩锁语义（防逐拍 warp 抖动）：回锚成功后 `armed` 置 false，直到再次观测
-/// 到"无触发条件"的一拍才重新武装——回锚落点在判定带外（edge.rs 内缩下限
-/// 保证），正常路径下一拍即解除；回锚失败/异常几何下条件持续不满足前不重发，
-/// warp 不会连发。两机制共存性：切入锚定是锚点的一次性捕获 + 每拍回位；
-/// 撞缘回锚是持续近缘触发且**迁移锚点**——回锚后每拍锚定在新位置，锚定
-/// 语义（光标冻结在稳定点）保持。
-///
-/// 几何快照缺失（非 macos/查询失败）/光标查询失败 → 仅维持锚定（本拍不回锚，
-/// 下拍重试——error-handling.md 规则 4，不打断受控转发路径）。
 /// 受控光标回报观察（探针，11-22 修复轮）：扫描解密明文流的完整帧，解出
 /// `MouseMoveAbs`（kind 0x04）反向回报，按 1/s 节流 info 打印归一化值。
 /// 回报在 core 层被消化为回切判定输入（无注入、无动作产出）——本函数是
@@ -2377,9 +3035,9 @@ fn consume_notices(session: &Session<SystemClock>, actions: &[SessionAction], bu
                 tracing::info!(target: "app::hotkey", target, ok,
                     "切换请求结果（对端 SwitchAck）");
             }
-            SessionAction::Notice(Notice::EdgeReturnedToHost { target }) => {
-                tracing::info!(target: "app::edge", target,
-                    "受控屏外侧滑出：边缘回切主控（环绕落点已执行，docs/03 §5）");
+            SessionAction::Notice(Notice::EdgeReturnedToHost { target, overflow }) => {
+                tracing::info!(target: "app::edge", target, ?overflow,
+                    "受控屏外侧滑出：边缘回切主控（环绕落点已执行，docs/03 §5；overflow = 回报段回切行程，单位=点）");
             }
             _ => {}
         }
@@ -2652,24 +3310,25 @@ mod tests {
         assert!(state.last_error.is_some());
     }
 
-    /// 边缘命中门控真值表：Running 未暂停 + 非 PeerControlsLocal + 无鼠标键
-    /// 按下才允许（LocalControlsPeer 允许 = 本机连控对端时仍可链式滑边，
-    /// FR-2.2；按键门控 = 11-22 第三轮拖拽防护，docs/03 §5）。
+    /// 边缘命中门控真值表（AC4，11-24 收紧）：仅 Running 未暂停 + **无人在控**
+    /// （`ControlDir::None`）+ 无鼠标键按下才允许。`LocalControlsPeer`（本机正在
+    /// 控制对端）由原放行改为**拒绝**——受控期间主控光标被锚定在切入处，屏边
+    /// 命中无有意滑边，重复的 `EdgeCrossing` 会把工作机光标拉回进入点、释放按键、
+    /// 重置回切免疫窗（docs/03 §5 死区，FR-2.1）；按键门控 = 11-22 第三轮拖拽
+    /// 防护。
     #[test]
     fn edge_gate_truth_table() {
         let running = SessionState::Running { paused: false };
         let paused = SessionState::Running { paused: true };
         assert!(edge_hit_allowed(&running, ControlDir::None, false));
-        assert!(edge_hit_allowed(
-            &running,
-            ControlDir::LocalControlsPeer,
-            false
-        ));
-        assert!(!edge_hit_allowed(
-            &running,
-            ControlDir::PeerControlsLocal,
-            false
-        ));
+        assert!(
+            !edge_hit_allowed(&running, ControlDir::LocalControlsPeer, false),
+            "受控中（本机控制对端）主控边缘命中一律忽略"
+        );
+        assert!(
+            !edge_hit_allowed(&running, ControlDir::PeerControlsLocal, false),
+            "本机被控时不切入"
+        );
         // 按键门控（11-22 第三轮）：任意鼠标键按下 → 不切入（上报被丢弃）。
         assert!(
             !edge_hit_allowed(&running, ControlDir::None, true),
@@ -2677,7 +3336,7 @@ mod tests {
         );
         assert!(
             !edge_hit_allowed(&running, ControlDir::LocalControlsPeer, true),
-            "按键门控优先于链式滑边允许"
+            "受控中 + 按键按下：两道门控都是拒绝"
         );
         assert!(
             !edge_hit_allowed(&paused, ControlDir::None, false),
@@ -2698,6 +3357,45 @@ mod tests {
             ControlDir::None,
             false
         ));
+    }
+
+    /// 控制关系变化后的切入防抖（AC4，11-24；docs/03 §5 死区）：变化沿后
+    /// 不足 150ms 的命中被拒绝，达到 150ms 起放行；无变化沿（会话从未发生过
+    /// 控制关系变化）恒放行。
+    #[test]
+    fn edge_dead_time_rejects_hits_within_window_after_control_change() {
+        const WINDOW: Duration = Duration::from_millis(150);
+        assert_eq!(
+            EDGE_SWITCH_DEAD_TIME, WINDOW,
+            "防抖窗 = 控制关系变化后 150ms"
+        );
+
+        // 无变化沿：恒放行（空闲常态不防抖）。
+        let now = Instant::now();
+        assert!(
+            edge_dead_time_elapsed(None, now),
+            "本会话尚无控制关系变化沿 → 不防抖"
+        );
+
+        // 变化沿时刻起：窗内拒绝。
+        let changed = Instant::now();
+        assert!(
+            !edge_dead_time_elapsed(Some(changed), changed),
+            "变化当拍拒绝"
+        );
+        assert!(
+            !edge_dead_time_elapsed(Some(changed), changed + WINDOW - Duration::from_millis(1)),
+            "149ms：仍在窗内"
+        );
+        // 达到 150ms：放行。
+        assert!(
+            edge_dead_time_elapsed(Some(changed), changed + WINDOW),
+            "150ms：窗口到期放行"
+        );
+        assert!(
+            edge_dead_time_elapsed(Some(changed), changed + WINDOW + Duration::from_millis(1)),
+            "151ms：窗外放行"
+        );
     }
 
     /// 鼠标按键位图跟踪（11-22 第三轮按键门控的跟踪面）：Down 置位/Up 清位、
@@ -2733,6 +3431,777 @@ mod tests {
             track_mouse_buttons(&mut bits, &btn(button, KS::Up));
             assert_eq!(bits, 0, "{button:?} 清位");
         }
+    }
+
+    // —— 位置模型校准（11-24，R2/AC2） ——
+
+    /// `is_preserved_entry`：只有"产出 `EnteredControl` 且无 `WarpPointer`"的
+    /// 序列算保持原位切入。期望形态不手写——用真实会话状态机对
+    /// `EnterScreen{preserve_cursor}` 两态产出的动作序列对拍；边缘切入（含
+    /// 落点 warp）与切出序列不触发。
+    #[test]
+    fn preserved_entry_detection_matches_session_actions() {
+        use xcontrol_core::clock::TestClock;
+        use xcontrol_core::session::{FramePayload, SessionEvent};
+        use xcontrol_proto::input::{Mods, ScreenEdge};
+        use xcontrol_proto::{Caps, CtrlMsg, ProtoVer};
+
+        let mut session = Session::new(
+            Role::Client,
+            Identity {
+                name: "client".into(),
+                screen_name: "client-screen".into(),
+                instance_id: [1; 16],
+                caps: Caps::UNICODE,
+                salt: [7; 16],
+            },
+            TestClock::new(),
+            Options::defaults(),
+        );
+        session
+            .step(SessionEvent::HandshakeReady { hs_hash: [0; 32] })
+            .expect("就绪被接受");
+        session
+            .step(SessionEvent::Frame(FramePayload::Ctrl(CtrlMsg::Hello {
+                proto: ProtoVer::CURRENT,
+                name: "host".into(),
+                screen_name: "host-screen".into(),
+                instance_id: [2; 16],
+                caps: Caps::UNICODE,
+                salt: [9; 16],
+            })))
+            .expect("协商被接受");
+
+        let enter = |preserve_cursor| InputEvent::EnterScreen {
+            target: 1,
+            edge: ScreenEdge::Left,
+            ratio: 0.5,
+            mods: Mods::default(),
+            preserve_cursor,
+        };
+
+        // 边缘切入（preserve_cursor=0）：序列含落点 warp → 不触发校准。
+        let actions = session
+            .step(SessionEvent::Frame(FramePayload::Input(enter(false))))
+            .expect("EnterScreen 被接受");
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, SessionAction::WarpPointer { .. })),
+            "边缘切入含落点 warp（实际 {actions:?}）"
+        );
+        assert!(!is_preserved_entry(&actions), "边缘切入不是保持原位切入");
+
+        // 切出序列：无 EnteredControl → 不触发校准。
+        let actions = session
+            .step(SessionEvent::Frame(FramePayload::Input(
+                InputEvent::LeaveScreen {
+                    mods: Mods::default(),
+                },
+            )))
+            .expect("LeaveScreen 被接受");
+        assert!(!is_preserved_entry(&actions), "切出序列不触发校准");
+
+        // 保持原位切入（preserve_cursor=1）：有 EnteredControl、无 warp → 触发。
+        let actions = session
+            .step(SessionEvent::Frame(FramePayload::Input(enter(true))))
+            .expect("EnterScreen 被接受");
+        assert_eq!(
+            actions,
+            vec![SessionAction::Notice(Notice::EnteredControl { target: 1 })],
+            "保持原位切入：仅对齐（本例无差异）+ 通知，无 warp（实际 {actions:?}）"
+        );
+        assert!(is_preserved_entry(&actions), "保持原位切入触发校准");
+
+        assert!(!is_preserved_entry(&[]), "空序列不触发");
+    }
+
+    /// 位置模型校准钩子贯通**生产同构**注入链（11-24，AC2）：`drive_session`
+    /// 的 sink 形态是 HotkeyFilterSink → MappingSink → Box<dyn InputSink + Send>
+    /// ——`resync_cursor` 须经三层透传到达底层实现。保持原位切入的动作序列
+    /// 触发一次校准，边缘切入（含 warp）不触发。
+    #[test]
+    fn resync_cursor_reaches_platform_sink_through_production_chain() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// 共享计数的底层 sink（装箱成 trait 对象后仍可读计数）。
+        #[derive(Default)]
+        struct SharedCountSink(Arc<AtomicU32>);
+
+        impl InputSink for SharedCountSink {
+            fn inject(
+                &mut self,
+                _event: &InputEvent,
+            ) -> Result<(), xcontrol_core::sink::SinkError> {
+                Ok(())
+            }
+
+            fn warp(
+                &mut self,
+                _screen: ScreenId,
+                _x: f32,
+                _y: f32,
+            ) -> Result<(), xcontrol_core::sink::SinkError> {
+                Ok(())
+            }
+
+            fn release_all(&mut self) -> Result<(), xcontrol_core::sink::SinkError> {
+                Ok(())
+            }
+
+            fn resync_cursor(&mut self) -> Result<(), xcontrol_core::sink::SinkError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let boxed: Box<dyn InputSink + Send> = Box::new(SharedCountSink(Arc::clone(&counter)));
+        let (hotkey_tx, _hotkey_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sink = HotkeyFilterSink::new(
+            HotkeySet::empty(),
+            build_mapping_sink(&KeymapConfig::default(), boxed),
+            hotkey_tx,
+        );
+
+        // drive_session 收帧分支的同款判定：保持原位切入 → 校准一次。
+        let preserved = vec![SessionAction::Notice(Notice::EnteredControl { target: 1 })];
+        if is_preserved_entry(&preserved) {
+            sink.resync_cursor().expect("生产链透传成功");
+        }
+        // 边缘切入（含落点 warp）→ 不校准。
+        let edge_entry = vec![
+            SessionAction::WarpPointer {
+                screen: 0,
+                x: 0.005,
+                y: 0.5,
+            },
+            SessionAction::Notice(Notice::EnteredControl { target: 1 }),
+        ];
+        if is_preserved_entry(&edge_entry) {
+            sink.resync_cursor().expect("生产链透传成功");
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "保持原位切入校准一次，边缘切入零次"
+        );
+    }
+
+    // —— 热键回主控落点 = 切入锚点（11-24，R4/AC5） ——
+
+    /// 真实 `ReleaseControl` 序列（core 状态机产出，期望形态不手写）：
+    /// `ReleaseAll` + `LeaveScreen` + 落点 warp。
+    fn host_release_control_actions() -> Vec<SessionAction> {
+        use xcontrol_core::clock::TestClock;
+        use xcontrol_core::session::{FramePayload, SessionEvent};
+        use xcontrol_proto::input::ScreenEdge;
+        use xcontrol_proto::{Caps, CtrlMsg, ProtoVer};
+
+        let mut session = Session::new(
+            Role::Host,
+            Identity {
+                name: "host".into(),
+                screen_name: "host-screen".into(),
+                instance_id: [2; 16],
+                caps: Caps::UNICODE,
+                salt: [9; 16],
+            },
+            TestClock::new(),
+            Options::defaults(),
+        );
+        session
+            .step(SessionEvent::HandshakeReady { hs_hash: [0; 32] })
+            .expect("就绪被接受");
+        session
+            .step(SessionEvent::Frame(FramePayload::Ctrl(
+                CtrlMsg::HelloBack {
+                    proto: ProtoVer::CURRENT,
+                    name: "client".into(),
+                    instance_id: [1; 16],
+                    caps: Caps::UNICODE,
+                },
+            )))
+            .expect("协商被接受");
+        session
+            .step(SessionEvent::Local(LocalCmd::EdgeCrossing {
+                target: 1,
+                edge: ScreenEdge::Right,
+                ratio: 0.5,
+            }))
+            .expect("EdgeCrossing 被接受");
+        assert_eq!(session.control_dir(), ControlDir::LocalControlsPeer);
+        session
+            .step(SessionEvent::Local(LocalCmd::ReleaseControl))
+            .expect("ReleaseControl 被接受")
+    }
+
+    /// macOS 主控热键回主控（AC5）：core 序列里的落点 warp 被剥离；替代落点 =
+    /// 切入锚点。锚点不可得时替代落点为空（光标停在当前位置）；suppress 尚未
+    /// 翻开（接管后一个输入拍内就按了回主控）或未剥离到时不动重放缓存。
+    #[test]
+    fn home_hotkey_strips_core_landing_and_replays_anchor() {
+        let actions = host_release_control_actions();
+        // core 序列形态自证：含且仅含一条落点 warp（主屏内侧 0.5/0.6）。
+        assert_eq!(
+            actions,
+            vec![
+                SessionAction::ReleaseAll,
+                actions[1].clone(),
+                SessionAction::WarpPointer {
+                    screen: 0,
+                    x: 0.5,
+                    y: 0.6
+                },
+            ],
+            "core 的 ReleaseControl 序列（实际 {actions:?}）"
+        );
+        assert!(matches!(
+            actions[1],
+            SessionAction::Send {
+                msg: xcontrol_core::session::Outbound::Input(_),
+                ..
+            }
+        ));
+
+        // 剥离：只剩释放序列（ReleaseAll + LeaveScreen），不残留 warp。
+        let mut stripped = actions.clone();
+        assert!(strip_home_warp(&mut stripped), "剥离到落点 warp");
+        assert_eq!(stripped, vec![actions[0].clone(), actions[1].clone()]);
+        assert!(
+            stripped
+                .iter()
+                .all(|action| !matches!(action, SessionAction::WarpPointer { .. }))
+        );
+        // 序列已无 warp / 空序列：未剥离到，序列不变。
+        assert!(!strip_home_warp(&mut stripped), "无 warp 可剥");
+        assert_eq!(stripped.len(), 2);
+        assert!(!strip_home_warp(&mut Vec::new()));
+
+        // 替代落点 = 切入锚点（受控期间所见位置）。
+        let mut pending = None;
+        assert!(apply_home_landing(
+            &mut pending,
+            true,
+            true,
+            Some((120.0, 340.0))
+        ));
+        assert_eq!(pending, Some((120.0, 340.0)), "重放点 = 锚点");
+
+        // 锚点不可得 → 替代落点为空（清掉残留值）：光标停物理鼠标位。
+        let mut pending = Some((7.0, 8.0));
+        assert!(apply_home_landing(&mut pending, true, true, None));
+        assert_eq!(pending, None, "无锚点：重放点为空");
+
+        // suppress 尚未翻开：只剥离，不动重放缓存（没有翻拍承接重放）。
+        let mut pending = None;
+        assert!(!apply_home_landing(
+            &mut pending,
+            true,
+            false,
+            Some((120.0, 340.0))
+        ));
+        assert_eq!(pending, None);
+
+        // 未剥离到：不动重放缓存。
+        let mut pending = Some((1.0, 2.0));
+        assert!(!apply_home_landing(
+            &mut pending,
+            false,
+            true,
+            Some((120.0, 340.0))
+        ));
+        assert_eq!(pending, Some((1.0, 2.0)));
+    }
+
+    // —— 回切行程补偿（11-24，R8 / AC10） ——
+
+    /// 真实边缘回切序列（core 状态机产出，期望形态不手写）：`[主控 | 工作机]`
+    /// 布局，主控右缘切出（回切触发边 = 工作机左缘）→ 免疫窗过后朝主控方向武装
+    /// → 工作机回报（`report_x` 可为端点之外的负值）触发回切。
+    fn host_edge_return_actions(report_x: f32) -> Vec<SessionAction> {
+        use xcontrol_core::clock::TestClock;
+        use xcontrol_core::session::{FramePayload, SessionEvent};
+        use xcontrol_proto::input::ScreenEdge;
+        use xcontrol_proto::{Caps, CtrlMsg, ProtoVer, ScreenInfo};
+
+        let host_id = [2; 16];
+        // 虚拟时钟双句柄：会话持一份、本测试持一份（回切免疫窗按时间计，推进
+        // 测试句柄即越过 800ms 窗）。
+        let clock = TestClock::new();
+        let mut session = Session::new(
+            Role::Host,
+            Identity {
+                name: "host".into(),
+                screen_name: "host-screen".into(),
+                instance_id: host_id,
+                caps: Caps::UNICODE,
+                salt: [9; 16],
+            },
+            clock.clone(),
+            Options::defaults(),
+        );
+        session
+            .step(SessionEvent::HandshakeReady { hs_hash: [0; 32] })
+            .expect("就绪被接受");
+        session
+            .step(SessionEvent::Frame(FramePayload::Ctrl(
+                CtrlMsg::HelloBack {
+                    proto: ProtoVer::CURRENT,
+                    name: "client".into(),
+                    instance_id: [1; 16],
+                    caps: Caps::UNICODE,
+                },
+            )))
+            .expect("协商被接受");
+        let screen = |id, owner, left, right| ScreenInfo {
+            id,
+            owner,
+            name: format!("screen-{id}"),
+            left,
+            right,
+            top: None,
+            bottom: None,
+            scale: 1.0,
+        };
+        session.set_layout(ScreenLayout::new(vec![
+            screen(0, host_id, None, Some(1)),
+            screen(1, [1; 16], Some(0), None),
+        ]));
+        session
+            .step(SessionEvent::Local(LocalCmd::EdgeCrossing {
+                target: 1,
+                edge: ScreenEdge::Right,
+                ratio: 0.5,
+            }))
+            .expect("EdgeCrossing 被接受");
+        // 回切免疫窗（接管后 800ms，按时间计）：推进虚拟时钟越过。
+        clock.advance(800);
+        // 朝主控方向（左）移动 → 同向武装。
+        session
+            .step(SessionEvent::Local(LocalCmd::ForwardInput(
+                InputEvent::MouseMoveRel { dx: -3.0, dy: 0.0 },
+            )))
+            .expect("ForwardInput 被接受");
+        session
+            .step(SessionEvent::Frame(FramePayload::Input(
+                InputEvent::MouseMoveAbs {
+                    screen: 1,
+                    x: report_x,
+                    y: 0.4,
+                },
+            )))
+            .expect("回报帧被接受")
+    }
+
+    /// `edge_return_of` + `compensated_release_point` 端到端（AC10）：真实回切序列
+    /// 解出落点素材；落点补偿 = 原落点 + （回报行程 + 在途批 + 排空批）。工作机
+    /// 顶边 120 点、在途 8 点、排空 2 点 → 回主控后落点从右缘内侧向行进方向（左）
+    /// 前移 130 点，与手势连续；旧工作机（端点值回报，行程 0）落点不变。
+    #[test]
+    fn edge_return_landing_is_compensated_by_lost_travel() {
+        use xcontrol_core::session::EDGE_RETURN_INSET;
+
+        use crate::edge::ScreenRect;
+
+        // 主控双屏各 1000×1000 点；落点在屏 0（面向工作机的那块）。
+        let rects = [
+            ScreenRect {
+                origin: (0.0, 0.0),
+                size: (1000.0, 1000.0),
+            },
+            ScreenRect {
+                origin: (1000.0, 0.0),
+                size: (1000.0, 1000.0),
+            },
+        ];
+        let base_x = f64::from(1.0 - EDGE_RETURN_INSET) * 1000.0;
+
+        // 越界回报（工作机左缘被推出 120 点）：行程为负（向左）。
+        let actions = host_edge_return_actions(-120.0);
+        let landing = edge_return_of(&actions).expect("边缘回切序列应被识别");
+        assert_eq!(
+            landing,
+            EdgeReturnLanding {
+                screen: 0,
+                x: 1.0 - EDGE_RETURN_INSET,
+                y: 0.4,
+                report_travel: (-120.0, 0.0),
+            }
+        );
+        // 在途批（2ms 前发出，窗内）计入；排空批 2 点。
+        let in_flight = in_flight_batch(Some((Instant::now(), (-8.0, 1.0))), Instant::now());
+        let drained = sum_mouse_deltas(&[
+            InputEvent::MouseMoveRel { dx: -2.0, dy: 0.0 },
+            InputEvent::Key {
+                code: KEY_C,
+                state: KeyState::Down,
+            },
+        ]);
+        assert_eq!((in_flight, drained), ((-8.0, 1.0), (-2.0, 0.0)));
+        let travel = (
+            landing.report_travel.0 + in_flight.0 + drained.0,
+            landing.report_travel.1 + in_flight.1 + drained.1,
+        );
+        let (px, py) = crate::edge::compensated_release_point(
+            &rects,
+            landing.screen,
+            landing.x,
+            landing.y,
+            travel,
+        )
+        .expect("合法落点");
+        assert!((px - (base_x - 130.0)).abs() < 1e-3, "落点 x = {px}");
+        assert!((py - 401.0).abs() < 1e-3, "落点 y = {py}");
+
+        // 旧工作机 / macOS / X11 工作机（端点值回报）：行程 0，无在途/排空批 →
+        // 落点与未补偿的原落点一致（行为与 11-24 之前相同）。
+        let actions = host_edge_return_actions(0.0);
+        let landing = edge_return_of(&actions).expect("边缘回切序列应被识别");
+        assert_eq!(landing.report_travel, (0.0, 0.0));
+        let (px, py) = crate::edge::compensated_release_point(
+            &rects,
+            landing.screen,
+            landing.x,
+            landing.y,
+            (0.0, 0.0),
+        )
+        .expect("合法落点");
+        assert!((px - base_x).abs() < 1e-3 && (py - 400.0).abs() < 1e-3);
+    }
+
+    /// `edge_return_of` 的识别面：只有同时含回切通知与落点 warp 的序列才算边缘
+    /// 回切——热键回主控序列（有 warp、无通知）、切入序列、空序列均返回 `None`
+    /// （热键回主控的落点策略是切入锚点，不得被当成边缘回切补偿）。
+    #[test]
+    fn edge_return_detection_requires_notice_and_warp() {
+        // 热键回主控（真实序列）：ReleaseAll + LeaveScreen + 落点 warp，无回切通知。
+        let home = host_release_control_actions();
+        assert!(
+            home.iter()
+                .any(|action| matches!(action, SessionAction::WarpPointer { .. }))
+        );
+        assert_eq!(edge_return_of(&home), None, "热键回主控不是边缘回切");
+        // 只有通知、没有 warp（防御：不完整的序列不补偿）。
+        assert_eq!(
+            edge_return_of(&[SessionAction::Notice(Notice::EdgeReturnedToHost {
+                target: 1,
+                overflow: (5.0, 0.0),
+            })]),
+            None
+        );
+        // 只有 warp、没有通知。
+        assert_eq!(
+            edge_return_of(&[SessionAction::WarpPointer {
+                screen: 0,
+                x: 0.5,
+                y: 0.5
+            }]),
+            None
+        );
+        assert_eq!(edge_return_of(&[]), None);
+    }
+
+    /// 在途批判定（AC10）：发出时刻距回切触发不足 3ms 的批计入，达到 3ms 不计；
+    /// 尚未发出过批 → 零位移。
+    #[test]
+    fn in_flight_batch_counts_only_batches_sent_within_window() {
+        assert_eq!(
+            IN_FLIGHT_WINDOW,
+            Duration::from_millis(3),
+            "在途批窗口 = 3ms"
+        );
+        assert_eq!(in_flight_batch(None, Instant::now()), (0.0, 0.0));
+        let now = Instant::now();
+        // 窗内（2ms 前）：整批位移计入。
+        assert_eq!(
+            in_flight_batch(Some((now - Duration::from_millis(2), (12.5, -3.0))), now),
+            (12.5, -3.0)
+        );
+        // 窗口边界：不足 3ms 计入，达到 3ms 不计。
+        assert_eq!(
+            in_flight_batch(Some((now - Duration::from_millis(3), (12.5, -3.0))), now),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            in_flight_batch(Some((now - Duration::from_millis(10), (12.5, -3.0))), now),
+            (0.0, 0.0),
+            "上一个 10ms 拍发出的批早已到达，不计"
+        );
+        // 零位移批（纯键盘批）在窗内也计入——计出来的就是零。
+        assert_eq!(
+            in_flight_batch(Some((now - Duration::from_millis(1), (0.0, 0.0))), now),
+            (0.0, 0.0)
+        );
+    }
+
+    /// 回放切片（11-25 第二轮）：各步之和等于"补偿终点 − 基点"；匀速微步、
+    /// 步数有界（≤ 30）；末步补齐余量；`pop()` 出步顺序即回放顺序。
+    #[test]
+    fn replay_slices_sum_to_travel_uniform_steps() {
+        let base = Some((100.0, 200.0));
+        let compensated = Some((220.0, 176.0));
+        let mut queue = replay_slices(compensated, base);
+        assert!(!queue.is_empty(), "非零位移应有切片");
+        let steps: Vec<(f64, f64)> = core::iter::from_fn(|| queue.pop()).collect();
+        let (sum_x, sum_y) = steps
+            .iter()
+            .fold((0.0, 0.0), |(x, y), &(dx, dy)| (x + dx, y + dy));
+        assert!(
+            (sum_x - 120.0).abs() < 1e-9,
+            "x 各步之和 = 120，实际 {sum_x}"
+        );
+        assert!(
+            (sum_y + 24.0).abs() < 1e-9,
+            "y 各步之和 = −24，实际 {sum_y}"
+        );
+        // 匀速：各步同向、长度相等；末步把剩余量补齐，误差即浮点量级。
+        for pair in steps.windows(2) {
+            assert!(
+                (pair[0].0 - pair[1].0).abs() < 1e-6 && pair[0].0 > 0.0,
+                "除末步外步长应相等且同向：{pair:?}"
+            );
+        }
+        // 步数 ≤ MAX_STEPS（总时长 ≤ 60ms）。
+        assert!(
+            steps.len() <= RETURN_REPLAY_MAX_STEPS,
+            "步数有界：{}",
+            steps.len()
+        );
+    }
+
+    /// 大行程：步数贴着上限（步长等比例放大），总时长仍有界，各步之和守恒。
+    #[test]
+    fn replay_slices_large_travel_capped_step_count() {
+        let mut queue = replay_slices(Some((10_060.0, 200.0)), Some((100.0, 200.0)));
+        let steps: Vec<(f64, f64)> = core::iter::from_fn(|| queue.pop()).collect();
+        assert_eq!(
+            steps.len(),
+            RETURN_REPLAY_MAX_STEPS,
+            "大行程步数贴上限（60ms 总时长有界）"
+        );
+        let (sum_x, _) = steps
+            .iter()
+            .fold((0.0, 0.0), |(x, y), &(dx, dy)| (x + dx, y + dy));
+        assert!((sum_x - 9_960.0).abs() < 1e-6, "各步之和守恒：{sum_x}");
+        // 除末步外步长相等（匀速放大形态）。
+        for pair in steps.windows(2) {
+            assert!((pair[0].0 - pair[1].0).abs() < 1e-6, "匀速：{pair:?}");
+        }
+        // 单步 ≥ MIN_STEP（防饿死下限）。
+        for &(dx, _) in &steps {
+            assert!(dx >= RETURN_REPLAY_MIN_STEP - 1e-9, "步长下限：{dx}");
+        }
+    }
+
+    /// 回放切片的不回放情形：零位移、终点或基点缺失、非有限位移。
+    #[test]
+    fn replay_slices_empty_when_nothing_to_replay() {
+        assert!(replay_slices(Some((50.0, 50.0)), Some((50.0, 50.0))).is_empty());
+        assert!(replay_slices(None, Some((50.0, 50.0))).is_empty());
+        assert!(replay_slices(Some((60.0, 50.0)), None).is_empty());
+        assert!(replay_slices(Some((f64::NAN, 50.0)), Some((50.0, 50.0))).is_empty());
+    }
+
+    /// 滚轮/其他事件不计；空批为零。
+    #[test]
+    fn sum_mouse_deltas_accumulates_only_relative_moves() {
+        let key = || InputEvent::Key {
+            code: KEY_C,
+            state: KeyState::Down,
+        };
+        let button = || InputEvent::MouseButton {
+            button: MouseButton::Left,
+            state: KeyState::Down,
+        };
+        let wheel = || InputEvent::Wheel {
+            axis: xcontrol_proto::input::Axis::Vertical,
+            delta: 2.0,
+        };
+        let batch = [
+            InputEvent::MouseMoveRel { dx: 3.0, dy: -1.0 },
+            key(),
+            InputEvent::MouseMoveRel {
+                dx: -10.5,
+                dy: 0.25,
+            },
+            button(),
+            wheel(),
+            InputEvent::MouseMoveRel { dx: 0.0, dy: 4.0 },
+        ];
+        let sum = sum_mouse_deltas(&batch);
+        assert!(
+            (sum.0 - -7.5).abs() < 1e-6 && (sum.1 - 3.25).abs() < 1e-6,
+            "{sum:?}"
+        );
+        assert_eq!(sum_mouse_deltas(&batch[..1]), (3.0, -1.0));
+        assert_eq!(sum_mouse_deltas(&batch[..0]), (0.0, 0.0), "空批零位移");
+        let no_moves = [key(), button(), wheel()];
+        assert_eq!(
+            sum_mouse_deltas(&no_moves),
+            (0.0, 0.0),
+            "纯键盘/按键/滚轮批零位移"
+        );
+    }
+
+    /// 捕获源恢复探测的节流（11-24，R9）：未探测过或距上次探测满 1s → 到期；
+    /// 间隔内不到期（授权后约 1s 内恢复，未授权期间不刷日志）。
+    #[test]
+    fn capture_probe_is_throttled_to_retry_interval() {
+        assert_eq!(
+            CAPTURE_RETRY_INTERVAL,
+            Duration::from_secs(1),
+            "恢复探测间隔 = 1s"
+        );
+        let now = Instant::now();
+        assert!(capture_probe_due(None, now), "首次探测立即到期");
+        assert!(
+            !capture_probe_due(Some(now - Duration::from_millis(999)), now),
+            "999ms：间隔未满"
+        );
+        assert!(
+            capture_probe_due(Some(now - Duration::from_millis(1000)), now),
+            "1000ms：到期"
+        );
+    }
+
+    /// 捕获源重建失败告警的退避（11-25）：首次失败立即告警；之后不足 30s 不再告警
+    /// （重试仍每秒一次，只是不刷日志），满 30s 再告警一条。
+    #[test]
+    fn capture_failure_log_backs_off_to_thirty_seconds() {
+        assert_eq!(
+            CAPTURE_FAILURE_LOG_INTERVAL,
+            Duration::from_secs(30),
+            "重建失败告警的退避间隔 = 30s"
+        );
+        let now = Instant::now();
+        assert!(capture_failure_log_due(None, now), "首次失败立即告警");
+        assert!(
+            !capture_failure_log_due(Some(now - Duration::from_secs(1)), now),
+            "已授权但持续失败：第 2 秒的探测不重复告警"
+        );
+        assert!(
+            !capture_failure_log_due(Some(now - Duration::from_secs(29)), now),
+            "29s：仍不告警"
+        );
+        assert!(
+            capture_failure_log_due(Some(now - Duration::from_secs(30)), now),
+            "30s：再告警一条"
+        );
+        // 探测间隔远小于告警间隔：告警退避期间每秒仍在重试。
+        assert!(CAPTURE_RETRY_INTERVAL < CAPTURE_FAILURE_LOG_INTERVAL);
+    }
+
+    /// 捕获源恢复的步骤决策（11-25）：未被控直接重建；名义上受控先释放；名义上
+    /// 受控且共享暂停中推迟（暂停期间对端拒收输入帧，此时释放会让两端失配）。
+    #[test]
+    fn capture_recovery_releases_first_and_defers_while_paused() {
+        assert_eq!(
+            capture_recovery_step(ControlDir::None, false),
+            CaptureRecoveryStep::Rebuild,
+            "未被控：直接重建"
+        );
+        assert_eq!(
+            capture_recovery_step(ControlDir::PeerControlsLocal, false),
+            CaptureRecoveryStep::Rebuild,
+            "本机被控与主控捕获源恢复无关"
+        );
+        assert_eq!(
+            capture_recovery_step(ControlDir::LocalControlsPeer, false),
+            CaptureRecoveryStep::ReleaseThenRebuild,
+            "名义上受控：先释放再重建"
+        );
+        assert_eq!(
+            capture_recovery_step(ControlDir::LocalControlsPeer, true),
+            CaptureRecoveryStep::DeferWhilePaused,
+            "名义上受控 + 共享暂停：推迟"
+        );
+        assert_eq!(
+            capture_recovery_step(ControlDir::None, true),
+            CaptureRecoveryStep::Rebuild,
+            "未被控时暂停不影响重建"
+        );
+    }
+
+    /// 捕获源恢复前释放名义上的控制关系（11-25）：真实状态机的 `ReleaseControl`
+    /// 序列保留 `ReleaseAll` 与 `LeaveScreen`（照常下发），**落点 warp 被剥离**
+    /// （光标不动），控制关系终结；未被控时产出空序列。
+    #[test]
+    fn capture_recovery_releases_nominal_control_without_landing_warp() {
+        use xcontrol_core::clock::TestClock;
+        use xcontrol_core::session::{FramePayload, Outbound, SessionEvent};
+        use xcontrol_proto::input::ScreenEdge;
+        use xcontrol_proto::{Caps, CtrlMsg, ProtoVer};
+
+        let mut session = Session::new(
+            Role::Host,
+            Identity {
+                name: "host".into(),
+                screen_name: "host-screen".into(),
+                instance_id: [2; 16],
+                caps: Caps::UNICODE,
+                salt: [9; 16],
+            },
+            TestClock::new(),
+            Options::defaults(),
+        );
+        session
+            .step(SessionEvent::HandshakeReady { hs_hash: [0; 32] })
+            .expect("就绪被接受");
+        session
+            .step(SessionEvent::Frame(FramePayload::Ctrl(
+                CtrlMsg::HelloBack {
+                    proto: ProtoVer::CURRENT,
+                    name: "client".into(),
+                    instance_id: [1; 16],
+                    caps: Caps::UNICODE,
+                },
+            )))
+            .expect("协商被接受");
+
+        // 未被控（授权前没有切入）：空序列，调用方不必发送。
+        assert_eq!(session.control_dir(), ControlDir::None);
+        assert!(
+            release_control_before_capture_recovery(&mut session).is_empty(),
+            "未被控时无动作"
+        );
+
+        // 未授权期间靠边缘传感器切入（不需要权限）：名义上处于受控态。
+        session
+            .step(SessionEvent::Local(LocalCmd::EdgeCrossing {
+                target: 1,
+                edge: ScreenEdge::Right,
+                ratio: 0.5,
+            }))
+            .expect("EdgeCrossing 被接受");
+        assert_eq!(session.control_dir(), ControlDir::LocalControlsPeer);
+
+        // 恢复前释放：释放序列照常，落点 warp 剥离。
+        let actions = release_control_before_capture_recovery(&mut session);
+        assert_eq!(
+            actions.len(),
+            2,
+            "ReleaseAll + LeaveScreen（实际 {actions:?}）"
+        );
+        assert_eq!(actions[0], SessionAction::ReleaseAll);
+        assert!(
+            matches!(
+                &actions[1],
+                SessionAction::Send {
+                    msg: Outbound::Input(InputEvent::LeaveScreen { .. }),
+                    ..
+                }
+            ),
+            "LeaveScreen 照常产出（实际 {:?}）",
+            actions[1]
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|action| !matches!(action, SessionAction::WarpPointer { .. })),
+            "落点 warp 被剥离——光标不动"
+        );
+        assert_eq!(session.control_dir(), ControlDir::None, "控制关系已终结");
     }
 
     /// ControlDir 生命周期 × 门控（PRD AC「被控时不轮询触发，LeaveScreen 恢复」）：
@@ -2778,7 +4247,9 @@ mod tests {
         ));
 
         // ② 本机切出（ReleaseAll + LeaveScreen + EnterScreen 出站）：
-        //    LocalControlsPeer —— 允许（防连续误触发归传感器去抖闩锁）。
+        //    LocalControlsPeer —— **拒绝**（11-24：受控期间主控光标被锚定在切入
+        //    处，屏边命中无有意滑边——重复 EdgeCrossing 会把工作机光标拉回进入
+        //    点、释放按键、重置回切免疫窗；回切走状态机的回报判定，不经此门）。
         let actions = session
             .step(SessionEvent::Local(LocalCmd::EdgeCrossing {
                 target: 1,
@@ -2788,11 +4259,10 @@ mod tests {
             .expect("EdgeCrossing 被接受");
         assert!(matches!(actions.first(), Some(SessionAction::ReleaseAll)));
         assert_eq!(session.control_dir(), ControlDir::LocalControlsPeer);
-        assert!(edge_hit_allowed(
-            session.state(),
-            session.control_dir(),
-            false
-        ));
+        assert!(
+            !edge_hit_allowed(session.state(), session.control_dir(), false),
+            "受控中（本机控制对端）主控边缘命中一律忽略"
+        );
 
         // ③ 对端 EnterScreen → 本机被控（PeerControlsLocal）：门控拒绝
         session

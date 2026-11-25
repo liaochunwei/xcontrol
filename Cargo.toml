@@ -207,6 +207,11 @@ gpui-tray = { version = "0.3", default-features = false, features = [
 # 解耦）；xtask RED_LINE_ALLOWED_DEPS 同步登记。crate 自身 #![cfg(windows)]，非 windows
 # 目标编译为空。
 windows-registry = "0.6"
+# windows-result：windows-registry 0.6 的错误类型出处（`windows_registry::Error`
+# 在 0.6 不再可见——E0603，PR #1 windows job 实测；错误本体在 windows-result，
+# 根路径 `windows_result::Error`）。tray 的 registry_error 收口函数点名该类型；
+# 版本 = windows-registry 0.6.1 依赖解析的同版（0.4.x），零新树。
+windows-result = "0.4"
 # tracing：结构化日志门面（PRD Requirement 6：子系统命名 app::/session::/net::）。
 # default features（attributes/std）即够；不引 async 桥接。
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }

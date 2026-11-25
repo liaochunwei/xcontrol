@@ -13,6 +13,8 @@ pub struct RecordingInputSink {
     events: Vec<InputEvent>,
     warps: Vec<(ScreenId, f32, f32)>,
     releases: u32,
+    /// `resync_cursor` 调用次数（11-24 位置模型校准钩子——透传链与调用点断言）。
+    resyncs: u32,
 }
 
 impl RecordingInputSink {
@@ -38,6 +40,12 @@ impl RecordingInputSink {
     #[must_use]
     pub fn release_count(&self) -> u32 {
         self.releases
+    }
+
+    /// `resync_cursor` 次数（11-24：保持原位切入后的位置模型校准，docs/03 §5）。
+    #[must_use]
+    pub fn resync_count(&self) -> u32 {
+        self.resyncs
     }
 
     /// 取走全部事件（清空记录；分阶段断言用）。
@@ -73,6 +81,11 @@ impl InputSink for RecordingInputSink {
         self.releases = self.releases.saturating_add(1);
         Ok(())
     }
+
+    fn resync_cursor(&mut self) -> Result<(), SinkError> {
+        self.resyncs = self.resyncs.saturating_add(1);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -90,11 +103,19 @@ mod tests {
         sink.warp(1, 1.0, 0.5).unwrap();
         sink.release_all().unwrap();
         sink.release_all().unwrap();
+        sink.resync_cursor().unwrap();
+        sink.resync_cursor().unwrap();
 
         assert_eq!(sink.events().len(), 2);
         assert_eq!(sink.joined_text(), "hello", "Text 按到达顺序拼接");
         assert_eq!(sink.warps(), &[(1, 1.0, 0.5)]);
         assert_eq!(sink.release_count(), 2);
+        assert_eq!(
+            sink.resync_count(),
+            2,
+            "位置模型校准计数（不产出 warp/事件）"
+        );
+        assert_eq!(sink.warps().len(), 1, "resync 不记为 warp");
 
         let taken = sink.take_events();
         assert_eq!(taken.len(), 2);

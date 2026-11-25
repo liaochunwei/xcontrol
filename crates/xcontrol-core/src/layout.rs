@@ -3,8 +3,9 @@
 //! 布局模型：每屏是布局图中的节点，邻居关系由 [`ScreenInfo`](xcontrol_proto::ScreenInfo)
 //! 的 `left/right/top/bottom` 显式声明（**不强制几何精确对齐**，几何模式为 P2）。
 //! 因此边缘判定是纯图查询：光标归一化坐标触边（`≤0` / `≥1`）且该方向存在邻居 → 产生
-//! [`EdgeCrossing`]（`EnterScreen` 帧所需的 target/edge/ratio 全部字段）；两轴
-//! 同时触边（角落区）排除（11-22 第三轮，docs/03 §5：角落留给系统热区）。
+//! [`EdgeCrossing`]（`EnterScreen` 帧所需的 target/edge/ratio 全部字段）；命中边的
+//! 沿边坐标落在**角落带**（每屏四角、沿屏宽与屏高各取 [`CORNER_RATIO`] 的矩形，
+//! 11-24）即排除——角落留给系统热区（docs/03 §5）。
 //!
 //! 坐标换算：[`to_abs`] 把归一化坐标换算为目标屏幕物理像素（含缩放提示
 //! `scale = 逻辑/物理像素比`，1.0 = 无缩放）。
@@ -17,6 +18,24 @@ use xcontrol_proto::input::{ScreenEdge, ScreenId};
 
 /// 热键切换闭环的进入点比例（docs/03 §5 热键闭环：居中进入；可配置重写属后续里程碑）。
 pub const SWITCH_ENTRY_RATIO: f32 = 0.5;
+
+/// 角落区比例（11-24，docs/03 §5 角落排除）：每屏四角、沿屏宽与屏高各取本比例
+/// 的矩形为**角落区**。沿边坐标落在 `[0, CORNER_RATIO] ∪ [1 − CORNER_RATIO, 1]`
+/// （含端点）即角落带。每条边两端各 5% 不可切换，中间 90% 可用（用户选定：
+/// 4K 约 192×108px，Mac 约 76×49pt）。
+///
+/// 取比例而非固定像素：主控判定工作机回切时只有归一化坐标，不知道工作机
+/// 分辨率。切入（[`edge_crossing`]）与回切（`session` 的 `edge_return_actions`）
+/// 两处判定面**只经本常量**——改这里即两处同步，判定处不得另写比例。
+pub const CORNER_RATIO: f32 = 0.05;
+
+/// 沿边坐标是否落在角落带（11-24，docs/03 §5 角落排除）：`v ≤ CORNER_RATIO`
+/// 或 `v ≥ 1 − CORNER_RATIO`（含端点）。非有限值（NaN）两比较皆假 → `false`
+/// ——调用方已先行拒绝非有限输入，本函数不做防御性收敛。
+#[must_use]
+pub const fn in_corner_band(v: f32) -> bool {
+    v <= CORNER_RATIO || v >= 1.0 - CORNER_RATIO
+}
 
 /// 屏幕布局图（`CtrlMsg::Layout` 的缓存形态）。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -103,10 +122,12 @@ pub struct EdgeCrossing {
 /// 给定当前屏 `current` 内的归一化光标 `(x, y)`：
 /// - `x ≤ 0.0` 且左侧有邻居 → 左边缘触发；`x ≥ 1.0` 且右侧有邻居 → 右边缘；
 ///   `y` 同理（上/下）。触边即触发（±0px 语义），越界量不影响；
-/// - **角落排除（11-22 第三轮，docs/03 §5）**：光标同时贴两条边（x 极值带 ∩
-///   y 极值带 = "角落区"）时不触发任何边——角落留给系统热区（KDE 触发角
-///   专用，边缘=切换）。垂直边命中要求沿边坐标 y 严格内侧，水平边命中要求
-///   x 严格内侧（极值判定 = 沿边坐标 ≤0 或 ≥1，与触边判定同款精确语义）；
+/// - **角落排除**（11-22 第三轮，docs/03 §5；11-24 由"两轴同为端点"改为角落区）：
+///   命中边的**沿边坐标**落在角落带（[`in_corner_band`]，每屏四角、沿屏宽与
+///   屏高各取 [`CORNER_RATIO`] 的矩形）时不触发——角落留给系统热区（KDE 触发角
+///   专用，边缘=切换）。垂直边看沿边坐标 y，水平边看 x；角落区外的边照常触发。
+///   原实现要求两轴同为端点，每个角落只有约 1 点见方，光标斜着进角落几乎必然
+///   先在角落外贴到可切换的边；
 /// - 同一位置多边越界时按 Left → Right → Top → Bottom 固定优先级取第一个
 ///   （角落排除后多边候选只剩角落——固定排除，优先级保留为防御顺序）；
 /// - `ratio` 取沿边方向的另一坐标并 clamp 到 `[0, 1]`；
@@ -122,13 +143,11 @@ pub fn edge_crossing(
     if !x.is_finite() || !y.is_finite() {
         return None;
     }
-    // 角落区判定（11-22 第三轮）：另一轴处于极值带 → 命中边落在角落，不切换。
-    // 判定与触边同款（≤0 / ≥1 精确语义）——传感器容差带已把贴边样本收敛到
-    // 端点值，角落驻留必然两轴同时命中端点。
-    let x_extreme = x <= 0.0 || x >= 1.0;
-    let y_extreme = y <= 0.0 || y >= 1.0;
+    // 角落区判定（11-24，docs/03 §5）：命中边的沿边坐标落在角落带 → 光标在屏角
+    // 的角落区内贴边，不切换。垂直边（Left/Right）看 y、水平边（Top/Bottom）
+    // 看 x；与 session 回切判定共用 in_corner_band（单一比例出处）。
     if x <= 0.0
-        && !y_extreme
+        && !in_corner_band(y)
         && let Some(target) = layout.neighbor(current, ScreenEdge::Left)
     {
         return Some(EdgeCrossing {
@@ -138,7 +157,7 @@ pub fn edge_crossing(
         });
     }
     if x >= 1.0
-        && !y_extreme
+        && !in_corner_band(y)
         && let Some(target) = layout.neighbor(current, ScreenEdge::Right)
     {
         return Some(EdgeCrossing {
@@ -148,7 +167,7 @@ pub fn edge_crossing(
         });
     }
     if y <= 0.0
-        && !x_extreme
+        && !in_corner_band(x)
         && let Some(target) = layout.neighbor(current, ScreenEdge::Top)
     {
         return Some(EdgeCrossing {
@@ -158,7 +177,7 @@ pub fn edge_crossing(
         });
     }
     if y >= 1.0
-        && !x_extreme
+        && !in_corner_band(x)
         && let Some(target) = layout.neighbor(current, ScreenEdge::Bottom)
     {
         return Some(EdgeCrossing {
@@ -421,9 +440,88 @@ fn layout_l_shape() -> ScreenLayout {
     ])
 }
 
+/// 十字 5 屏 fixture：A(0) 四边各有邻居——右 B(1)、左 C(2)、下 D(3)、上 E(4)
+/// （切入侧四条边的角落带边界各验一遍用）。
+#[cfg(test)]
+fn layout_cross() -> ScreenLayout {
+    ScreenLayout::new(vec![
+        ScreenInfo {
+            id: 0,
+            owner: [1; 16],
+            name: "A".into(),
+            left: Some(2),
+            right: Some(1),
+            top: Some(4),
+            bottom: Some(3),
+            scale: 1.0,
+        },
+        ScreenInfo {
+            id: 1,
+            owner: [2; 16],
+            name: "B".into(),
+            left: Some(0),
+            right: None,
+            top: None,
+            bottom: None,
+            scale: 1.0,
+        },
+        ScreenInfo {
+            id: 2,
+            owner: [2; 16],
+            name: "C".into(),
+            left: None,
+            right: Some(0),
+            top: None,
+            bottom: None,
+            scale: 1.0,
+        },
+        ScreenInfo {
+            id: 3,
+            owner: [2; 16],
+            name: "D".into(),
+            left: None,
+            right: None,
+            top: Some(0),
+            bottom: None,
+            scale: 1.0,
+        },
+        ScreenInfo {
+            id: 4,
+            owner: [2; 16],
+            name: "E".into(),
+            left: None,
+            right: None,
+            top: None,
+            bottom: Some(0),
+            scale: 1.0,
+        },
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CORNER_RATIO` 与 `in_corner_band`（11-24，AC9）：比例 = 5%；角落带 =
+    /// 沿边坐标两端各 5%（含端点），带外中段为 false。边界值相对常量书写
+    /// （`± 0.001`），不测精确端点。
+    #[test]
+    fn corner_band_is_five_percent_at_each_end() {
+        assert!((CORNER_RATIO - 0.05).abs() < 1e-6, "角落区比例 = 5%");
+        // 带内：两端（含越界外推样本）。
+        assert!(in_corner_band(0.0));
+        assert!(in_corner_band(1.0));
+        assert!(in_corner_band(CORNER_RATIO - 0.001));
+        assert!(in_corner_band(1.0 - CORNER_RATIO + 0.001));
+        assert!(in_corner_band(-0.5), "屏角外推样本同样算带内");
+        assert!(in_corner_band(1.5), "屏角外推样本同样算带内");
+        // 带外：中段。
+        assert!(!in_corner_band(CORNER_RATIO + 0.001));
+        assert!(!in_corner_band(1.0 - CORNER_RATIO - 0.001));
+        assert!(!in_corner_band(0.25));
+        assert!(!in_corner_band(0.5));
+        assert!(!in_corner_band(0.75));
+    }
 
     /// neighbor() 四方向查询：有边/无边/无此屏三态。
     #[test]
@@ -525,31 +623,96 @@ mod tests {
         assert_eq!(edge_crossing(&layout, 2, 0.5, 1.0), None);
     }
 
-    /// 角落排除（11-22 第三轮，docs/03 §5）：光标同时贴两条边（角落区）不触发
-    /// 任何边——角落留给系统热区（KDE 触发角专用，边缘=切换）。四角各一 +
-    /// 非角落正常触发回归。
+    /// 角落排除（11-22 第三轮，docs/03 §5；11-24 由"两轴同为端点"改为 5% 角落区）：
+    /// 光标在角落区内贴边不触发任何边——角落留给系统热区（KDE 触发角专用，
+    /// 边缘=切换）。四个角点各一；**角落带内但并非角点**的样本（如右缘
+    /// y=0.03——旧实现下"y=0.001 未收敛 → 触发"）同样排除；沿边中段照常触发。
+    /// 角落带边界（`CORNER_RATIO ± 0.001`）见
+    /// `edge_crossing_corner_band_boundaries_on_all_four_edges`。
     #[test]
     fn edge_crossing_corner_exclusion() {
         let layout = layout_l_shape(); // A(0) 右邻 B(1)、下邻 C(2)
-        // A 右上角（x≥1 ∩ y≤0，右缘有邻居）：角落 → None
+        // A 右上角（右缘有邻居）：角落 → None
         assert_eq!(edge_crossing(&layout, 0, 1.0, 0.0), None);
-        // A 右下角（x≥1 ∩ y≥1，右/下缘均有邻居，Right 优先候选）：角落 → None
+        // A 右下角（右/下缘均有邻居，Right 优先候选）：角落 → None
         assert_eq!(edge_crossing(&layout, 0, 1.0, 1.0), None);
-        // A 左下角（x≤0 ∩ y≥1，下缘有邻居）：角落 → None（无邻居边同样不因角落豁免）
+        // A 左下角（下缘有邻居）：角落 → None
         assert_eq!(edge_crossing(&layout, 0, 0.0, 1.0), None);
-        // A 左上角（x≤0 ∩ y≤0，两缘均无邻居）：角落 → None
+        // A 左上角（两缘均无邻居）：角落 → None
         assert_eq!(edge_crossing(&layout, 0, 0.0, 0.0), None);
-        // 非角落回归：沿边坐标严格内侧 → 照常触发
-        assert!(
-            edge_crossing(&layout, 0, 1.0, 0.5).is_some(),
+        // 右上角落带内的非角点：同样排除（旧实现下 0.001 未收敛会触发）。
+        assert_eq!(
+            edge_crossing(&layout, 0, 1.0, 0.001),
+            None,
+            "右上角带内（近角点）"
+        );
+        assert_eq!(edge_crossing(&layout, 0, 1.0, 0.03), None, "右上角带内中点");
+        // 右下角带内 / 下缘的左右角落带内。
+        assert_eq!(edge_crossing(&layout, 0, 1.0, 0.97), None, "右下角带内");
+        assert_eq!(edge_crossing(&layout, 0, 0.04, 1.0), None, "下缘左角带内");
+        assert_eq!(edge_crossing(&layout, 0, 0.96, 1.0), None, "下缘右角带内");
+        // 角落区外回归：沿边中段 → 照常触发，ratio = 沿边坐标。
+        assert_eq!(
+            edge_crossing(&layout, 0, 1.0, 0.5),
+            Some(EdgeCrossing {
+                target: 1,
+                edge: ScreenEdge::Right,
+                ratio: 0.5
+            }),
             "右缘中点触发"
         );
-        assert!(
-            edge_crossing(&layout, 0, 0.5, 1.0).is_some(),
+        assert_eq!(
+            edge_crossing(&layout, 0, 0.5, 1.0),
+            Some(EdgeCrossing {
+                target: 2,
+                edge: ScreenEdge::Bottom,
+                ratio: 0.5
+            }),
             "下缘中点触发"
         );
-        // 角落边界邻域（容差带收敛前形态）：y=0.001 未收敛 → 非角落 → 触发
-        assert!(edge_crossing(&layout, 0, 1.0, 0.001).is_some());
+    }
+
+    /// 角落带边界（11-24，AC9）——切入侧**四条边各验**：沿边坐标落在角落带内
+    /// （`CORNER_RATIO − 0.001`、`1 − CORNER_RATIO + 0.001`）贴边不触发；带外
+    /// （`CORNER_RATIO + 0.001`、`1 − CORNER_RATIO − 0.001`）照常触发，ratio =
+    /// 沿边坐标原值。边界值相对常量书写，不测精确端点。
+    #[test]
+    fn edge_crossing_corner_band_boundaries_on_all_four_edges() {
+        let layout = layout_cross(); // A(0)：右 B(1)、左 C(2)、上 E(4)、下 D(3)
+        let (in_low, out_low) = (CORNER_RATIO - 0.001, CORNER_RATIO + 0.001);
+        let (out_high, in_high) = (1.0 - CORNER_RATIO - 0.001, 1.0 - CORNER_RATIO + 0.001);
+        // A 屏 `edge` 边上、沿边坐标 = `along` 的样本 → (命中边, 目标, ratio)。
+        let hit = |edge: ScreenEdge, along: f32| {
+            match edge {
+                ScreenEdge::Left => edge_crossing(&layout, 0, 0.0, along),
+                ScreenEdge::Right => edge_crossing(&layout, 0, 1.0, along),
+                ScreenEdge::Top => edge_crossing(&layout, 0, along, 0.0),
+                ScreenEdge::Bottom => edge_crossing(&layout, 0, along, 1.0),
+            }
+            .map(|hit| (hit.edge, hit.target, hit.ratio))
+        };
+
+        for (edge, target) in [
+            (ScreenEdge::Left, 2),
+            (ScreenEdge::Right, 1),
+            (ScreenEdge::Top, 4),
+            (ScreenEdge::Bottom, 3),
+        ] {
+            // 角落带外：四条边照常触发。
+            assert_eq!(
+                hit(edge, out_low),
+                Some((edge, target, out_low)),
+                "{edge:?} 下端角落带外应触发"
+            );
+            assert_eq!(
+                hit(edge, out_high),
+                Some((edge, target, out_high)),
+                "{edge:?} 上端角落带外应触发"
+            );
+            // 角落带内：四条边都不触发。
+            assert_eq!(hit(edge, in_low), None, "{edge:?} 下端角落带内不触发");
+            assert_eq!(hit(edge, in_high), None, "{edge:?} 上端角落带内不触发");
+        }
     }
 
     /// ratio clamp：越界沿边坐标收敛到 [0,1]（角落区已排除——沿边坐标越界

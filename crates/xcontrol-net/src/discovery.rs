@@ -538,6 +538,9 @@ mod tests {
 
     /// 本机接口枚举：不污染断言（环境相关），只断言结构不变式——
     /// 每条记录的 broadcast 与 (ip, prefix) 自洽；allowlist 能捞回虚拟口。
+    /// 回环口断言仅 macOS/Linux（11-25 PR #1 windows job 实测：Windows 无
+    /// `lo0`/`lo` 命名惯例——回环口不参与广播发现，allowlist 启发式按
+    /// 平台命名约定，断言随平台走）。
     #[test]
     fn interface_enumeration_invariants() {
         let ifaces = interfaces_ipv4(&[]).expect("本机枚举可用");
@@ -551,9 +554,15 @@ mod tests {
         }
         // allowlist 覆盖启发式：lo0 在 macOS/Linux 必存在（回环）。
         let with_lo = interfaces_ipv4(&["lo0".to_owned(), "lo".to_owned()]).expect("枚举可用");
+        #[cfg(not(target_os = "windows"))]
         assert!(
             with_lo.iter().any(|i| i.name.starts_with("lo")),
             "allowlist 应放行回环口"
+        );
+        #[cfg(target_os = "windows")]
+        assert!(
+            with_lo.iter().any(|i| !is_virtual_interface(&i.name)),
+            "allowlist 只过滤虚拟口（Windows 无 lo 命名，回环口若被枚举则放行）"
         );
     }
 

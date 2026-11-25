@@ -28,6 +28,10 @@ gpui-tray = { workspace = true, optional = true }
 # 红线 2 的依赖侧先例：非 windows 目标即使误开 windows feature 也不拉入编译）。
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-registry.workspace = true
+# windows-result：registry_error 的错误类型（windows_registry::Error 在 0.6 不可
+# 见——E0603，PR #1 windows job 实测；本体在 windows_result 根路径，与
+# windows-registry 0.6.1 解析到同版 0.4.x，零新树）。
+windows-result.workspace = true
 
 # 平台 feature 名与模块名固定（docs/08 §3）：自启平台后端位于 autostart/{macos,windows,linux}.rs。
 # - macos：launchd agent（~/Library/LaunchAgents plist；纯 std：fs + launchctl Command）

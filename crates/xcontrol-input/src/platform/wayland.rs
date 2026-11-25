@@ -278,8 +278,31 @@ pub struct UinputInjector {
     /// 由 libinput quirks 对本设备单独关闭（flat，手感 = ABS 直通等价），
     /// 原 11-20 的"REL 跳数百像素"前提（compositor 加速）随 quirks 消除。
     /// `warp`/`MouseMoveAbs` 仍走 ABS 绝对定位（落点语义不经加速曲线）。
+    ///
+    /// **位置模型纪律（11-24，docs/05 §4.5）**：uinput 无"查询真实光标"入口，
+    /// 本字段就是位置模型的唯一事实源——回报（`cursor_normalized`）与下一条
+    /// MoveRel 的起算点都取自它，必须与真实光标保持一致：`warp` 同步 virt
+    /// （注意 `inject` 的 `MouseMoveAbs` 分支只发 ABS、**不写** virt——与 `warp`
+    /// 不对称，属既有行为，11-24 未改）；`release_all` **保留** virt（切出时
+    /// 真实光标原地不动）；保持原位切入（不 warp）后由 `resync_cursor` 把真实
+    /// 光标 ABS 定位回 virt。
     virt_x: i32,
     virt_y: i32,
+    /// 顶边行程（回切行程补偿，11-24 / R8；docs/02 §4.2「反向回报取值范围扩展到
+    /// 端点之外」、docs/05 §4.5）：光标被推出屏幕边界期间，被边界截掉的位移量
+    /// （单位 = `MouseMoveRel` delta 单位，即控制方转发的点）。符号 = 推出方向：
+    /// `> 0` 推出右/下边界，`< 0` 推出左/上边界，`0` = 无越界。
+    ///
+    /// 背景：受控光标到达屏边后，控制方继续转发的 `MouseMoveRel` 在注入时被屏幕
+    /// 边界截掉（virt 被钳在边界）——此前回报坐标恒钳在端点值 0.0/1.0，这段推进
+    /// 量没有任何回报渠道，回切后丢失（快速甩动时几十到上百点，落点停在中途）。
+    /// 维护纪律：`inject(MouseMoveRel)` 两轴都经 [`advance_axis`] 推进（越界累加、
+    /// 严格回到屏内清零、贴边且该轴无位移保留）；`warp` 与 `release_all` 清零
+    /// （重新定位/切出后旧行程作废——切出后光标停在边上，行程不应带到下一次受控）；
+    /// 回报见 [`UinputInjector::cursor_normalized`]。
+    overflow_x: f32,
+    /// 垂直轴顶边行程（语义同 `overflow_x`）。
+    overflow_y: f32,
     /// 受控移动 REL 小数格累积器（[水平, 垂直]；uinput REL 轴只收整数格，
     /// 协议 delta 可含小数——余量滚存防丢步，语义同 wheel_accum）。
     move_accum: [f32; 2],
@@ -359,6 +382,8 @@ impl UinputInjector {
             device,
             virt_x: w / 2,
             virt_y: h / 2,
+            overflow_x: 0.0,
+            overflow_y: 0.0,
             screen_w: f64::from(w),
             screen_h: f64::from(h),
             pressed_keys: BTreeSet::new(),
@@ -468,8 +493,11 @@ impl InputSink for UinputInjector {
                 self.move_accum[0] -= step_x as f32;
                 self.move_accum[1] -= step_y as f32;
                 let (x_max, y_max) = self.abs_max();
-                self.virt_x = (self.virt_x + step_x).clamp(0, x_max);
-                self.virt_y = (self.virt_y + step_y).clamp(0, y_max);
+                // 两轴经 advance_axis 推进（回切行程补偿，11-24 / R8）：virt 仍钳在
+                // 边界（与此前 `(virt + step).clamp(0, max)` 同值），越界推进量累进
+                // 顶边行程、随 `cursor_normalized` 回报——被屏幕边界截掉的位移不再丢失。
+                self.virt_x = advance_axis(self.virt_x, step_x, x_max, &mut self.overflow_x);
+                self.virt_y = advance_axis(self.virt_y, step_y, y_max, &mut self.overflow_y);
                 if step_x != 0 {
                     self.emit(
                         evdev::EventType::RELATIVE.0,
@@ -557,6 +585,11 @@ impl InputSink for UinputInjector {
         // 屏幕中心）起跳——进入落点"先正确、一动就跳屏中央/底部"的元凶。
         self.virt_x = px;
         self.virt_y = py;
+        // 顶边行程清零（回切行程补偿，11-24）：warp 是重新定位，此前顶边累计的
+        // 行程作废——新位置可能在屏内或另一条边上，旧行程带过去会让主控的回切
+        // 落点补偿凭空多出一段位移。
+        self.overflow_x = 0.0;
+        self.overflow_y = 0.0;
         self.emit(
             evdev::EventType::ABSOLUTE.0,
             evdev::AbsoluteAxisCode::ABS_X.0,
@@ -570,11 +603,17 @@ impl InputSink for UinputInjector {
     }
 
     fn release_all(&mut self) -> Result<(), SinkError> {
-        // 虚拟光标复位回中（11-20：ABS 模式下位置随会话收尾重置）。
-        let (cx, cy) = self.abs_max();
-        self.virt_x = (cx + 1) / 2;
-        self.virt_y = (cy + 1) / 2;
+        // 虚拟位置**保留**（11-24，位置模型纪律，见字段 `virt_x` 文档）：切出/
+        // 暂停只释放按键，真实光标原地不动——virt 若在此复位回屏幕中心（11-20
+        // ABS 模式的遗留；现行 REL 注入下复位不产生任何可见效果），回报与下一条
+        // MoveRel 的起算点就与真实光标脱节：热键切换先产 ReleaseAll、随后
+        // `EnterScreen{preserve_cursor=1}` 不 warp，回切判定从此基于虚构位置。
+        // 顶边行程同时清零（回切行程补偿，11-24）：切出后光标停在边上，顶边期间
+        // 累计的行程已随触发回切的那条回报交付主控，不应带到下一次受控（保持原位
+        // 切入后光标仍在边上，残留行程会让主控凭空多补一段位移）。
         // 先收后发：克隆快照再清集合，防止注入失败时的半释放状态歧义。
+        self.overflow_x = 0.0;
+        self.overflow_y = 0.0;
         let keys = std::mem::take(&mut self.pressed_keys);
         for code in keys {
             self.emit(evdev::EventType::KEY.0, code, 0)?;
@@ -584,6 +623,24 @@ impl InputSink for UinputInjector {
             self.emit(evdev::EventType::KEY.0, code, 0)?;
         }
         Ok(())
+    }
+
+    fn resync_cursor(&mut self) -> Result<(), SinkError> {
+        // 位置模型校准（11-24，docs/03 §5 热键闭环）：保持原位切入不 warp，而
+        // 真实光标可能已偏离 virt（未受控期间被本机物理鼠标挪动过）。按 `warp`
+        // 的同款序列把真实光标 ABS 定位到 (virt_x, virt_y)——**virt 不动**（回报
+        // 与后续 MoveRel 的起算点保持），即"光标落到上次受控结束的位置"（进程
+        // 启动后首次 = 构造默认的屏幕中心）。
+        self.emit(
+            evdev::EventType::ABSOLUTE.0,
+            evdev::AbsoluteAxisCode::ABS_X.0,
+            self.virt_x,
+        )?;
+        self.emit(
+            evdev::EventType::ABSOLUTE.0,
+            evdev::AbsoluteAxisCode::ABS_Y.0,
+            self.virt_y,
+        )
     }
 
     fn cursor_normalized(&self) -> Option<(f32, f32)> {
@@ -596,11 +653,17 @@ impl InputSink for UinputInjector {
         if x_max <= 0 || y_max <= 0 {
             return None;
         }
-        let x = abs_normalized(self.virt_x, x_max);
-        let y = abs_normalized(self.virt_y, y_max);
-        // 探针（验证面）：原始域值随行——回切"差一点不到缘"的实测分辨入口。
+        // 顶边行程随回报带出（回切行程补偿，11-24；docs/02 §4.2「反向回报取值范围
+        // 扩展到端点之外」）：有行程时回报端点之外的值（幅值 = 行程，单位 = 控制
+        // 方转发的 delta 单位），无行程时维持端点收敛逻辑（取值仍在 [0, 1]，与
+        // 11-22 契约一致）。
+        let x = axis_report(abs_normalized(self.virt_x, x_max), self.overflow_x);
+        let y = axis_report(abs_normalized(self.virt_y, y_max), self.overflow_y);
+        // 探针（验证面）：原始域值与顶边行程随行——回切"差一点不到缘"与"行程是否
+        // 随回报带出"的实测分辨入口。
         tracing::debug!(target: "input::wayland",
             x = self.virt_x, y = self.virt_y, x_max, y_max, nx = x, ny = y,
+            overflow_x = self.overflow_x, overflow_y = self.overflow_y,
             "受控光标采样（uinput ABS 域）");
         Some((x, y))
     }
@@ -631,6 +694,61 @@ fn abs_normalized(virt: i32, max: i32) -> f32 {
         1.0
     } else {
         (f64::from(virt) / f64::from(max)) as f32
+    }
+}
+
+/// 单轴虚拟位置推进（纯函数，回切行程补偿，11-24 / R8；docs/02 §4.2「反向回报取值
+/// 范围扩展到端点之外」）：`virt` 推进 `step` 格后钳在 `[0, max]`，被边界截掉的
+/// 推进量累进 `overflow`（顶边行程，单位与 `step` 相同）。
+///
+/// - 越过上界：累加超出量（正值，= 推出右/下边界的行程），位置钳在 `max`；
+/// - 越过下界：累加负量（= 推出左/上边界的行程），位置钳在 0；
+/// - 落在域内且本轴有位移：行程清零（光标已严格回到屏内，旧行程作废）；
+/// - 落在域内且本轴无位移（`step == 0`）：行程**保留**——光标贴边、这一拍只沿
+///   另一轴移动时，顶边行程必须继续随每条回报带出（否则回报退回端点值，主控
+///   误判行程归零）。
+///
+/// 起点若已在域外（`warp` 取 x=1.0 时 `virt = w = max + 1`）先按边界起算：越出
+/// 域的那 1 格是 warp 取整的产物而非顶边行程，不计入。`max < 0`（几何异常，
+/// 构造已保证不出现）时各分支仍不 panic。
+fn advance_axis(virt: i32, step: i32, max: i32, overflow: &mut f32) -> i32 {
+    let start = if virt < 0 {
+        0
+    } else if virt > max {
+        max
+    } else {
+        virt
+    };
+    let candidate = start.saturating_add(step);
+    // i32 → f32 直接 cast（无 From/TryFrom 实现；大值有精度损失，行程量级下可忽略，
+    // 写法与本文件既有换算一致）。
+    if candidate > max {
+        *overflow += (candidate - max) as f32;
+        max
+    } else if candidate < 0 {
+        *overflow += candidate as f32;
+        0
+    } else {
+        if step != 0 {
+            *overflow = 0.0;
+        }
+        candidate
+    }
+}
+
+/// 单轴回报值（纯函数，[`advance_axis`] 的配套）：归一化坐标 + 顶边行程 →
+/// 受控光标回报取值（docs/02 §4.2 反向回报契约）。
+///
+/// - `overflow < 0`（推出左/上边界）：直接回报该负值（`|值|` = 行程）；
+/// - `overflow > 0`（推出右/下边界）：回报 `1.0 + overflow`（超出 1 的部分 = 行程）；
+/// - `overflow == 0`：维持原端点收敛值（取值在 [0, 1]）。
+fn axis_report(normalized: f32, overflow: f32) -> f32 {
+    if overflow < 0.0 {
+        overflow
+    } else if overflow > 0.0 {
+        1.0 + overflow
+    } else {
+        normalized
     }
 }
 
@@ -2915,6 +3033,99 @@ mod tests {
         // warp 可把 virt 推过域上界（x=1.0 → px = w > max）：clamp 到 1.0。
         assert_eq!(abs_normalized(1920, 1919), 1.0);
         assert_eq!(abs_normalized(-5, 1919), 0.0);
+    }
+
+    /// 顶边行程推进（11-24 回切行程补偿，docs/02 §4.2 反向回报取值范围扩展）：
+    /// 屏内推进不累计；恰好到边行程为 0；越过上界累加超出量、越过下界累加负量
+    /// （多拍累加）；贴边且本轴无位移时保留；严格回到屏内清零。
+    #[test]
+    fn advance_axis_accumulates_beyond_edges_and_clears_inside() {
+        // 屏内推进：位置前移，行程恒 0。
+        let mut overflow = 0.0_f32;
+        assert_eq!(advance_axis(500, 30, 1919, &mut overflow), 530);
+        assert_eq!(overflow, 0.0);
+        // 恰好到边：无越界，行程 0。
+        assert_eq!(advance_axis(1889, 30, 1919, &mut overflow), 1919);
+        assert_eq!(overflow, 0.0, "恰好到边不算越界");
+
+        // 越过上界：超出量累加（正值 = 推出右/下边界），位置钳在 max。
+        let mut overflow = 0.0_f32;
+        assert_eq!(advance_axis(1910, 50, 1919, &mut overflow), 1919);
+        assert_eq!(overflow, 41.0, "一步越过：仅超出边界的 41 格计入行程");
+        assert_eq!(advance_axis(1919, 25, 1919, &mut overflow), 1919);
+        assert_eq!(overflow, 66.0, "多拍累加");
+        // 贴边且本轴无位移：行程保留（这一拍只沿另一轴移动）。
+        assert_eq!(advance_axis(1919, 0, 1919, &mut overflow), 1919);
+        assert_eq!(overflow, 66.0, "贴边无位移时行程保留");
+        // 严格回到屏内：行程清零。
+        assert_eq!(advance_axis(1919, -1, 1919, &mut overflow), 1918);
+        assert_eq!(overflow, 0.0, "严格回到屏内即清零");
+        // 回到屏内后无位移：仍为 0。
+        assert_eq!(advance_axis(1918, 0, 1919, &mut overflow), 1918);
+        assert_eq!(overflow, 0.0);
+
+        // 越过下界：累加负量（= 推出左/上边界），位置钳在 0。
+        let mut overflow = 0.0_f32;
+        assert_eq!(advance_axis(5, -12, 1919, &mut overflow), 0);
+        assert_eq!(overflow, -7.0, "一步越过：仅超出边界的 7 格计入");
+        assert_eq!(advance_axis(0, -5, 1919, &mut overflow), 0);
+        assert_eq!(overflow, -12.0);
+        // 贴边无位移保留；回屏内清零。
+        assert_eq!(advance_axis(0, 0, 1919, &mut overflow), 0);
+        assert_eq!(overflow, -12.0);
+        assert_eq!(advance_axis(0, 3, 1919, &mut overflow), 3);
+        assert_eq!(overflow, 0.0);
+    }
+
+    /// 顶边行程推进的防御面：起点在域外（warp 取 x=1.0 → virt = w = max + 1）时
+    /// 越出域的 1 格不计入行程；极大步长不溢出（饱和加法）。
+    #[test]
+    fn advance_axis_ignores_overshoot_from_warp_and_never_overflows() {
+        // 起点在域外：先按边界起算。
+        let mut overflow = 0.0_f32;
+        assert_eq!(advance_axis(1920, 0, 1919, &mut overflow), 1919);
+        assert_eq!(overflow, 0.0, "无位移：域外起点收敛到边界，行程仍为 0");
+        assert_eq!(advance_axis(1920, 3, 1919, &mut overflow), 1919);
+        assert_eq!(overflow, 3.0, "只计本次推进的 3 格（不是 4）");
+        let mut overflow = 0.0_f32;
+        assert_eq!(advance_axis(1920, -3, 1919, &mut overflow), 1916);
+        assert_eq!(overflow, 0.0);
+        // 负侧域外起点对称。
+        let mut overflow = 0.0_f32;
+        assert_eq!(advance_axis(-2, 0, 1919, &mut overflow), 0);
+        assert_eq!(overflow, 0.0);
+        // 极大步长：不 panic（饱和加法），超出量按 f32 计。
+        let mut overflow = 0.0_f32;
+        assert_eq!(advance_axis(0, i32::MAX, 1919, &mut overflow), 1919);
+        assert_eq!(overflow, (i32::MAX - 1919) as f32);
+        assert!(overflow.is_finite(), "行程恒有限（wire 解码只校验有限性）");
+    }
+
+    /// 回报值映射（11-24）：有行程时回报端点之外的值——推出右/下边界回报
+    /// `1.0 + 行程`，推出左/上边界回报负值；无行程时维持端点收敛值（取值仍在
+    /// [0, 1]，与 11-22 契约一致）。
+    #[test]
+    fn axis_report_extends_beyond_endpoints_only_with_overflow() {
+        // 无行程：原值不变（端点与中段）。
+        assert_eq!(axis_report(1.0, 0.0), 1.0);
+        assert_eq!(axis_report(0.0, 0.0), 0.0);
+        assert_eq!(
+            axis_report(abs_normalized(960, 1919), 0.0),
+            abs_normalized(960, 1919)
+        );
+        // 推出右/下边界：1.0 + 行程。
+        assert_eq!(axis_report(1.0, 37.0), 38.0);
+        assert_eq!(axis_report(0.5, 0.25), 1.25, "只看行程符号，不依赖归一化值");
+        // 推出左/上边界：直接回报负值。
+        assert_eq!(axis_report(0.0, -12.5), -12.5);
+        assert_eq!(axis_report(0.5, -3.0), -3.0);
+        // 端到端：推进函数的行程经映射即 wire 取值。
+        let mut overflow = 0.0_f32;
+        assert_eq!(advance_axis(1919, 120, 1919, &mut overflow), 1919);
+        assert_eq!(axis_report(abs_normalized(1919, 1919), overflow), 121.0);
+        let mut overflow = 0.0_f32;
+        assert_eq!(advance_axis(0, -80, 1919, &mut overflow), 0);
+        assert_eq!(axis_report(abs_normalized(0, 1919), overflow), -80.0);
     }
 
     /// 兜底标定决策：探针 None → 1920×1080（无 wayland 环境的 fallback 路径

@@ -1,0 +1,10 @@
+{"file": "docs/03-input.md", "reason": "§4.6 切换路由语义（Home 落点）、§5 屏幕布局与跨屏路由：边缘切换/热键闭环/双向边缘回切/死区——本任务的行为规范与修订落点"}
+{"file": "docs/02-protocol.md", "reason": "§4.2 EnterScreen preserve_cursor 语义（光标留在切出时的位置）——R2 的定义来源；本任务不改 wire"}
+{"file": "docs/05-platform.md", "reason": "§1.2 macOS 受控光标冻结实测记录（R3 门控依据、R4 锚点落点来源）、§4.5 uinput 注入实装记录（R2 落点）"}
+{"file": "docs/00-requirements.md", "reason": "FR-2.1/2.2/2.5 的验收标准——需求追踪"}
+{"file": ".trellis/spec/rust-core/architecture-rules.md", "reason": "分层红线（core 零 I/O、Clock 注入）与 tokio select 取消安全纪律——改 drive_session 必读"}
+{"file": ".trellis/spec/rust-core/error-handling.md", "reason": "规则 4：实时路径可忽略错误不打断事件流（校准失败只告警）"}
+{"file": ".trellis/spec/rust-core/testing.md", "reason": "新增状态转移/回切判定分支必须单测覆盖；#[ignore] 纪律"}
+{"file": ".trellis/spec/rust-platform/platform-code.md", "reason": "feature 门控、回调线程纪律、uinput 与两机 KVM 实测要点"}
+{"file": ".trellis/spec/rust-platform/macos-input.md", "reason": "mac 平台代码纪律——本任务在该文件只新增 CaptureSource::anchor_point 只读访问器，不碰捕获与锚定逻辑"}
+{"file": ".trellis/tasks/11-24-edge-switch-latency-hotkey-return/research/root-cause-analysis.md", "reason": "根因证据、时序、否决方案与未验证假设——实现前必读，避免重复推导或误改未验证项"}

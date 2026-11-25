@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-24.04, windows-2022]
+        os: [macos-15, ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -74,7 +74,10 @@ jobs:
 
       # linux 暂排除 xcontrol-app（gpui 系统库缺位，见文件头"延后项"）；
       # macOS/Windows 全量。app 的质量闸门由 macOS job 完整承载。
+      # shell: bash：run 内是 bash 语法条件（Windows runner 默认 pwsh 会把
+      # `if [ ... ]` 当 PowerShell 解析而语法错——PR #1 首跑实测）。
       - name: clippy
+        shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             cargo clippy --workspace --exclude xcontrol-app --all-targets -- -D warnings
@@ -89,6 +92,7 @@ jobs:
         run: cargo run -p xtask -- check-deps
 
       - name: test
+        shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             cargo test --workspace --exclude xcontrol-app
@@ -167,6 +171,7 @@ jobs:
 
       # linux 暂排除 xcontrol-app（同 clippy/test 注释：gpui 系统库缺位）。
       - name: build
+        shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             cargo build --workspace --exclude xcontrol-app

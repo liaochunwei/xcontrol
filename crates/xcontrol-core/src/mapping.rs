@@ -842,8 +842,8 @@ fn compile_mods(names: &[String], index: usize) -> Result<Mods, MappingError> {
 }
 
 /// 映射引擎的 sink 适配器（design.md 裁定的集成方式）：包装 [`InputSink`]，
-/// 注入动作先经 [`MappingEngine`] 改写再下沉；warp 直通；`release_all` 原子完成
-/// "释放 OS 按键 + 重置引擎运行态"（模块文档裁定 2）。
+/// 注入动作先经 [`MappingEngine`] 改写再下沉；warp / `resync_cursor` 直通；
+/// `release_all` 原子完成"释放 OS 按键 + 重置引擎运行态"（模块文档裁定 2）。
 ///
 /// client/host 双端可用（`apply_actions` 只见 `&mut dyn InputSink`），不触碰
 /// 会话 select 循环。
@@ -929,6 +929,12 @@ impl<S: InputSink> InputSink for MappingSink<S> {
     fn cursor_normalized(&self) -> Option<(f32, f32)> {
         // 只读查询：映射引擎只改写注入事件流，对光标位置语义无涉——直通。
         self.inner.cursor_normalized()
+    }
+
+    fn resync_cursor(&mut self) -> Result<(), SinkError> {
+        // 位置模型校准（11-24）：不是注入事件（不经映射引擎、不触碰运行态），
+        // 直通内层——否则平台覆写（uinput）在包装层下不可达。
+        self.inner.resync_cursor()
     }
 }
 
@@ -1017,6 +1023,33 @@ mod tests {
 
         fn release_all(&mut self) -> Result<(), SinkError> {
             self.releases += 1;
+            Ok(())
+        }
+    }
+
+    /// 覆写 `resync_cursor` 的计数 sink（11-24 位置模型校准钩子的透传断言）。
+    #[derive(Default)]
+    struct ResyncCountingSink {
+        events: Vec<InputEvent>,
+        resyncs: usize,
+    }
+
+    impl InputSink for ResyncCountingSink {
+        fn inject(&mut self, event: &InputEvent) -> Result<(), SinkError> {
+            self.events.push(event.clone());
+            Ok(())
+        }
+
+        fn warp(&mut self, _screen: u16, _x: f32, _y: f32) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn release_all(&mut self) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn resync_cursor(&mut self) -> Result<(), SinkError> {
+            self.resyncs += 1;
             Ok(())
         }
     }
@@ -1729,6 +1762,24 @@ mod tests {
         sink.inject(&down(KEY_LEFT_META)).unwrap();
         assert!(sink.inner().events.is_empty(), "pending 期间不注入");
         assert_eq!(sink.flush_pending(), 1, "补注入 LCtrl↓");
+        assert_eq!(sink.inner().events, vec![down(KEY_LEFT_CTRL)]);
+    }
+
+    /// MappingSink 透传 `resync_cursor`（11-24 位置模型校准钩子）：不经映射
+    /// 引擎（非注入事件、不触碰运行态），直达内层覆写——缺了这层透传，平台
+    /// 覆写（uinput）在包装层下不可达。
+    #[test]
+    fn mapping_sink_forwards_resync_cursor() {
+        let mut sink = MappingSink::new(mac2win(&[]), ResyncCountingSink::default());
+        sink.resync_cursor().expect("透传成功");
+        sink.resync_cursor().expect("透传成功");
+        assert_eq!(sink.inner().resyncs, 2, "内层覆写被调两次");
+        assert!(
+            sink.inner().events.is_empty(),
+            "校准不产出注入事件（不经映射引擎）"
+        );
+        // 透传不扰动引擎运行态：随后的映射照常。
+        sink.inject(&down(KEY_LEFT_META)).unwrap();
         assert_eq!(sink.inner().events, vec![down(KEY_LEFT_CTRL)]);
     }
 

@@ -628,6 +628,14 @@ mod tests {
 
     /// **UDP 探测端到端（真实 socket）**：假主控应答 `XCP1?` → probe 层产出
     /// 候选（127.0.0.0/30 定点探测，不触真实网段）。
+    /// `#[ignore]` 理由（PR #1 windows job 实测）：探测路径经**定向广播**
+    /// （`bind_discovery_socket` 的 SO_BROADCAST 面），Windows 的 UDP 栈对
+    /// 回环段广播不回投（正向单播应答测试同环境通过，红灯只集中在广播面）
+    /// ——GitHub runner 沙箱上不可靠。本机 `cargo test -p xcontrol-net` 照常跑。
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "Windows 对回环段定向广播不回投（平台 UDP 行为差异）；本机验证"
+    )]
     #[tokio::test]
     async fn probe_cidrs_finds_mock_responder() {
         let responder = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -750,6 +758,13 @@ mod tests {
 
     /// `XCP1?` 应答全链路（假主控 ↔ 假从机，双进程同语义的最小复现）：
     /// 探测 → 应答 → 候选 →（外部）握手衔接由 app 的 session_rt 承担。
+    /// `#[ignore]` 理由：同 [`probe_cidrs_finds_mock_responder`]——探测经
+    /// 回环段定向广播，Windows 不回投（平台 UDP 行为差异，PR #1 windows job
+    /// 实测）；本机 `cargo test -p xcontrol-net` 照常跑。
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "Windows 对回环段定向广播不回投（平台 UDP 行为差异）；本机验证"
+    )]
     #[tokio::test]
     async fn probe_then_candidate_end_to_end() {
         let responder = tokio::net::UdpSocket::bind("127.0.0.1:0")

@@ -332,23 +332,30 @@ enum  FileErrCode(u8)  { NotFound = 1, PermissionDenied = 2, SourceGone = 3,
 
 **防护规则**（信任边界在接收端，§6.7 原则沿用）：
 
-1. `FileRefAnnounce`：`entries.len()` ≤ 4096（可配）；`total_bytes` ≤ 协商上限
-   （默认 2 GiB，可配，独立于剪贴板 16MiB，FR-4.5 不适用）；单 `name` ≤ 1024B
-   UTF-8 且不含路径分隔符以外的组件语义（即纯名/相对子路径，以 `/` 分层）；
-   清单编码后 > 1 MiB = 违规断开。
-2. `FilePullReq`：`transfer_id` 必须是本会话已通告且未过期；`entry` < 已知下标
+1. `FileRefAnnounce`：**清单必须单帧承载**（帧 payload 物理上限 64KiB，§4.1）——
+   `entries.len()` ≤ 512；单 `name` ≤ 256B UTF-8 纯名（不含 `/`，分层只经目录
+   条目表达）；编码后超帧 = 发送端编码期拒绝（`TooManyEntries` 语义，不产生
+   分帧）。超过 512 个顶层条目的复制（罕见）由发送端拆分为多条 announce（新
+   transfer_id），或提示用户缩减选择。`total_bytes` ≤ 协商上限（默认 2 GiB，
+   可配，独立于剪贴板 16MiB，FR-4.5 不适用）。
+   > 物理上限先行（65472B 同源教训，§6.2 修订 2026-11-17）：本项初稿曾写
+   > "条目 ≤4096、清单 ≤1MiB"，与帧层 `len: u16` 物理上限矛盾（4096 条目 ≈
+   > 数百 KiB，单帧装不下）——2026-11-26 实装前自查修正（任务
+   > 11-26-file-transfer-spec），无已部署对端，非兼容性破坏。
+2. `FileExpand`：每批 `entries.len()` ≤ 512（同单帧承载约束）；`base` 必须等于
+   源端当前下标空间上界（接收端以此校验下标连续性）；展开仅允许由
+   `FilePullReq{entry=Dir 下标}` 触发。
+3. `FilePullReq`：`transfer_id` 必须是本会话已通告且未过期；`entry` < 已知下标
    空间；`offset` ≤ 条目 `size`。违规断开。
-3. `FileChunk`：seq 单调递增不回绕；单条目累计 ≤ 条目 `size`；每条目独立重组状态。
-4. 流控：信用窗口初始 16 块，`FileAck` 归还；**分块空闲超时** 10s（无 chunk 到达
+4. `FileChunk`：seq 单调递增不回绕；单条目累计 ≤ 条目 `size`；每条目独立重组状态。
+5. 流控：信用窗口初始 16 块，`FileAck` 归还；**分块空闲超时** 10s（无 chunk 到达
    判死该 transfer）+ 单 transfer 总时长上限（默认 30min，可配）——超时仅终止该
    transfer（`FileError{SourceGone}`），**不断连**（文件量大、耗时长是常态而非攻击）。
-5. 失败语义：`FileError` 条目级**可重试**（由接收端决策）——与剪贴板"允许失败不
+6. 失败语义：`FileError` 条目级**可重试**（由接收端决策）——与剪贴板"允许失败不
    重传"（§6.5）语义不同：用户在粘贴处同步等待。
-6. 并发：每连接同时活动 transfer ≤ 4；超出 = 违规断开。
-7. blake3 由源端**边流边算**（复制瞬间不预哈希，保持复制零延迟）；`FileEnd` 校验
+7. 并发：每连接同时活动 transfer ≤ 4；超出 = 违规断开。
+8. blake3 由源端**边流边算**（复制瞬间不预哈希，保持复制零延迟）；`FileEnd` 校验
    失败 = 该条目 `FileError{HashMismatch}`，可重试。
-8. `FileExpand`：`base` 必须等于源端当前下标空间上界（接收端以此校验下标连续性）；
-   展开仅允许由 `FilePullReq{entry=Dir 下标}` 触发。
 
 > 修订记录（2026-11-26，任务 11-26-file-transfer-spec）：本节为 FR-7.3 立项新增
 > （XCP minor 1.1 → 1.2）。兼容性：仅新增连接类型与 kind，既有帧格式/wire 类型

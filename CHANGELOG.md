@@ -6,6 +6,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- **FR-7.3 跨设备文件复制粘贴立项（规范先行，代码未动）**：复制端仅同步文件元数据
+  清单，接收端在用户粘贴时才经文件通道拉流物化——跨设备复制对齐本地体验。
+  [ADR-0004](docs/adr/0004-file-transfer-channel-and-materialization.md) 定稿通道拓扑
+  （独立第三条 TCP，与剪贴板通道同构隔离）与物化策略（统一 stage-then-mount，OS 原生
+  惰性粘贴列为 P2 增强）；XCP 协议 minor 1.1 → 1.2 预留文件通道消息域
+  （kind 0x58–0x60，[docs/02 §4.6](docs/02-protocol.md)）；剪贴板侧 pending 槽/代次
+  失效/回环指纹规范形入 [docs/04 §8](docs/04-clipboard.md)；平台读写路径与实机复核项
+  入 [docs/05 §0.2](docs/05-platform.md)；文件传输安全面（条目索引寻址红线、磁盘耗尽
+  防护、粘贴即授权）入 [docs/07 §9](docs/07-security.md)。后续实装按切片推进
+  （元数据面 → 通道拉流 → 透明粘贴 → 打磨）。
+
 ### Fixed
 
 - **热键切入后边缘回切失效**（FR-2.2/FR-2.5，任务 11-24-edge-switch-latency-hotkey-return）：

@@ -1,0 +1,4 @@
+{"file": "docs/02-protocol.md", "reason": "§4.6 文件域 wire 契约与防护规则（实现主体依据）"}
+{"file": "docs/04-clipboard.md", "reason": "§8 剪贴板侧语义：pending 槽/代次失效/指纹规范形"}
+{"file": "docs/05-platform.md", "reason": "§0.1 Caps bit4 CAP_FILETRANSFER、§0.2 平台检测路径"}
+{"file": "docs/07-security.md", "reason": "§9 索引寻址红线（防御面测试依据）"}

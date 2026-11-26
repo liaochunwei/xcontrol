@@ -104,3 +104,19 @@
 3. **tick 内返回类型陷阱**：select 臂返回 ()，深层违规不能 `return true`——用局部 violated 标志 + tick 收尾统一 break。
 
 **功能剩余面**（后续任务）：切片 c 透明粘贴（注入拦截物化）；win/linux 平台面（实机复核）；切片 d 目录/进度/断点。
+
+## 2026-11-26 · 任务 11-26-paste-materialize（FR-7.3 切片 c：透明文件粘贴）
+
+**结果**：提交 3245e7c，切片 c 完成。「像本地一样」达成：受控机上直接 Cmd+V/Ctrl+V → 注入管线最内层 sink 包装器拦截粘贴组合（pending 槽有货时）→ 挂起组合键 + 触发拉流（复用切片 b 管线）→ 挂板成功后自动回注挂起键 → 目标应用粘到物化后的本地文件。零系统级 hook；文本粘贴路径零改动。
+
+**关键设计落地**：
+1. **拦截点 = 注入管线最内层 sink 包装器**（HotkeyFilterSink → MappingSink → PasteInterceptSink → 平台 sink）——KVM 注入路径天然钩子；修饰键自跟踪复用 core ModifierTracker（wire Key 无 mods，手写 match 是重复造轮子——mods.rs 早有 apply_key）。
+2. **单飞 + 一次性消费**：共享 AtomicBool（物化中不重复触发）；挂板后 consume_pending（托盘条目消失、随后粘贴行为与无文件槽一致——回归保护内建）。
+3. **async/sync 边界**：sink.inject 是同步热路径，物化是异步长任务——桥接面 = 两条 unbounded 通道（job → worker；outcome → 回注），worker 只轮询 hub 挂板指纹，回注在会话循环线程执行（sink 所有权约束）。
+
+**流程教训**：
+1. paste_intercept 首版又混入草稿垃圾（占位 SystemClock/thread_local/假事件）——写完立即自检"这段是设计还是草稿"，一次重写比事后修干净。
+2. 结构体加字段（TrayState.incoming_files）的构造点散布三个文件——下次加字段先 grep 全部构造点清单。
+3. 原子序 store 不能 AcqRel（编译器直接拦）——Release/Acquire 配对够用。
+
+**遗留**：AC5 双机实测移交人工（A 复制 → 控制着 B 直接 Cmd+V）；切片 d（目录 FileExpand 接线/进度 UI/断点评估/配置面）；win/linux 平台面（docs/05 §0.2 pending）。

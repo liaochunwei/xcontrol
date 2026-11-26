@@ -7,6 +7,7 @@
 | [0001](0001-gpui-and-tray.md) | gpui 依赖方式与系统托盘集成策略 | 已接受（2026-11-15） |
 | [0002](0002-transport-and-discovery.md) | 传输层、加密与发现机制选型 | 已接受（2026-11-15） |
 | [0003](0003-platform-input-paths.md) | 各平台输入捕获/注入/剪贴板实现路径 | 已接受（2026-11-15） |
+| [0004](0004-file-transfer-channel-and-materialization.md) | 跨设备文件传输的通道拓扑与物化策略（FR-7.3） | 已接受（2026-11-26） |
 
 ## 模板
 

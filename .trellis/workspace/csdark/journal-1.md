@@ -87,3 +87,20 @@
 - 剩余平台（win CF_HDROP / x11 uri-list / wayland mime）检测与挂板——docs/05 §0.2 pending 实机复核
 - 切片 c 透明粘贴（注入路径拦截物化）
 - PendingSlot 过期 Clock（切片 d）；断点续传 offset 评估（切片 d）
+
+## 2026-11-26 · 任务 11-26-file-channel-pull 收口（切片 b 完成 + 托盘触发面）
+
+**结果**：切片 b 全部三阶段（b-core/b-net/b-app+b-平台）+ 托盘触发面完成归档。mac 上文件跨设备复制管线真机可走通：复制 → 对端通告 → 托盘「接收文件：N 项 / X MB」→ 点击 → 暂存落盘 + blake3 校验 + **挂板系统剪贴板** → Cmd+V。双机实测（mac↔win/linux）移交人工——win/linux 平台面按 docs/05 §0.2 pending。
+
+**本轮要点**（托盘面）：
+- docs/06 §5.2 菜单先行（红线）；menu 顺序 golden 扩展（有货 12 项/无货 11 项，既有 golden 不变）
+- 投影直读 hub（tray_rt 200ms 刷新即反映）——避免了 AppState 桥接任务的第三处 spawn 点
+- hub 拉取队列 + 泵「接收端空闲」门控：多文件顺序拉流、全条目完成统一挂板（对齐 Finder 多选语义）
+- i18n trf 占位符键 zh/en 同表（parity 测试同约束）
+
+**流程教训**（本轮反复踩的坑）：
+1. **结构体加字段后所有构造点都要补**：TraySnapshot/TrayState 加 incoming_files，散布在 project/menu/tray 三处测试构造器 + loopback match 臂——clippy -D warnings 逐个揪出；先 grep 构造点清单再动手更省轮次。
+2. **python 补丁断言失败的两种根因**：锚点写了记忆版而非 fmt 后实况；插入位置吞掉相邻结构体的 derive 行——插入后必须回读前后 20 行。
+3. **tick 内返回类型陷阱**：select 臂返回 ()，深层违规不能 `return true`——用局部 violated 标志 + tick 收尾统一 break。
+
+**功能剩余面**（后续任务）：切片 c 透明粘贴（注入拦截物化）；win/linux 平台面（实机复核）；切片 d 目录/进度/断点。

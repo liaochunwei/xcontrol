@@ -375,6 +375,7 @@ const ZH: &[(&str, &str)] = &[
     ("menu.resume", "恢复共享"),
     ("menu.slave_latency", "{name} · 延迟 {ms}ms"),
     ("menu.slaves_submenu", "在线工作机"),
+    ("menu.receive_files", "接收文件：{count} 项 / {size}"),
     ("menu.switch_role", "切换角色：主控 ↔ 工作机"),
     (
         "notice.code_rollback_failed",
@@ -848,6 +849,10 @@ const EN: &[(&str, &str)] = &[
     ("menu.resume", "Resume sharing"),
     ("menu.slave_latency", "{name} · {ms}ms latency"),
     ("menu.slaves_submenu", "Online clients"),
+    (
+        "menu.receive_files",
+        "Receive files: {count} items / {size}",
+    ),
     ("menu.switch_role", "Switch role: host ↔ client"),
     (
         "notice.code_rollback_failed",

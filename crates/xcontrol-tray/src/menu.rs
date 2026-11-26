@@ -35,6 +35,7 @@ gpui::actions!(
         TogglePause,
         SwitchRole,
         DisconnectRescan,
+        TransferFiles,
         OpenSettings,
         ToggleAutostart,
         QuitApp
@@ -118,6 +119,19 @@ pub fn build_menu(state: &TrayState) -> Vec<MenuItem> {
                 items.push(host_candidates_submenu(&state.host_candidates));
             }
         }
+    }
+    // 接收文件（FR-7.3）：对端 pending 有货才渲染（无货不占菜单位，docs/06 §5.2）。
+    if let Some(files) = &state.incoming_files {
+        items.push(MenuItem::action(
+            xcontrol_i18n::trf(
+                "menu.receive_files",
+                &[
+                    ("count", &files.count.to_string()),
+                    ("size", &files.size_label),
+                ],
+            ),
+            TransferFiles,
+        ));
     }
     items.extend([
         MenuItem::separator(),
@@ -222,6 +236,7 @@ mod tests {
             },
         };
         TrayState {
+            incoming_files: None,
             role,
             status,
             icon_kind: if status == TrayStatus::Error {
@@ -485,5 +500,40 @@ mod tests {
             SwitchToSlave::name_for_type(),
             "xcontrol_tray::SwitchToSlave"
         );
+    }
+
+    /// 接收文件条目（FR-7.3）：incoming_files 有货时插入第 7 位（角色段之后、
+    /// 设置段之前），计数 12；无货不渲染（既有 11 项 golden 不变）。
+    #[test]
+    fn menu_incoming_files_item_position() {
+        let mut state = state(
+            TrayRole::Host,
+            TrayStatus::Online,
+            false,
+            true,
+            vec![SlaveInfo {
+                name: "mac-book".to_owned(),
+                latency_ms: Some(8),
+            }],
+        );
+        // 无货：11 项（既有 golden 形态）
+        assert_eq!(build_menu(&state).len(), 11, "无 pending 时不渲染接收文件");
+        // 有货：12 项，位次 6（0 状态头 1 分隔 2 暂停 3 切换 4 分隔 5 子菜单
+        // 6 接收文件 7 分隔 8 设置 9 自启 10 分隔 11 退出）
+        state.incoming_files = Some(crate::project::IncomingFilesInfo {
+            count: 3,
+            size_label: "128.0 MB".to_owned(),
+        });
+        let menu = build_menu(&state);
+        assert_eq!(menu.len(), 12, "有 pending 时插入接收文件条目");
+        let has_transfer = menu.iter().any(|item| match item {
+            MenuItem::Action { action, .. } => action
+                .as_ref()
+                .as_any()
+                .downcast_ref::<TransferFiles>()
+                .is_some(),
+            _ => false,
+        });
+        assert!(has_transfer, "接收文件条目携带 TransferFiles 动作");
     }
 }

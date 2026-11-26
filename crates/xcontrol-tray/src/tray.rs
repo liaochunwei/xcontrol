@@ -213,6 +213,7 @@ mod tests {
             },
             slaves,
             host_candidates: Vec::new(),
+            incoming_files: None,
         }
     }
 

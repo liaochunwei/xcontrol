@@ -68,6 +68,9 @@ pub enum CoreCommand {
     /// 重建（会话循环收到后优雅断开并上抛 [`crate::session_rt::SessionEnd::RoleSwitch`]，
     /// main.rs 的运行时 supervisor 据此重建——进程内角色翻转，docs/06 §5.2）。
     SwitchRole,
+    /// 接收对端文件（FR-7.3；托盘「接收文件」路径）：会话循环把 pending 槽
+    /// 全部条目排入拉取队列（file_channel 泵按信用窗口逐条拉流物化挂板）。
+    TransferFiles,
     /// 切换到指定在线从机（FR-2.5「直接切换」；托盘子菜单路径，热键路径复用
     /// 同一 `LocalCmd::Switch` 信令）。`target` = 在线从机序下标（M4 单会话单
     /// 从机拓扑恒 0），会话循环经 `layout_rt::resolve_slave_target` 换算到

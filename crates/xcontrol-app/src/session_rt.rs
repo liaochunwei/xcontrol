@@ -1790,6 +1790,11 @@ async fn drive_session(
                 // 动作同门控语义（hotkey_rt::switch_allowed）。target = 在线从机序
                 // 下标（托盘 M4 拓扑投影），经布局装配的全局 id 解析（docs/02 §4.2；
                 // 越界回退原值 = 1.0 语义兼容）。
+                Some(CoreCommand::TransferFiles) => {
+                    // 接收对端文件（FR-7.3 托盘路径）：pending 槽整单入拉取队列
+                    // （file_channel 泵按接收端空闲逐条拉流，全条目完成挂板）。
+                    crate::file_channel::lock_hub().request_pull_all_pending();
+                }
                 Some(CoreCommand::SwitchToSlave { target }) => {
                     let actions = if crate::hotkey_rt::switch_allowed(
                         session.state(),

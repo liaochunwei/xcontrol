@@ -71,8 +71,11 @@ pub struct FileHub {
     /// 对端最近通告的 pending 槽（代次失效/去重在泵内 [`FileRefRx`] 承接，
     /// docs/04 §8.2；本字段是托盘投影源，b-app 消费）。
     pending: Option<xcontrol_core::file_ref::PendingSlot>,
-    /// 待发拉取请求（b-app 粘贴动作/测试写入；泵消费发出）。
+    /// 待发拉取请求（单条兼容面：测试/单条目路径；泵优先消费）。
     pull_request: Option<(u32, u32)>,
+    /// 拉取队列（托盘「接收文件」整单入队；泵在接收端空闲时逐条消费——
+    /// 顺序拉流、全条目完成后统一挂板）。
+    pull_queue: Vec<(u32, u32)>,
     /// 本机清单对应的实际路径（与 outbound.entries 同序；b-平台：serve 分块
     /// 发送按此打开文件——路径不出 wire、仅本机持有，docs/07 §9 元数据最小化）。
     outbound_paths: Vec<PathBuf>,
@@ -150,9 +153,25 @@ impl FileHub {
         self.pull_request = Some((transfer_id, entry));
     }
 
-    /// 取走待发拉取请求（泵消费）。
+    /// 整单入队（托盘「接收文件」）：pending 槽全部条目按序排队。
+    pub fn request_pull_all_pending(&mut self) {
+        if let Some(slot) = &self.pending {
+            let ids: Vec<(u32, u32)> = (0..slot.entries.len() as u32)
+                .map(|entry| (slot.transfer_id, entry))
+                .collect();
+            self.pull_queue.extend(ids);
+        }
+    }
+
+    /// 取走待发拉取请求（泵消费：单条优先，其次队列首条）。
     pub fn take_pull_request(&mut self) -> Option<(u32, u32)> {
-        self.pull_request.take()
+        if self.pull_request.is_some() {
+            return self.pull_request.take();
+        }
+        if !self.pull_queue.is_empty() {
+            return Some(self.pull_queue.remove(0));
+        }
+        None
     }
 
     /// 本机清单路径（serve 读取面）。
@@ -219,6 +238,7 @@ impl FileHub {
     pub fn reset_for_new_session(&mut self) {
         self.pending = None;
         self.pull_request = None;
+        self.pull_queue.clear();
         self.staged.clear();
         self.verified.clear();
         self.failures.clear();
@@ -449,10 +469,14 @@ async fn run_file_pump(
                     }
                 }
 
-                // ③ 待发拉取请求（size 取自 pending 槽清单；暂存文件同拍建立）
+                // ③ 待发拉取请求（size 取自 pending 槽清单；暂存文件同拍建立）。
+                // 接收端空闲门控：上一条目组装中不取下一条（队列顺序拉流语义；
+                // verified 由 record_rx_action 释放 active，下一拍自然继续）。
                 let pull = {
                     let mut hub = lock_hub();
-                    hub.take_pull_request().filter(|_| hub.file_capable())
+                    let idle = rx.active().is_none();
+                    hub.take_pull_request()
+                        .filter(|_| hub.file_capable() && idle)
                 };
                 if let Some((transfer_id, entry)) = pull {
                     let size = lock_hub()

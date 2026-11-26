@@ -23,7 +23,8 @@
 1. `ProtoVer{major,minor}`；major=1 内只增不改不删；会话取 `min(minor)`，只发送会话 minor 之下的消息集。
 2. 每个消息 kind 必须有 `tests/fixtures/xcp/*.bin` golden 样本（`tests/fixtures.rs` 的 `#[ignore]` 生成测试产出，默认只跑比对；M1 定稿，原"xtask 生成"措辞作废），CI 比对。
 3. fuzz（cargo-fuzz）必跑路径：超长 len、伪造 clip_id 属 proto 层（targets 已建 `fuzz/frame_decode`、`fuzz/clip_announce`）；seq 回绕、未握手发帧属连接态语义，在 core/net 层任务覆盖（M1 分层边界）。**fuzz/target 是 cargo-fuzz 自建构建目录，必须显式 gitignore**（同 spike 教训：独立目录 target 不受根 `/target` 覆盖；曾误入库 275 文件）。
-4. **kind 分配约定（M1 定稿）**：控制消息 kind `0x40–0x48`、剪贴板 `0x50–0x54`，按 `CtrlMsg`/`ClipMsg` 枚举声明顺序单调分配；postcard 判别值 = 帧 kind 的第二层类型标签，错配 = `KindMismatch` 协议违规。新消息只追加到枚举尾部并分配下一个 kind（docs/02 §4.3 修订记录）。
+4. **kind 分配约定（M1 定稿）**：控制消息 kind `0x40–0x48`、剪贴板 `0x50–0x54`、文件域 `0x58–0x60`（XCP 1.2，FR-7.3 立项预留，2026-11-26——11-26-file-transfer-spec），按 `CtrlMsg`/`ClipMsg`/`FileMsg` 枚举声明顺序单调分配；postcard 判别值 = 帧 kind 的第二层类型标签，错配 = `KindMismatch` 协议违规。新消息只追加到枚举尾部并分配下一个 kind（docs/02 §4.3/§4.6 修订记录）。
+5. **文件域红线（XCP 1.2，未实装——实装切片先补 fixtures/fuzz）**：文件通道 = 独立第三条 TCP + `FileBind{session_id}` 首帧绑定（同构剪贴板通道，docs/02 §4.6）；文件域 kind 仅出现在文件连接，控制/剪贴板连接收到一律剥出丢弃告警；`FileRefAnnounce` 仅元数据（清单 ≤1MiB、条目 ≤4096、总字节 ≤协商上限，独立于剪贴板 16MiB）；**拉取请求只含 transfer_id + 条目下标，任何帧不得携带路径**（任意读红线，docs/07 §9）；流超时 = 分块空闲超时 + 总时长上限（不用固定 10s），失败条目级可重试；消息集随 minor ≥ 2 门控发送。
 5. **ModifierSync 单向语义（M1 定稿，P1 教训）**：周期性快照仅**控制方**发送、仅**被控方**应用对齐——Session 用 `ControlDir`（None/LocalControlsPeer/PeerControlsLocal）门控，由 `EdgeCrossing`/`EnterScreen`/`LeaveScreen` 维护。双向无条件收发会让未受控机器被幻按键注入（防卡键机制反制卡键）。`EnterScreen` 进入时的无条件快照对齐保留。收到方向不符的 sync 宽容忽略（不断连）。
 
 ## 帧传输边界（11-20 两机实测定稿）

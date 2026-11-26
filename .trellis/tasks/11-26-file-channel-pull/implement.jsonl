@@ -1,0 +1,5 @@
+{"file": "docs/02-protocol.md", "reason": "§4.6 文件域 wire 契约与防护规则（通道/流控/超时语义）"}
+{"file": "docs/04-clipboard.md", "reason": "§8 剪贴板侧语义：pending 槽是拉流的数据源"}
+{"file": "docs/05-platform.md", "reason": "§0.2 平台读写路径（b-平台 阶段依据）"}
+{"file": "docs/07-security.md", "reason": "§9 索引寻址红线与磁盘耗尽防护"}
+{"file": "docs/adr/0004-file-transfer-channel-and-materialization.md", "reason": "通道拓扑与物化策略决策"}

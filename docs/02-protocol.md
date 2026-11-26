@@ -22,9 +22,10 @@
  │ ①发现: mDNS / UDP beacon / TCP 扫描       │
  │ ──────────── TCP 4243 (control) ────────► │  输入+控制+心跳
  │ ──────────── TCP 4243 (clipboard) ─────► │  剪贴板大块数据（握手后按需建立）
+ │ ──────────── TCP 4243 (file) ──────────► │  文件拉流（1.2+，握手后按需建立，§4.6）
 ```
 
-- 每台从机与主控维持至多 2 条 TCP；主控支持 N 台从机并发（FR-1.2）。
+- 每台从机与主控维持至多 3 条 TCP（1.2 会话：控制 / 剪贴板 / 文件；1.0/1.1 会话无文件连接，仍为至多 2 条）；主控支持 N 台从机并发（FR-1.2）。
 - 两条连接分别独立做 Noise 握手；剪贴板连接首帧 `ChannelBind` 绑定控制连接的会话（§4.4）。
 - 所有帧在 Noise 传输态密文内传输（§3）；明文链路上只有 Noise 握手报文与发现 beacon。
 
@@ -261,6 +262,98 @@ struct ErrCode(u8) // §7；未知 code 原样透传，不得拒收（major=1 �
 | Ping 周期 | 3s（空闲时；输入流量存在时可视作活性，可降频至 15s） |
 | 判死 | 9s 无任何帧 → 断开、从机回本地控制（NFR-5） |
 | 剪贴板通道空闲 30s 自动关闭，按需重建 |
+| 文件通道空闲 30s 自动关闭，按需重建（§4.6，1.2+） |
+
+### 4.6 文件通道（XCP 1.2，FR-7.3，[ADR-0004](adr/0004-file-transfer-channel-and-materialization.md)）
+
+跨设备文件复制粘贴（复制端仅同步元数据、接收端粘贴时拉流物化）走**独立第三条 TCP**，
+与 §4.4 剪贴板通道同构：另拨 TCP → 完整 Noise 握手 → 首帧 `FileBind { session_id }`
+绑定控制会话（对端校验 session 存在且绑定唯一，否则断开）；按需建立、空闲关闭
+（§4.5）；通道任何失败只影响文件域，独立退避重连（3s 起）。
+
+- **域隔离**：文件域 kind（0x58–0x60）**仅出现在文件连接**。控制/剪贴板连接收到
+  文件域帧为防御面：剥出丢弃告警，不断连（与 §4.4 clip 帧同策略）。
+- **协商门控**：会话 minor < 2 不得建立文件通道、不得收发本节任何 kind（§5.3）；
+  老对端无感知（文件连接本就不存在）。
+
+**kind 分配**（随 minor 1.2 新增，老对端按"未知 kind 跳过"无损降级）：
+
+| kind | 消息 |
+| --- | --- |
+| 0x58 | `FileBind` |
+| 0x59 | `FileRefAnnounce` |
+| 0x5A | `FilePullReq` |
+| 0x5B | `FileChunk` |
+| 0x5C | `FileAck` |
+| 0x5D | `FileEnd` |
+| 0x5E | `FileError` |
+| 0x5F | `FileCancel` |
+| 0x60 | `FileExpand` |
+
+**传输模型**（两种流，同一连接）：
+
+1. **元数据面**：复制端检测到文件引用剪贴板（[04-clipboard.md](04-clipboard.md) §8）
+   → `FileRefAnnounce`（仅清单：条目名/大小/mtime/树形，**无内容字节**，< 1MiB）。
+   接收端入 pending 槽（[04-clipboard.md](04-clipboard.md) §8），不触碰本机剪贴板。
+2. **内容面**（接收端发起，粘贴/显式动作触发）：`FilePullReq → FileChunk* → FileAck*`
+   （信用窗口）`→ FileEnd`（条目级 blake3）；任一步失败 `FileError`；随时 `FileCancel`。
+   目录条目先 `FileExpand` 展开子清单再逐条目拉取（v1 切片仅顶层文件；`FileExpand`
+   随 1.2 一并钉死 wire，避免后续"只增"二次协商）。
+
+**v1.2 wire 类型钉死**（postcard 按 Rust 类型编码；本块与 §6 同纪律——后续 postcard
+升级不得改变本布局）：
+
+```rust
+struct FileBind        { session_id: [u8; 16] }                     // §3.3 session_id 16B
+struct FileRefAnnounce { transfer_id: u32, origin_id: [u8; 16], origin_seq: u32,
+                         entries: Vec<FileEntry>, total_bytes: u64, copied_at_ms: u64 }
+struct FileEntry       { name: String,             // 条目名（UTF-8，**相对名**，不含绝对路径）
+                         size: u64, mtime_ms: u64,
+                         kind: FileEntryKind,
+                         children: u32 }           // Dir = 子树条目总数（FileExpand 展开前为估计值，可为 0 = 未统计）
+enum  FileEntryKind    { File = 0, Dir = 1 }
+struct FilePullReq     { transfer_id: u32, entry: u32, offset: u64 }
+struct FileChunk       { transfer_id: u32, seq: u32, data: Vec<u8> } // data.len() ≤ 64KiB；发送有效分块 65472B（同 §6.2 物理上限推导）
+struct FileAck         { seq: u32 }
+struct FileEnd         { transfer_id: u32, entry: u32, blake3: [u8; 32] }
+struct FileError       { transfer_id: u32, entry: Option<u32>, code: FileErrCode }
+struct FileCancel      { transfer_id: u32 }
+struct FileExpand      { transfer_id: u32, parent: u32, base: u32, entries: Vec<FileEntry> } // 子清单：全局下标自 base 起连续分配
+enum  FileErrCode(u8)  { NotFound = 1, PermissionDenied = 2, SourceGone = 3,
+                         SizeMismatch = 4, HashMismatch = 5, Cancelled = 6,
+                         Quota = 7, TooManyEntries = 8 }   // major=1 内只增
+```
+
+**寻址与安全红线**（[07-security.md](07-security.md) §9）：
+
+- 拉取请求只含 `transfer_id + entry 下标 (+offset)`，**任何帧不得携带路径**；
+  下标 → 本机路径的映射完全由源端维护，源端只服务**本会话已通告/已展开**的下标，
+  未知 `transfer_id` / 越界下标 = 协议违规断开——杜绝对端构造请求读取任意文件。
+
+**防护规则**（信任边界在接收端，§6.7 原则沿用）：
+
+1. `FileRefAnnounce`：`entries.len()` ≤ 4096（可配）；`total_bytes` ≤ 协商上限
+   （默认 2 GiB，可配，独立于剪贴板 16MiB，FR-4.5 不适用）；单 `name` ≤ 1024B
+   UTF-8 且不含路径分隔符以外的组件语义（即纯名/相对子路径，以 `/` 分层）；
+   清单编码后 > 1 MiB = 违规断开。
+2. `FilePullReq`：`transfer_id` 必须是本会话已通告且未过期；`entry` < 已知下标
+   空间；`offset` ≤ 条目 `size`。违规断开。
+3. `FileChunk`：seq 单调递增不回绕；单条目累计 ≤ 条目 `size`；每条目独立重组状态。
+4. 流控：信用窗口初始 16 块，`FileAck` 归还；**分块空闲超时** 10s（无 chunk 到达
+   判死该 transfer）+ 单 transfer 总时长上限（默认 30min，可配）——超时仅终止该
+   transfer（`FileError{SourceGone}`），**不断连**（文件量大、耗时长是常态而非攻击）。
+5. 失败语义：`FileError` 条目级**可重试**（由接收端决策）——与剪贴板"允许失败不
+   重传"（§6.5）语义不同：用户在粘贴处同步等待。
+6. 并发：每连接同时活动 transfer ≤ 4；超出 = 违规断开。
+7. blake3 由源端**边流边算**（复制瞬间不预哈希，保持复制零延迟）；`FileEnd` 校验
+   失败 = 该条目 `FileError{HashMismatch}`，可重试。
+8. `FileExpand`：`base` 必须等于源端当前下标空间上界（接收端以此校验下标连续性）；
+   展开仅允许由 `FilePullReq{entry=Dir 下标}` 触发。
+
+> 修订记录（2026-11-26，任务 11-26-file-transfer-spec）：本节为 FR-7.3 立项新增
+> （XCP minor 1.1 → 1.2）。兼容性：仅新增连接类型与 kind，既有帧格式/wire 类型
+> 零变更；文件域消息集随 minor 1.2 门控，1.0/1.1 对端靠"无文件连接 + 未知 kind
+> 跳过"无损降级（§5.4 只增承诺内）。golden fixtures 随实装切片新增（§8）。
 
 ## 5. 版本协商与兼容策略
 
@@ -314,6 +407,10 @@ enum ClipFormat     { Text = 0, Png = 1, Html = 2, UriList = 3 } // docs/04 §2 
 ## 8. 测试要求（引用 [08-engineering.md](08-engineering.md) §4）
 
 - 全消息 golden fixtures（`tests/fixtures/xcp/*.bin`），CI 比对。
-- 版本协商矩阵测试（1.0↔1.1↔2.0 组合）。
+- 版本协商矩阵测试（1.0↔1.1↔1.2↔2.0 组合）。
 - 恶意流 fuzz（cargo-fuzz）：超长 len、伪造 clip_id、seq 回绕、未握手发帧。
 - 回环延迟基准：mock 传输 P50 < 5ms（NFR-1 分量）。
+- 文件域（§4.6，随实装切片落地）：golden fixtures（`file_*` 全消息）；恶意流 fuzz——
+  越界 `entry`、伪造 `transfer_id`、`offset` 超条目 size、清单/条目数超限、`FileExpand`
+  `base` 不连续；mock 双端全链路（announce → pending 槽 → 拉流 → 暂存，[04-clipboard.md](04-clipboard.md) §8）
+  与故障注入（源离线 / 条目消失 / 传输中断连）——断言控制与剪贴板连接不受影响。

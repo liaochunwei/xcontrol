@@ -65,3 +65,25 @@
 4. 大段插入文档用标题作锚点会吞标题（§4.6 插入吞了 §5 标题，立即发现修复）——插入后必须回读前后结构。
 
 **遗留/后续**：切片 b（文件 TCP 通道 + FileBind 绑定 + 拉流 + 真实平台检测 + app 泵接线 + 托盘提示）承接；会话 minor ≥ 2 发送门控随发送路径落地。
+
+## 2026-11-26 · 任务 11-26-file-channel-pull（FR-7.3 切片 b：通道拉流三阶段推进）
+
+**结果**：分支 `feat/file-transfer-spec` 三批提交（3fa018c b-core / 2679dd3 b-net / 8988359 b-app+b-平台）。文件拉流全链路打通：本机检测 → 元数据通告 → pending 槽 → 拉取 → 真实分块发送 → 暂存落盘 → blake3 校验 → **挂板系统剪贴板**（mac 真机实测）。质量门：clippy 双 feature 配置零警告、fmt 干净、workspace 无 feature + macos feature 测试全绿、check-deps PASS、mac 剪贴板自往返冒烟 PASS。
+
+**关键设计落地**：
+1. **FileTx 哈希下沉**：源端 blake3 边流边算放 core FileTx（on_chunk_sent 喂入）——app 层零 blake3 依赖（分层红线；最初设计让 app 持 Hasher，实装时发现会把 blake3 拉进 app 依赖树，下沉即解）。
+2. **FileHub 进程级单例**（OnceLock，同 clip shared_echo 先例）：pending/清单/挂板防线跨重连存活；挂板回环防线 = 指纹 + 2s 窗口（docs/04 §8.3 同板多域语义的 app 层等价）。
+3. **NSURL 绑定路径全部源码核实**（objc2-app-kit 0.3.2 nspasteboard.rs）：writeObjects 安全绑定 + NSURL 的 NSPasteboardWriting/Reading unsafe impl 声明——写路径零 unsafe，读路径一处 unsafe 绑定带 SAFETY。pasteboardTypes 未进绑定 → 检测面改按类过滤一步到位。
+
+**经验教训**：
+1. **绑定可用性先查本地 registry 源码再写代码**（~/.cargo/registry/src/...）：本次 5 个关键 selector（writeObjects/readObjectsForClasses/fileURLWithPath_isDirectory/path/NSPasteboardTypeFileURL）全部先 grep 核实签名再落笔，一次编译通过率高很多。
+2. **python 补丁脚本锚点必须以当前文件实况为准**：三次 AssertionError 全是"锚点写了记忆中的版本而非 fmt 后实况"——先 grep 再 assert。
+3. **大文件补丁用脚本文件而非 heredoc**：嵌套三引号在 heredoc 里炸过一次。
+4. **集成测试要先消化协议的正常面**：host 泵会推自身 outbound announce——测试收帧循环不能假设第一帧就是目标帧。
+5. **挂板/检测面按平台 cfg 门控 + 断言分叉**：无 feature workspace 测试（CI Linux 面）与 macos feature 测试都全绿的关键。
+
+**遗留/后续**（切片 b 收尾 + c）：
+- 托盘「传输文件到本机」动作（pull 触发面 UI；menu 顺序 golden + docs/06 §5.2 先行）+ i18n 文案
+- 剩余平台（win CF_HDROP / x11 uri-list / wayland mime）检测与挂板——docs/05 §0.2 pending 实机复核
+- 切片 c 透明粘贴（注入路径拦截物化）
+- PendingSlot 过期 Clock（切片 d）；断点续传 offset 评估（切片 d）

@@ -174,6 +174,12 @@ impl FileHub {
         None
     }
 
+    /// 拉取队列长度（诊断/测试面）。
+    #[must_use]
+    pub fn pull_queue_len(&self) -> usize {
+        self.pull_queue.len()
+    }
+
     /// 本机清单路径（serve 读取面）。
     #[must_use]
     pub fn outbound_paths(&self) -> &[PathBuf] {
@@ -232,6 +238,14 @@ impl FileHub {
     pub fn set_mounted(&mut self, fingerprint: [u8; 16], now_ms: u64) {
         self.mounted_fp = Some(fingerprint);
         self.mounted_at_ms = now_ms;
+    }
+
+    /// 消费 pending 槽（切片 c 一次性语义：物化挂板成功后清空 pending 与
+    /// 拉取队列——托盘「接收文件」随之消失，随后粘贴组合因无货放行）。
+    pub fn consume_pending(&mut self) {
+        self.pending = None;
+        self.pull_queue.clear();
+        self.pull_request = None;
     }
 
     /// 清空会话期状态（控制会话结束随行清理；跨会话不得残留旧对端清单）。
@@ -894,6 +908,8 @@ fn mount_paths(paths: &[PathBuf], fingerprint: [u8; 16], now_ms: u64) {
     match open_platform_clipboard().and_then(|mut clipboard| clipboard.write_file_urls(&existing)) {
         Ok(_) => {
             lock_hub().set_mounted(fingerprint, now_ms);
+            // 一次性消费（切片 c：透明粘贴/托盘条目随之消失；回环防线指纹已登记）
+            lock_hub().consume_pending();
             tracing::info!(target: TARGET, count = existing.len(),
                 "文件已物化并挂上本机剪贴板（可直接粘贴）");
         }

@@ -142,7 +142,7 @@ impl Rig {
                 seq,
                 data: data.to_vec(),
             };
-            must("tx on_chunk_sent", self.tx.on_chunk_sent(seq, data.len()));
+            must("tx on_chunk_sent", self.tx.on_chunk_sent(seq, data));
             // 接收端消费本块；Ack 即刻归还源端信用
             let new_actions = self.rx.on_chunk(&frame);
             for action in &new_actions {

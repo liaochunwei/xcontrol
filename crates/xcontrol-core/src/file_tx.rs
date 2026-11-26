@@ -12,8 +12,17 @@
 /// 单连接信用窗口初始块数（docs/02 §4.6 防护规则 5）。
 pub const INITIAL_FILE_CREDIT_CHUNKS: usize = 16;
 
-/// 单条目流的发送状态（单连接同时一条目流）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 全量内容摘要（测试/校验面共用：blake3 不进 app 依赖树——app 侧端到端
+/// 测试经本助手构造 `FileEnd` 载荷，与源端边流边算同算法）。
+#[must_use]
+pub fn content_digest(data: &[u8]) -> [u8; 32] {
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(blake3::hash(data).as_bytes());
+    digest
+}
+
+/// 单条目流的发送状态（单连接同时一条目流；含 blake3 增量面，非 Eq）。
+#[derive(Debug, Clone)]
 struct EntryStream {
     transfer_id: u32,
     entry: u32,
@@ -23,10 +32,13 @@ struct EntryStream {
     bytes_sent: u64,
     /// 下一块 seq（u32 单调递增不回绕，docs/02 §4.6 防护规则 4）。
     next_seq: u32,
+    /// 条目内容摘要（源端边流边算——`on_chunk_sent` 喂入，docs/02 §4.6
+    /// 防护规则 8「复制瞬间不预哈希」；`end_digest` 于发满时取值进 FileEnd）。
+    hasher: blake3::Hasher,
 }
 
-/// 源端发送编排（每条文件连接一个实例）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 源端发送编排（每条文件连接一个实例；含 blake3 增量面，非 Eq）。
+#[derive(Debug, Clone)]
 pub struct FileTx {
     window: usize,
     /// 已发送未确认的块 seq（FIFO 登记；上限即窗口大小）。
@@ -69,6 +81,7 @@ impl FileTx {
             size,
             bytes_sent: 0,
             next_seq: 0,
+            hasher: blake3::Hasher::new(),
         });
         Ok(())
     }
@@ -92,21 +105,37 @@ impl FileTx {
     ///
     /// # Errors
     /// 无条目流 / 累计超 size → `Err`（调用方 bug，不产线上帧）。
-    pub fn on_chunk_sent(&mut self, seq: u32, len: usize) -> Result<(), String> {
+    pub fn on_chunk_sent(&mut self, seq: u32, data: &[u8]) -> Result<(), String> {
         let Some(stream) = &mut self.stream else {
             return Err("无进行中条目流".to_owned());
         };
         if seq != stream.next_seq {
             return Err(format!("seq 失序：期望 {} 收到 {seq}", stream.next_seq));
         }
-        let new_len = stream.bytes_sent.saturating_add(len as u64);
+        let new_len = stream.bytes_sent.saturating_add(data.len() as u64);
         if new_len > stream.size {
             return Err(format!("累计发送 {new_len} 超条目 size {}", stream.size));
         }
+        // 源端边流边算（docs/02 §4.6 防护规则 8：复制瞬间不预哈希）
+        stream.hasher.update(data);
         stream.bytes_sent = new_len;
         stream.next_seq = stream.next_seq.wrapping_add(1);
         self.unacked.push(seq);
         Ok(())
+    }
+
+    /// 发满条目的内容摘要（`FileEnd.blake3` 载荷；`should_end()` 为真后调用）。
+    /// blake3 `finalize` 非消费语义（可重复取值）；条目收尾经 [`FileTx::take_stream`]。
+    #[must_use]
+    pub fn end_digest(&self) -> [u8; 32] {
+        match &self.stream {
+            Some(stream) => {
+                let mut digest = [0u8; 32];
+                digest.copy_from_slice(stream.hasher.finalize().as_bytes());
+                digest
+            }
+            None => [0u8; 32],
+        }
     }
 
     /// `FileAck` 归还信用；未知 / 重复 seq → `false`（信用不重复归还）。
@@ -204,7 +233,7 @@ mod tests {
         // 16 块窗口：每块 10B，10 块发满
         for seq in 0..10u32 {
             assert!(tx.can_send(), "窗口 16 远大于块数，第 {seq} 块应可发");
-            tx.on_chunk_sent(seq, 10).unwrap();
+            tx.on_chunk_sent(seq, &[7u8; 10]).unwrap();
         }
         assert!(tx.should_end(), "100/100 字节发满");
         let (transfer_id, entry) = tx.take_stream().unwrap();
@@ -225,12 +254,12 @@ mod tests {
         let mut tx = FileTx::new();
         tx.begin_entry(1, 0, 1000).unwrap();
         for seq in 0..16u32 {
-            tx.on_chunk_sent(seq, 10).unwrap();
+            tx.on_chunk_sent(seq, &[7u8; 10]).unwrap();
         }
         assert!(!tx.can_send(), "窗口满（16 块在途）");
         assert!(tx.on_ack(3));
         assert!(tx.can_send());
-        tx.on_chunk_sent(16, 10).unwrap();
+        tx.on_chunk_sent(16, &[7u8; 10]).unwrap();
         assert!(!tx.can_send());
     }
 
@@ -238,26 +267,29 @@ mod tests {
     #[test]
     fn defensive_errors() {
         let mut tx = FileTx::new();
-        assert!(tx.on_chunk_sent(0, 1).is_err(), "无流发送");
+        assert!(tx.on_chunk_sent(0, &[0u8; 1]).is_err(), "无流发送");
 
         tx.begin_entry(1, 0, 100).unwrap();
-        assert!(tx.on_chunk_sent(1, 10).is_err(), "seq 失序（期望 0）");
-        tx.on_chunk_sent(0, 10).unwrap();
+        assert!(
+            tx.on_chunk_sent(1, &[7u8; 10]).is_err(),
+            "seq 失序（期望 0）"
+        );
+        tx.on_chunk_sent(0, &[7u8; 10]).unwrap();
         assert!(
             tx.begin_entry(2, 1, 50).is_err(),
             "begin 重入（上一条目进行中）"
         );
         assert!(
-            tx.on_chunk_sent(1, 95).is_err(),
+            tx.on_chunk_sent(1, &[9u8; 95]).is_err(),
             "累计 105 > 100 超条目尺寸"
         );
-        tx.on_chunk_sent(1, 90).unwrap();
+        tx.on_chunk_sent(1, &[9u8; 90]).unwrap();
         assert!(tx.should_end(), "100/100 发满");
 
         // 未发满 take 的负例：另起一条目发一半再 take
         let mut partial = FileTx::new();
         partial.begin_entry(3, 5, 100).unwrap();
-        partial.on_chunk_sent(0, 40).unwrap();
+        partial.on_chunk_sent(0, &[7u8; 40]).unwrap();
         let err = partial.take_stream().unwrap_err();
         assert!(err.contains("未发满"), "{err}");
         assert!(partial.stream().is_some(), "take 失败后流保留");
@@ -269,7 +301,7 @@ mod tests {
         let mut tx = FileTx::new();
         tx.begin_entry(1, 0, 100).unwrap();
         for seq in 0..16u32 {
-            tx.on_chunk_sent(seq, 5).unwrap();
+            tx.on_chunk_sent(seq, &[3u8; 5]).unwrap();
         }
         tx.reset();
         assert_eq!(tx.in_flight(), 0);
@@ -277,7 +309,7 @@ mod tests {
         assert!(!tx.can_send(), "无流时不可发送（窗口语义以流为前提）");
         tx.begin_entry(2, 3, 10).unwrap();
         assert!(tx.can_send(), "重置后新流窗口恢复");
-        tx.on_chunk_sent(0, 10).unwrap();
+        tx.on_chunk_sent(0, &[7u8; 10]).unwrap();
         assert!(tx.should_end());
     }
 

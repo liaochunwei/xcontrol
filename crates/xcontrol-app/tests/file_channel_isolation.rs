@@ -1,13 +1,12 @@
-//! FR-7.3 独立文件通道集成测试（docs/02 §4.6，XCP 1.2+；切片 b-net）。
+//! FR-7.3 独立文件通道集成测试（docs/02 §4.6，XCP 1.2+；切片 b-net/b-app）。
 //!
 //! 1. **三通道并存**：控制连接（静默）/ 剪贴板通道（`ChannelBind`）/ 文件通道
 //!    （`FileBind`）经 [`classify_incoming`] 分派为三个角色，同一监听端口、
 //!    独立 Noise 握手；`FileBind` 会话不匹配 = 拒绝断开（不扰动已有通道）；
-//! 2. **元数据面端到端**：对端通告 `FileRefAnnounce` → host 泵入 pending 槽
-//!    （hub 投影，托盘数据源）；
-//! 3. **拉流面端到端（软失败路径）**：host 发起 `FilePullReq` → 对端（b-net
-//!    阶段无磁盘读取面）回 `FileError{SOURCE_GONE}` → host hub 记录条目级软
-//!    失败（可重试语义，不断连）。
+//! 2. **真实文件拉流端到端**：host 发布真实临时文件 → 对端通告镜像清单 →
+//!    host 拉取（PullReq）→ 对端按 serve 语义回 chunk/end → host 暂存落盘 +
+//!    blake3 校验 + **挂板**（mac 实测路径；hub.verified / mounted 指纹 /
+//!    暂存内容逐字节断言）。
 //!
 //! hub 为进程级单例（同生产形态：host/client 各一个进程）——本测试以
 //! raw-frame 对端驱动，host 侧 hub 单角色使用；两用例以 hub 测试互斥锁串行。
@@ -17,12 +16,13 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 use xcontrol_app::clip_channel::{CLIP_BIND_PEEK_WINDOW, IncomingClass, classify_incoming};
-use xcontrol_app::file_channel::{FILE_MIN_MINOR, lock_hub};
+use xcontrol_app::file_channel::{FILE_MIN_MINOR, lock_hub, staging_dir_for_test};
+use xcontrol_core::file_tx::content_digest;
 use xcontrol_net::{HandshakeThrottle, ServerOptions, ThrottleConfig, serve};
-use xcontrol_proto::file::{FileBind, FileErrCode, FileError, FilePullReq};
+use xcontrol_proto::file::{FileBind, FileChunk, FileEnd, FilePullReq};
 use xcontrol_proto::{FileEntry, FileEntryKind, FileMsg, FileRefAnnounce, Message as _};
 
-/// hub 测试互斥（进程级单例的跨用例串行）。
+/// hub 测试互斥（进程级单例的跨用例串行；异步锁——跨 await 持有）。
 static HUB_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// 测试假码派生（docs/08 §4 假码纪律；每码进程内只派生一次）。
@@ -93,17 +93,6 @@ fn entry(name: &str, size: u64) -> FileEntry {
     }
 }
 
-fn announce(transfer_id: u32) -> FileRefAnnounce {
-    FileRefAnnounce {
-        transfer_id,
-        origin_id: [0x22; 16],
-        origin_seq: 1,
-        entries: vec![entry("report.pdf", 2048)],
-        total_bytes: 2048,
-        copied_at_ms: 0,
-    }
-}
-
 /// 三通道并存 + FileBind 会话校验（分派面全矩阵）。
 #[tokio::test]
 async fn classify_dispatches_control_clip_file_and_rejects() {
@@ -112,11 +101,11 @@ async fn classify_dispatches_control_clip_file_and_rejects() {
     let session_id = [0x3Fu8; 16];
     let mut throttle = HandshakeThrottle::<SocketAddr>::with_config(fast_throttle_config());
 
-    // ① 静默连接（控制形态）。
+    // ① 静默连接（控制形态）。② 剪贴板通道（ChannelBind）。
+    // ③ 文件通道（FileBind，会话匹配）。④ 文件通道（会话不匹配）。
     let _control = serve::connect(addr, &psk("it-good"), &mut throttle)
         .await
         .expect("控制连接握手");
-    // ② 剪贴板通道（ChannelBind）。
     let mut clip_conn = serve::connect(addr, &psk("it-good"), &mut throttle)
         .await
         .expect("剪贴板连接握手");
@@ -126,7 +115,6 @@ async fn classify_dispatches_control_clip_file_and_rejects() {
         .send(&bind.encode_frame(0).expect("bind 编码"))
         .await
         .expect("bind 发送");
-    // ③ 文件通道（FileBind，会话匹配）。
     let mut file_conn = serve::connect(addr, &psk("it-good"), &mut throttle)
         .await
         .expect("文件连接握手");
@@ -136,7 +124,6 @@ async fn classify_dispatches_control_clip_file_and_rejects() {
         .send(&file_bind.encode_frame(0).expect("file bind 编码"))
         .await
         .expect("file bind 发送");
-    // ④ 文件通道（FileBind，会话不匹配）。
     let mut mismatch_conn = serve::connect(addr, &psk("it-good"), &mut throttle)
         .await
         .expect("第四条连接握手");
@@ -174,22 +161,42 @@ async fn classify_dispatches_control_clip_file_and_rejects() {
     );
 }
 
-/// 元数据面 + 拉流面端到端（软失败路径）。
+/// 真实文件拉流端到端：host 发布临时文件 → 对端通告镜像 → 拉取 → chunk/end
+/// 回传 → 暂存 + 校验 + 挂板。
 #[tokio::test]
-async fn announce_flows_to_pending_and_pull_soft_fails() {
+async fn real_file_pull_flow_stages_and_mounts() {
     let _hub_guard = HUB_LOCK.lock().await;
     let (mut server, addr) = test_server().await;
     let session_id = [0x4Fu8; 16];
 
-    // hub 复位 + 协商 minor 就绪（FILE_MIN_MINOR 门控的测试等价：host 泵的
-    // 出站拍门控按 hub minor 判定；入站面不受门控——对端 1.2 客户端已 gate）。
     {
         let mut hub = lock_hub();
         hub.reset_for_new_session();
         hub.set_session_minor(FILE_MIN_MINOR);
     }
 
-    // 对端（raw-frame 客户端形态）：独立握手 + FileBind 首帧。
+    // —— host 真实临时文件 → 本机清单发布（b-app 检测面的测试等价入口）——
+    let content: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    let dir = std::env::temp_dir().join("xcontrol-file-e2e");
+    std::fs::create_dir_all(&dir).expect("临时目录");
+    let path = dir.join("e2e-样本.bin");
+    std::fs::write(&path, &content).expect("临时文件");
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .expect("文件名");
+    let now_ms = 1_700_000_000_000;
+    lock_hub().publish_local_manifest(
+        vec![entry(&file_name, content.len() as u64)],
+        vec![path.clone()],
+        now_ms,
+    );
+    let transfer_id = lock_hub()
+        .outbound()
+        .map(|announce| announce.transfer_id)
+        .expect("发布后有清单");
+
+    // —— 对端（raw-frame）：握手 + FileBind → host 分派文件通道 ——
     let mut throttle = HandshakeThrottle::<SocketAddr>::with_config(fast_throttle_config());
     let mut peer = serve::connect(addr, &psk("it-good"), &mut throttle)
         .await
@@ -199,76 +206,111 @@ async fn announce_flows_to_pending_and_pull_soft_fails() {
         .send(&file_bind.encode_frame(0).expect("file bind 编码"))
         .await
         .expect("file bind 发送");
-
     let guard = match accept_and_classify(&mut server, session_id).await {
         IncomingClass::FileChannel(guard) => guard,
         other => panic!("FileBind 应产出文件通道：{other:?}"),
     };
 
-    // —— 元数据面：对端 announce → host pending 槽 ——
-    let announce = announce(7);
-    peer.transport
-        .send(&announce.encode_frame(1).expect("announce 编码"))
-        .await
-        .expect("announce 发送");
-    let pending = wait_for(Duration::from_secs(5), || {
-        lock_hub()
-            .pending()
-            .is_some_and(|slot| slot.transfer_id == 7 && slot.entries.len() == 1)
-    })
-    .await;
-    assert!(pending, "announce 应在 5s 内入 pending 槽");
-    assert_eq!(
-        lock_hub().pending().map(|slot| slot.total_bytes),
-        Some(2048)
-    );
-
-    // —— 拉流面：host 发起拉取 → 对端回 SOURCE_GONE（b-net 无读取面）→
-    //        条目级软失败记录（可重试语义）——
-    {
-        let mut hub = lock_hub();
-        hub.request_pull(7, 0);
-    }
-    // 对端在 5s 内收到 PullReq（200ms 出站拍 + 传输延迟）
-    let mut wire_buf = Vec::new();
-    let received = must(
-        "PullReq 在 5s 内到达对端",
-        tokio::time::timeout(Duration::from_secs(5), peer.transport.recv(&mut wire_buf)).await,
-    );
-    received.expect("PullReq 读取");
-    let msgs = decode_file_frames(&wire_buf);
-    assert!(
-        msgs.iter().any(|msg| matches!(
-            msg,
-            FileMsg::PullReq(FilePullReq {
-                transfer_id: 7,
-                entry: 0,
-                ..
-            })
-        )),
-        "对端应收到 PullReq{{7, 0}}：{msgs:?}"
-    );
-
-    // 对端回 FileError{SOURCE_GONE}（b-net 阶段：文件服务未接线的固定路径）
-    let error = FileError {
-        transfer_id: 7,
-        entry: Some(0),
-        code: FileErrCode::SOURCE_GONE,
+    // —— 元数据面：对端通告同清单（镜像 host 发布条目）→ host pending 槽 ——
+    let mirror = FileRefAnnounce {
+        transfer_id,
+        origin_id: [0x22; 16],
+        origin_seq: 1,
+        entries: vec![entry(&file_name, content.len() as u64)],
+        total_bytes: content.len() as u64,
+        copied_at_ms: now_ms,
     };
     peer.transport
-        .send(&error.encode_frame(2).expect("error 编码"))
+        .send(&mirror.encode_frame(1).expect("announce 编码"))
         .await
-        .expect("error 发送");
-    let failed = wait_for(Duration::from_secs(5), || !lock_hub().failures.is_empty()).await;
-    assert!(failed, "软失败应在 5s 内记录到 hub");
-    assert!(
-        lock_hub().failures[0].contains("transfer 7"),
-        "失败记录携带 transfer 上下文：{:?}",
-        lock_hub().failures
+        .expect("announce 发送");
+    let pending_ready = wait_for(Duration::from_secs(5), || {
+        lock_hub()
+            .pending()
+            .is_some_and(|slot| slot.transfer_id == transfer_id)
+    })
+    .await;
+    assert!(pending_ready, "announce 应在 5s 内入 pending 槽");
+
+    // —— 拉流面：host 发起拉取 → 对端按 serve 语义回 chunk×2 + end ——
+    lock_hub().request_pull(transfer_id, 0);
+    // 收帧直到 PullReq（host 泵会先推自身 outbound announce——元数据面正常
+    // 行为，测试侧消化；出站拍 200ms + 逐帧独立发送）
+    let mut saw_pull_req = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !saw_pull_req && tokio::time::Instant::now() < deadline {
+        let mut wire_buf = Vec::new();
+        let received =
+            tokio::time::timeout(Duration::from_secs(1), peer.transport.recv(&mut wire_buf)).await;
+        let Ok(Ok(())) = received else { continue };
+        let msgs = decode_file_frames(&wire_buf);
+        saw_pull_req = msgs.iter().any(|msg| matches!(
+            msg,
+            FileMsg::PullReq(FilePullReq { transfer_id: tid, entry: 0, .. }) if *tid == transfer_id
+        ));
+    }
+    assert!(saw_pull_req, "对端应在 5s 内收到 PullReq{{transfer, 0}}");
+
+    // 按 65472B 有效分块回传（seq 单调 + 末尾 end，blake3 全量）
+    let mut seq: u32 = 0;
+    let mut chunk_frames = Vec::new();
+    for chunk_data in content.chunks(65472) {
+        chunk_frames.push(
+            FileChunk {
+                transfer_id,
+                seq,
+                data: chunk_data.to_vec(),
+            }
+            .encode_frame(seq + 10)
+            .expect("chunk 编码"),
+        );
+        seq += 1;
+    }
+    let end_frame = FileEnd {
+        transfer_id,
+        entry: 0,
+        blake3: content_digest(&content),
+    }
+    .encode_frame(seq + 10)
+    .expect("end 编码");
+    chunk_frames.push(end_frame);
+    for frame in &chunk_frames {
+        peer.transport.send(frame).await.expect("chunk/end 发送");
+    }
+
+    // —— host 端断言：verified + 暂存内容逐字节一致 + 挂板指纹登记 ——
+    let verified = wait_for(Duration::from_secs(5), || {
+        lock_hub()
+            .verified
+            .iter()
+            .any(|(tid, entry)| *tid == transfer_id && *entry == 0)
+    })
+    .await;
+    assert!(verified, "blake3 校验应在 5s 内通过并记录 verified");
+    let staged_path = staging_dir_for_test().join(format!("{transfer_id}-0-{file_name}"));
+    let staged = std::fs::read(&staged_path).expect("暂存文件存在");
+    assert_eq!(staged, content, "暂存内容与源逐字节一致");
+    // 挂板按平台分叉（docs/05 §0.2）：mac = write_file_urls 实测路径 + 回环
+    // 防线指纹登记；其余平台挂板未实装（文件已暂存，路径提示）。
+    #[cfg(feature = "macos")]
+    assert_eq!(
+        lock_hub().mounted_fp(),
+        Some(xcontrol_core::file_ref::manifest_fingerprint(
+            &mirror.entries
+        )),
+        "全条目完成触发挂板并登记回环防线指纹"
+    );
+    #[cfg(not(feature = "macos"))]
+    assert_eq!(
+        lock_hub().mounted_fp(),
+        None,
+        "非 mac 平台挂板未实装（docs/05 §0.2 pending）：文件已暂存，指纹不登记"
     );
 
     guard.close();
     lock_hub().reset_for_new_session();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&staged_path);
 }
 
 /// 轮询等待（50ms 拍，超时返回 false）。

@@ -137,6 +137,13 @@ objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSString",
+    # FR-7.3 文件引用挂板/检测（11-26-file-channel-pull b-平台）：NSURL
+    # fileURLWithPath_isDirectory / path + NSArray::from_slice（writeObjects
+    # 载体）；objc2-app-kit NSPasteboard feature 下已有 writeObjects /
+    # readObjectsForClasses 与 NSURL 的 NSPasteboardWriting/Reading 符合声明
+    # （0.3.2 nspasteboard.rs NSURLNSPasteboardSupport 类目，签名已对源码核实）。
+    "NSURL",
+    "NSArray",
 ] }
 # --- 第三方（11-17-m3-input-win 任务过审：Windows 输入层，docs/05 §2、ADR-0003 决策 1） ---
 # windows：微软官方 Win32 bindings（Rust 生成，纯 Rust 无 C 编译步骤，docs/01 §6 平台行

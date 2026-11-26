@@ -97,7 +97,7 @@ pub use file_rx::{
     FILE_IDLE_TIMEOUT_MS, FILE_TOTAL_DURATION_CAP_MS, FileRx, FileRxAction, FileRxConfig,
 };
 pub use file_serve::{FileServe, MAX_ACTIVE_TRANSFERS, ServeVerdict};
-pub use file_tx::{FileTx, INITIAL_FILE_CREDIT_CHUNKS};
+pub use file_tx::{FileTx, INITIAL_FILE_CREDIT_CHUNKS, content_digest};
 pub use hotkey::{
     FilterOutcome, HotkeyCombo, HotkeyError, HotkeyFilter, HotkeyId, HotkeySet, ModFamilies,
 };

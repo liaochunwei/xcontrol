@@ -23,19 +23,29 @@
 //!   待 b-app 落盘与读取面）；拉取触发面（托盘/粘贴拦截）同样待 b-app。
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::watch;
-use xcontrol_core::clock::SystemClock;
-use xcontrol_core::file_ref::{FileRefRx, FileRefRxConfig, FileRefVerdict, manifest_fingerprint};
+#[cfg(feature = "macos")]
+use xcontrol_clipboard::{ClipboardWatch, PlatformClipboard, open_platform_clipboard};
+use xcontrol_core::clip_plan::WIRE_CHUNK_LEN;
+use xcontrol_core::clock::{Clock, SystemClock};
+use xcontrol_core::file_ref::{
+    FileRefRx, FileRefRxConfig, FileRefVerdict, build_manifest, manifest_fingerprint,
+};
 use xcontrol_core::file_rx::{FileRx, FileRxAction, FileRxConfig};
 use xcontrol_core::file_serve::{FileServe, ServeVerdict};
 use xcontrol_core::file_tx::FileTx;
 use xcontrol_net::transport::TcpTransport;
 use xcontrol_net::{HandshakeThrottle, NetError, serve};
-use xcontrol_proto::file::{FileAck, FileBind, FileErrCode, FileError, FileMsg, FilePullReq};
-use xcontrol_proto::{FileRefAnnounce, Message as _, frame};
+#[cfg(feature = "macos")]
+use xcontrol_proto::FileEntryKind;
+use xcontrol_proto::file::{
+    FileAck, FileBind, FileChunk, FileEnd, FileErrCode, FileError, FileMsg, FilePullReq,
+};
+use xcontrol_proto::{FileEntry, FileRefAnnounce, Message as _, frame};
 
 /// 观测日志 target（文件域独立命名，诊断可分辨于剪贴板流量）。
 pub const TARGET: &str = "session::file";
@@ -63,6 +73,16 @@ pub struct FileHub {
     pending: Option<xcontrol_core::file_ref::PendingSlot>,
     /// 待发拉取请求（b-app 粘贴动作/测试写入；泵消费发出）。
     pull_request: Option<(u32, u32)>,
+    /// 本机清单对应的实际路径（与 outbound.entries 同序；b-平台：serve 分块
+    /// 发送按此打开文件——路径不出 wire、仅本机持有，docs/07 §9 元数据最小化）。
+    outbound_paths: Vec<PathBuf>,
+    /// 传输 id 分配器（每进程单调；拉取/通告双方独立命名空间）。
+    next_transfer_id: u32,
+    /// 挂板回环防线（docs/04 §8.2 写入自标记的文件域等价）：物化挂板后的清单
+    /// 指纹 + 时刻——本机检测在 2s 窗口内命中同指纹不重新通告（防 B 物化 →
+    /// B 检测 → 回传 A 的回环）。跨会话保留（防线不随会话失效）。
+    mounted_fp: Option<[u8; 16]>,
+    mounted_at_ms: u64,
     /// 拉取落盘累积（b-net 无磁盘面：WriteChunk 数据在 hub 暂存供测试/检查；
     /// b-app 改为直写暂存文件）。
     pub staged: Vec<(u32, u32, Vec<u8>)>,
@@ -135,6 +155,66 @@ impl FileHub {
         self.pull_request.take()
     }
 
+    /// 本机清单路径（serve 读取面）。
+    #[must_use]
+    pub fn outbound_paths(&self) -> &[PathBuf] {
+        &self.outbound_paths
+    }
+
+    /// 分配下一传输 id（单调）。
+    pub fn take_next_transfer_id(&mut self) -> u32 {
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
+        self.next_transfer_id
+    }
+
+    /// 本机剪贴板文件引用发布（b-平台检测面：manifest + 实际路径同记；挂板
+    /// 回环防线——2s 窗口内命中 mounted 指纹不发布）。
+    pub fn publish_local_manifest(
+        &mut self,
+        entries: Vec<FileEntry>,
+        paths: Vec<PathBuf>,
+        now_ms: u64,
+    ) {
+        let fingerprint = manifest_fingerprint(&entries);
+        if self.mounted_fp == Some(fingerprint)
+            && now_ms.saturating_sub(self.mounted_at_ms) <= MOUNT_ECHO_WINDOW_MS
+        {
+            tracing::debug!(target: TARGET,
+                "本机文件引用为刚物化的挂板回声（2s 窗口命中），不重新通告");
+            return;
+        }
+        let transfer_id = self.take_next_transfer_id();
+        let copied_at_ms = now_ms;
+        match build_manifest(
+            transfer_id,
+            LOCAL_ORIGIN_ID,
+            LOCAL_ORIGIN_SEQ,
+            entries,
+            copied_at_ms,
+        ) {
+            Ok(Some(announce)) => {
+                self.outbound_paths = paths;
+                self.publish_manifest(announce);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(target: TARGET, %error, "本机清单构建失败（超限/坏名），不发布");
+            }
+        }
+    }
+
+    /// 挂板回环防线指纹（诊断/测试）。
+    #[must_use]
+    pub fn mounted_fp(&self) -> Option<[u8; 16]> {
+        self.mounted_fp
+    }
+
+    /// 物化挂板登记（EntryVerified → write_file_urls 成功后调用）。
+    pub fn set_mounted(&mut self, fingerprint: [u8; 16], now_ms: u64) {
+        self.mounted_fp = Some(fingerprint);
+        self.mounted_at_ms = now_ms;
+    }
+
     /// 清空会话期状态（控制会话结束随行清理；跨会话不得残留旧对端清单）。
     pub fn reset_for_new_session(&mut self) {
         self.pending = None;
@@ -144,8 +224,27 @@ impl FileHub {
         self.failures.clear();
         self.outbound = None;
         self.outbound_fp = None;
+        self.outbound_paths.clear();
         self.session_minor = None;
     }
+}
+
+/// 挂板回声抑制窗口：2s（docs/04 §5 防线 1 时间窗的文件域等价）。
+const MOUNT_ECHO_WINDOW_MS: u64 = 2_000;
+/// 本机通告的占位 origin（wire 字段必填；回环防线在挂板指纹——origin 为本端
+/// 自分配固定值，代次去重对本端出站清单不适用）。
+const LOCAL_ORIGIN_ID: [u8; 16] = [0xA1; 16];
+const LOCAL_ORIGIN_SEQ: u32 = 1;
+/// 暂存目录：系统临时目录子目录（docs/07 §9 专用暂存面）。
+fn staging_dir() -> PathBuf {
+    std::env::temp_dir().join("xcontrol-file-transfer")
+}
+
+/// 暂存目录（集成测试可见性；生产代码用内部私有路径）。
+#[doc(hidden)]
+#[must_use]
+pub fn staging_dir_for_test() -> PathBuf {
+    staging_dir()
 }
 
 /// 进程级 hub 单例（同 [`crate::clip_rt::shared_echo`] 的 OnceLock 先例——
@@ -226,9 +325,26 @@ fn decode_file_channel_frames(stream: &[u8]) -> Result<Vec<FileMsg>, String> {
     Ok(msgs)
 }
 
+/// 源端服务流（真实分块发送，b-app 接线）：按 serve Grant 打开的文件 +
+/// 信用窗口驱动的读块面。
+struct ServingEntry {
+    transfer_id: u32,
+    entry: u32,
+    file: std::fs::File,
+    /// 剩余字节（Grant.remaining；读满即 FileEnd）。
+    remaining: u64,
+}
+
+/// 接收端暂存流（落盘面）：begin_pull 时建暂存文件，WriteChunk 顺序写入，
+/// EntryVerified 收尾挂板。
+struct StagingEntry {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
 /// 单条已建立文件通道的泵循环（双端共用）：入站（announce → pending 槽 /
-/// PullReq → serve 校验 → 文件服务 / Chunk → 组装）+ 出站拍（200ms：本机清单
-/// 推送、待发拉取、组装产出 Ack）+ 停止信号。
+/// PullReq → serve 校验 → 服务流 / Chunk → 暂存落盘）+ 出站拍（200ms：本机
+/// 清单推送、待发拉取、服务分块、超时判定、本机文件引用检测）+ 停止信号。
 ///
 /// 任何通道失败 → 泵退出（客户端 3s 退避重连，host 等客户端重拨）；hub 状态
 /// 跨重连存活（pending 槽与去重基线不随重建丢失）。
@@ -245,6 +361,11 @@ async fn run_file_pump(
     let mut tx = FileTx::new();
     let mut rx = FileRx::new(FileRxConfig::default(), SystemClock::new());
     let mut ref_rx = FileRefRx::new(FileRefRxConfig::default());
+    let mut serving: Option<ServingEntry> = None;
+    let mut staging: Option<StagingEntry> = None;
+    // 本机文件引用检测器（b-平台；mac 路径实测，其余平台按 docs/05 §0.2 随实装补齐）。
+    #[cfg(feature = "macos")]
+    let mut detector = LocalFileRefDetector::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut wire_buf = Vec::new();
@@ -265,7 +386,8 @@ async fn run_file_pump(
                         let mut violated = false;
                         for msg in msgs {
                             violated |= on_file_msg(
-                                msg, &mut serve, &mut tx, &mut rx, &mut ref_rx, &mut out,
+                                msg, &mut serve, &mut tx, &mut rx, &mut ref_rx,
+                                &mut serving, &mut staging, &mut out,
                             );
                         }
                         if violated {
@@ -293,14 +415,20 @@ async fn run_file_pump(
                 }
             },
 
-            // 出站拍：超时判定 + 本机清单推送 + 待发拉取。
+            // 出站拍：本机检测 / 清单推送 / 待发拉取 / 服务分块 / 超时判定。
             _ = ticker.tick() => {
                 let mut out = Vec::new();
-                // ① 接收端超时判定（空闲 10s / 总时长 30min → 条目软失败；
-                // on_tick 不产 Violation——记录面即可）
-                for action in rx.on_tick() {
-                    record_rx_action(action, &mut out, &mut serve, &mut tx);
+                let mut violated = false;
+
+                // ⑤ 本机文件引用检测（mac 实测路径；变化触发 → 清单发布）
+                #[cfg(feature = "macos")]
+                {
+                    let now_ms = SystemClock::new().now_ms();
+                    if let Some(detector) = detector.as_mut() {
+                        detector.poll(now_ms);
+                    }
                 }
+
                 // ② 本机清单推送（协商门控 + 指纹节流；announce 与 serve 注册
                 // 同拍——后续 PullReq 校验依据；hub 清单保留，重连后按指纹不重发，
                 // 新会话 reset 后重发）
@@ -320,7 +448,8 @@ async fn run_file_pump(
                         out.push(FileMsg::RefAnnounce(announce));
                     }
                 }
-                // ③ 待发拉取请求（size 取自 pending 槽清单；协商门控同面）
+
+                // ③ 待发拉取请求（size 取自 pending 槽清单；暂存文件同拍建立）
                 let pull = {
                     let mut hub = lock_hub();
                     hub.take_pull_request().filter(|_| hub.file_capable())
@@ -333,8 +462,28 @@ async fn run_file_pump(
                     match size {
                         Some(size) => {
                             rx.begin_pull(transfer_id, entry, size);
-                            // 发送侧条目流同拍开账（b-app 阶段承接真实分块发送）
+                            // 发送侧条目流同拍开账（本端作为源端的信用窗口记账）
                             let _ = tx.begin_entry(transfer_id, entry, size);
+                            // 暂存文件建立（docs/07 §9 专用暂存面；名字经 proto
+                            // 纯名校验——路径拼接无穿越分量）
+                            let staged_name = lock_hub()
+                                .pending()
+                                .and_then(|slot| slot.entries.get(entry as usize))
+                                .map(|entry| entry.name.clone());
+                            if let Some(name) = staged_name {
+                                let dir = staging_dir();
+                                let _ = std::fs::create_dir_all(&dir);
+                                let path = dir.join(format!("{transfer_id}-{entry}-{name}"));
+                                match std::fs::File::create(&path) {
+                                    Ok(file) => {
+                                        staging = Some(StagingEntry { file, path });
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(target: TARGET, %error,
+                                            "暂存文件创建失败（拉取继续，落盘面缺失）");
+                                    }
+                                }
+                            }
                             out.push(FileMsg::PullReq(FilePullReq {
                                 transfer_id,
                                 entry,
@@ -345,6 +494,100 @@ async fn run_file_pump(
                             "拉取请求越界：transfer {transfer_id} entry {entry}（pending 槽无此条目）"
                         )),
                     }
+                }
+
+                // ④ 源端服务分块泵（信用窗口内逐块读文件 → blake3 → 出站；
+                // 发满即 FileEnd；Ack 在后续入站拍归还信用，窗口空则本拍停发）
+                while serving.is_some() && tx.can_send() {
+                    let Some(stream) = serving.as_mut() else {
+                        unreachable!("循环条件已保证");
+                    };
+                    use std::io::Read as _;
+                    let read_to = stream.remaining.min(WIRE_CHUNK_LEN as u64) as usize;
+                    let mut data = vec![0u8; read_to];
+                    match stream.file.read(&mut data) {
+                        Ok(0) => {
+                            // 文件提前 EOF（拉取后文件被截断）：条目级软失败
+                            lock_hub().failures.push(format!(
+                                "transfer {} entry {}：源文件提前 EOF（可能已被修改），可重试",
+                                stream.transfer_id, stream.entry
+                            ));
+                            let transfer_id = stream.transfer_id;
+                            let entry = stream.entry;
+                            out.push(FileMsg::Error(FileError {
+                                transfer_id,
+                                entry: Some(entry),
+                                code: FileErrCode::SIZE_MISMATCH,
+                            }));
+                            serving = None;
+                            serve.release(transfer_id);
+                            tx.reset();
+                            break;
+                        }
+                        Ok(read_len) => {
+                            data.truncate(read_len);
+                            stream.remaining -= read_len as u64;
+                            // next_seq/on_chunk_sent 在「流活跃 + 窗口有余」前置下
+                            // 不可失败；失败即内部不变量破坏 → 按违规断通道。
+                            let Some(seq) = tx.next_seq() else {
+                                tracing::warn!(target: TARGET,
+                                    "服务流 seq 缺失（内部不变量破坏，断开）");
+                                violated = true;
+                                break;
+                            };
+                            if let Err(error) = tx.on_chunk_sent(seq, &data) {
+                                tracing::warn!(target: TARGET, %error,
+                                    "服务流记账越界（内部不变量破坏，断开）");
+                                violated = true;
+                                break;
+                            }
+                            let transfer_id = stream.transfer_id;
+                            let entry = stream.entry;
+                            out.push(FileMsg::Chunk(FileChunk {
+                                transfer_id,
+                                seq,
+                                data,
+                            }));
+                            if stream.remaining == 0 {
+                                out.push(FileMsg::End(FileEnd {
+                                    transfer_id,
+                                    entry,
+                                    blake3: tx.end_digest(),
+                                }));
+                                let _ = tx.take_stream();
+                                serve.release(transfer_id);
+                                serving = None;
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: TARGET, %error, "源文件读取失败（条目级软错误）");
+                            let transfer_id = stream.transfer_id;
+                            let entry = stream.entry;
+                            out.push(FileMsg::Error(FileError {
+                                transfer_id,
+                                entry: Some(entry),
+                                code: FileErrCode::NOT_FOUND,
+                            }));
+                            serving = None;
+                            serve.release(transfer_id);
+                            tx.reset();
+                            break;
+                        }
+                    }
+                }
+
+                // ① 接收端超时判定（空闲 10s / 总时长 30min → 条目软失败；
+                // on_tick 不产 Violation——记录面即可）
+                for action in rx.on_tick() {
+                    violated |= record_rx_action(
+                        action, &mut out, &mut serve, &mut tx, &mut staging,
+                    );
+                }
+
+                // 违规断开文件通道（独立连接语义；控制/剪贴板不受影响）
+                if violated {
+                    break;
                 }
                 if !out.is_empty()
                     && send_file_frames(&mut transport, out, &mut wire_seq)
@@ -361,12 +604,15 @@ async fn run_file_pump(
 }
 
 /// 单条入站文件域消息处理（返回违规标志：true = 断开文件通道）。
+#[allow(clippy::too_many_arguments)]
 fn on_file_msg(
     msg: FileMsg,
     serve: &mut FileServe,
     tx: &mut FileTx,
     rx: &mut FileRx<SystemClock>,
     ref_rx: &mut FileRefRx,
+    serving: &mut Option<ServingEntry>,
+    staging: &mut Option<StagingEntry>,
     out: &mut Vec<FileMsg>,
 ) -> bool {
     match msg {
@@ -384,21 +630,31 @@ fn on_file_msg(
                 false
             }
         },
-        // 拉流面（源端角色）：PullReq 校验 → 文件服务。b-net 阶段无磁盘读取面
-        // ——回条目级软错误（可重试），待 b-app 接入读取/分块。
+        // 拉流面（源端角色）：PullReq 校验 → 服务流建立（真实文件读取，b-app
+        // 接线）。路径在本端 hub（docs/07 §9：路径不出 wire、源端私有映射）。
         FileMsg::PullReq(req) => match serve.on_pull(&req) {
             ServeVerdict::Grant {
-                transfer_id, entry, ..
+                transfer_id,
+                entry,
+                offset,
+                remaining,
             } => {
-                tracing::warn!(target: TARGET, transfer_id, entry,
-                    "文件服务未接线（b-app 待落地）：回 FileError{{SOURCE_GONE}}");
-                out.push(FileMsg::Error(FileError {
-                    transfer_id,
-                    entry: Some(entry),
-                    code: FileErrCode::SOURCE_GONE,
-                }));
-                serve.release(transfer_id);
-                false
+                match open_serving(transfer_id, entry, offset, remaining) {
+                    Ok(stream) => {
+                        *serving = Some(stream);
+                        false
+                    }
+                    Err(code) => {
+                        // 路径查无/打开失败：条目级软错误（可重试，不断连）
+                        out.push(FileMsg::Error(FileError {
+                            transfer_id,
+                            entry: Some(entry),
+                            code,
+                        }));
+                        serve.release(transfer_id);
+                        false
+                    }
+                }
             }
             ServeVerdict::Violation { reason } => {
                 tracing::warn!(target: TARGET, reason,
@@ -410,28 +666,28 @@ fn on_file_msg(
         FileMsg::Chunk(chunk) => {
             let mut violated = false;
             for action in rx.on_chunk(&chunk) {
-                violated |= record_rx_action(action, out, serve, tx);
+                violated |= record_rx_action(action, out, serve, tx, staging);
             }
             violated
         }
         FileMsg::End(end) => {
             let mut violated = false;
             for action in rx.on_end(&end) {
-                violated |= record_rx_action(action, out, serve, tx);
+                violated |= record_rx_action(action, out, serve, tx, staging);
             }
             violated
         }
         FileMsg::Error(error) => {
             let mut violated = false;
             for action in rx.on_error(&error) {
-                violated |= record_rx_action(action, out, serve, tx);
+                violated |= record_rx_action(action, out, serve, tx, staging);
             }
             violated
         }
         FileMsg::Cancel(cancel) => {
             let mut violated = false;
             for action in rx.on_cancel(&cancel) {
-                violated |= record_rx_action(action, out, serve, tx);
+                violated |= record_rx_action(action, out, serve, tx, staging);
             }
             violated
         }
@@ -450,8 +706,7 @@ fn on_file_msg(
                 false
             }
         }
-        // 信用归还（源端角色）——b-net 无出站块，多余 Ack 无状态影响（on_ack
-        // 未知 seq 返回 false，忽略）。
+        // 信用归还（源端角色）：窗口放行下一批分块（tick ④ 消化）。
         FileMsg::Ack(ack) => {
             let _ = tx.on_ack(ack.seq);
             false
@@ -459,36 +714,108 @@ fn on_file_msg(
     }
 }
 
-/// 接收端动作落位：Ack → 出站；WriteChunk/Verified/Failed → hub 记录；
+/// 服务流建立：按 hub 本机清单路径打开文件（transfer 匹配 + 下标合法；
+/// offset 定位）。失败返回条目级错误码（`FileError` 载荷）。
+fn open_serving(
+    transfer_id: u32,
+    entry: u32,
+    offset: u64,
+    remaining: u64,
+) -> Result<ServingEntry, FileErrCode> {
+    let hub = lock_hub();
+    let matches_current = hub
+        .outbound()
+        .is_some_and(|announce| announce.transfer_id == transfer_id);
+    let path = if matches_current {
+        hub.outbound_paths().get(entry as usize).cloned()
+    } else {
+        None
+    };
+    drop(hub);
+    let Some(path) = path else {
+        return Err(FileErrCode::NOT_FOUND);
+    };
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Err(FileErrCode::NOT_FOUND);
+    };
+    // 拉取时 re-stat（docs/04 §8.4：源文件消失/截断 → 条目级错误）
+    let Ok(meta) = file.metadata() else {
+        return Err(FileErrCode::NOT_FOUND);
+    };
+    let size = meta.len();
+    if offset + remaining > size {
+        return Err(FileErrCode::SIZE_MISMATCH);
+    }
+    use std::io::Seek;
+    if file.seek(std::io::SeekFrom::Start(offset)).is_err() {
+        return Err(FileErrCode::NOT_FOUND);
+    }
+    Ok(ServingEntry {
+        transfer_id,
+        entry,
+        file,
+        remaining,
+    })
+}
+
+/// 接收端动作落位：Ack → 出站；WriteChunk → 暂存落盘；Verified → 全条目完成
+/// 即挂板（多文件按序全量挂，单文件即单挂）+ 挂板回环防线登记；Failed → 记录；
 /// Violation → 返回 true（调用方断开文件通道）。
 fn record_rx_action(
     action: FileRxAction,
     out: &mut Vec<FileMsg>,
     serve: &mut FileServe,
     tx: &mut FileTx,
+    staging: &mut Option<StagingEntry>,
 ) -> bool {
     match action {
         FileRxAction::SendAck { seq } => {
             out.push(FileMsg::Ack(FileAck { seq }));
             false
         }
-        FileRxAction::WriteChunk {
-            transfer_id,
-            entry,
-            data,
-        } => {
-            lock_hub().staged.push((transfer_id, entry, data));
+        FileRxAction::WriteChunk { data, .. } => {
+            match staging.as_mut() {
+                Some(entry) => {
+                    use std::io::Write;
+                    if let Err(error) = entry.file.write_all(&data) {
+                        tracing::warn!(target: TARGET, %error,
+                            "暂存写入失败（条目继续，挂板面缺失）");
+                    }
+                }
+                None => {
+                    tracing::warn!(target: TARGET, "无暂存流收到 chunk（begin_pull 未建立暂存面）");
+                }
+            }
             false
         }
         FileRxAction::EntryVerified { transfer_id, entry } => {
-            lock_hub().verified.push((transfer_id, entry));
+            let (staged_path, total_entries) = {
+                let mut hub = lock_hub();
+                let staged_path = staging.as_ref().map(|s| s.path.clone());
+                let total = hub.pending().map_or(0, |slot| slot.entries.len());
+                hub.verified.push((transfer_id, entry));
+                (staged_path, total)
+            };
             serve.release(transfer_id);
-            // 条目流收尾（发满才 Verified；take 失败即 reset 兜底）
             if tx.should_end() {
                 let _ = tx.take_stream();
             } else {
                 tx.reset();
             }
+            if let Some(staged) = staging.take() {
+                drop(staged.file); // 落盘句柄收尾（write_all 已刷入 OS 页缓存）
+                // 全条目完成才挂板（多文件按 pending 顺序全量挂——与 Finder
+                // 多选复制语义对齐；部分完成继续等后续条目）
+                let done = lock_hub()
+                    .verified
+                    .iter()
+                    .filter(|(tid, _)| *tid == transfer_id)
+                    .count();
+                if done >= total_entries && total_entries > 0 {
+                    mount_staged(transfer_id);
+                }
+            }
+            let _ = staged_path;
             false
         }
         FileRxAction::EntryFailed {
@@ -501,12 +828,134 @@ fn record_rx_action(
                 .push(format!("transfer {transfer_id}：{reason}"));
             serve.release(transfer_id);
             tx.reset();
+            *staging = None; // 暂存流随条目失败废弃（可重试语义：重新拉取重建）
             false
         }
         FileRxAction::Violation { reason } => {
             tracing::warn!(target: TARGET, reason, "文件通道接收端违规（断开）");
             true
         }
+    }
+}
+
+/// 挂板（b-平台写路径，mac 实测；其余平台待实装——暂存文件已就绪，路径提示）。
+fn mount_staged(transfer_id: u32) {
+    let pending_entries = lock_hub()
+        .pending()
+        .filter(|slot| slot.transfer_id == transfer_id)
+        .map(|slot| slot.entries.clone());
+    let Some(entries) = pending_entries else {
+        return;
+    };
+    let dir = staging_dir();
+    let paths: Vec<PathBuf> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| dir.join(format!("{transfer_id}-{index}-{}", entry.name)))
+        .collect();
+    let fingerprint = manifest_fingerprint(&entries);
+    let now_ms = SystemClock::new().now_ms();
+    mount_paths(&paths, fingerprint, now_ms);
+}
+
+/// 平台挂板（docs/05 §0.2「挂板」列；mac = write_file_urls 实测路径）。
+#[cfg(feature = "macos")]
+fn mount_paths(paths: &[PathBuf], fingerprint: [u8; 16], now_ms: u64) {
+    // 存在性过滤（暂存面写失败的条目剔除，防把空壳路径挂上剪贴板）
+    let existing: Vec<PathBuf> = paths.iter().filter(|path| path.exists()).cloned().collect();
+    if existing.is_empty() {
+        tracing::warn!(target: TARGET, "挂板面为空（暂存文件缺失），跳过");
+        return;
+    }
+    match open_platform_clipboard().and_then(|mut clipboard| clipboard.write_file_urls(&existing)) {
+        Ok(_) => {
+            lock_hub().set_mounted(fingerprint, now_ms);
+            tracing::info!(target: TARGET, count = existing.len(),
+                "文件已物化并挂上本机剪贴板（可直接粘贴）");
+        }
+        Err(error) => {
+            tracing::warn!(target: TARGET, %error, "文件挂板失败（文件已暂存，可手动复制）");
+        }
+    }
+}
+
+/// 非 mac 平台：挂板路径未实装（docs/05 §0.2 挂板列 pending——win CF_HDROP /
+/// x11 uri-list / wayland mime 随平台实装补齐）；文件已暂存，路径留提示。
+#[cfg(not(feature = "macos"))]
+fn mount_paths(paths: &[PathBuf], _fingerprint: [u8; 16], _now_ms: u64) {
+    tracing::warn!(target: TARGET,
+        paths = ?paths,
+        "本平台挂板未实装（docs/05 §0.2）：文件已暂存于 {:?}",
+        staging_dir());
+}
+
+// ============================================================
+// 本机文件引用检测器（b-平台检测面，mac 实测路径；其余平台随实装补齐）
+// ============================================================
+
+/// changeCount 基线 + 按变化读 file URLs → 清单发布（挂板回环防线在
+/// hub.publish_local_manifest 内）。
+#[cfg(feature = "macos")]
+struct LocalFileRefDetector {
+    clipboard: PlatformClipboard,
+    seen: u64,
+}
+
+#[cfg(feature = "macos")]
+impl LocalFileRefDetector {
+    fn new() -> Option<Self> {
+        match open_platform_clipboard() {
+            Ok(clipboard) => {
+                let seen = clipboard.change_count();
+                Some(Self { clipboard, seen })
+            }
+            Err(error) => {
+                tracing::warn!(target: TARGET, %error, "文件引用检测器初始化失败（检测面停用）");
+                None
+            }
+        }
+    }
+
+    fn poll(&mut self, now_ms: u64) {
+        if !self.clipboard.has_changes_since(self.seen) {
+            return;
+        }
+        self.seen = self.clipboard.change_count();
+        let Ok(Some(paths)) = self.clipboard.read_file_urls(FileRefAnnounce::MAX_ENTRIES) else {
+            return; // 无文件引用（文本/图片剪贴板）：文件域静默
+        };
+        // stat → 清单条目（不存在/读取失败的条目剔除——发送面只服务可得文件）
+        let mut entries: Vec<FileEntry> = Vec::new();
+        let mut valid: Vec<PathBuf> = Vec::new();
+        for path in paths {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let mtime_ms = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+            entries.push(FileEntry {
+                name: name.to_string_lossy().into_owned(),
+                size: meta.len(),
+                mtime_ms,
+                kind: if meta.is_dir() {
+                    FileEntryKind::Dir
+                } else {
+                    FileEntryKind::File
+                },
+                children: 0,
+            });
+            valid.push(path);
+        }
+        if entries.is_empty() {
+            return;
+        }
+        lock_hub().publish_local_manifest(entries, valid, now_ms);
     }
 }
 

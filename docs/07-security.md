@@ -89,3 +89,30 @@
 - [x] 安全码钥匙串存储三平台实测；日志/诊断包脱敏抽查——**实测证据**：mac 本机 `cargo test -p xcontrol-config --features keychain -- --ignored keychain_live` PASS（真实 login keychain 写入/读取/覆盖写/删除 + 幂等 + file 后端对照一致）；win/linux 编译级（`cargo check --target` 两 target 查树无 tokio/无红线树增量）+ linux 实测移交（lsdark-eos 本次不可达，探测配方：`busctl --user status org.freedesktop.secrets`，Secret Service 兼容层 = kwalletd/gnome-keyring）。日志脱敏：`SecretCode` Debug 恒 `[REDACTED]`（secret.rs 红线测试）、错误类型不携带秘密（error-handling.md 红线 6）。
 - [x] 剪贴板超限/超时/乱序 fuzz 用例全部断开而非崩溃——**实测证据**：`cargo +nightly fuzz run frame_decode / clip_announce -- -max_total_time=30`（M1 遗留 fuzz 实跑收口，2026-11-20；两 target 各 30s 零 crash/零 hang，覆盖率/执行统计见 fuzz 输出）。
 - [x] 威胁模型表逐行复核（§1）与 ADR-0002/0003 无冲突——复核记录：被动嗅探（Noise 全流量密文，第 3 项证据）；主动中间人（XXpsk0 无正确码不完成握手）；伪造主控（多主控候选 FR-5.5 用户确认 + 记忆——本任务实装，错码软排除用户可见）；伪造从机（白名单 FR-5.4 本任务实装 + 握手限速）；离线爆破者（无 oracle 原则 §2 不变，限速键 = 来源 IP 回归测试在列）；本机恶意软件（钥匙串实装后 mac 凭据受 ACL 保护，file 回退 0600）。ADR-0002（传输/发现选型）与 ADR-0003（平台输入路径）无新增冲突；keyring 引入经 xtask 白名单登记（config `keychain` feature 门控）。
+
+## 9. 文件传输面安全（FR-7.3，XCP 1.2+，规划——[ADR-0004](adr/0004-file-transfer-channel-and-materialization.md)）
+
+文件通道（[02-protocol.md](02-protocol.md) §4.6）把"对端可触达本机文件系统"变成协议能力，
+威胁面与剪贴板本质不同，红线如下：
+
+1. **条目索引寻址（最高红线）**：拉取请求只含 `transfer_id + entry 下标 (+offset)`，
+   任何帧不得携带路径；下标 → 本机路径映射完全由源端私有维护，源端只服务**本会话
+   已通告/已展开**的下标，未知 `transfer_id` / 越界下标 = 协议违规断开——杜绝对端
+   构造请求读取任意文件（等价于把全盘读权限交给对端）。
+2. **元数据最小化**：清单只含条目名（相对名）/大小/mtime/树形计数，不含绝对路径；
+   接收端用户界面呈现的来源路径仅限清单内相对结构。
+3. **清单与条目上限**（接收端校验，信任边界在接收端，§6 原则沿用）：条目数/清单
+   字节/总字节/名称长度上限（[02-protocol.md](02-protocol.md) §4.6 防护规则 1）；
+   `FileExpand` 下标连续性校验。
+4. **磁盘耗尽防护**：接收端拉流前做剩余空间预检；总字节超用户阈值（可配，默认
+   512MiB）需显式确认（UI），拒绝即不发起拉取；暂存区专用子目录，物化完成/取消
+   后清理，不与用户目录混淆。
+5. **协议面防护沿用**：文件域帧同样受 Noise 加密、帧长上限、逐帧校验约束；
+   transfer 并发上限（≤4/连接）、分块空闲超时与总时长上限防资源占用（§4.6 防护
+   规则 4/6）；文件通道故障只影响文件域（§4.6 域隔离）。
+6. **敏感文件不外发**：源端剪贴板文件引用若来自密码管理器等 Concealed 标记上下文
+   ——文件引用格式本身无此标记（剪贴板敏感格式过滤为剪贴板域 P1 项，§5），v1 不
+   做源端文件级敏感判定，依赖"接收端粘贴动作显式发起"的同意模型：**粘贴即授权**
+   （元数据清单到达 ≠ 内容传输；无粘贴动作零字节出站）。
+7. **发布自查**：本节随 FR-7.3 实装切片纳入 §8 门禁（新增"越界下标 fuzz 断开 +
+   索引寻址红线测试"两项），实装前不勾选。

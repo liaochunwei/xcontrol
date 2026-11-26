@@ -74,6 +74,9 @@ pub mod clip_rx;
 pub mod clip_tx;
 pub mod clock;
 pub mod file_ref;
+pub mod file_rx;
+pub mod file_serve;
+pub mod file_tx;
 pub mod hotkey;
 pub mod layout;
 pub mod mapping;
@@ -90,6 +93,11 @@ pub use clock::{Clock, SystemClock, TestClock};
 pub use file_ref::{
     FileRefRx, FileRefRxConfig, FileRefVerdict, PendingSlot, build_manifest, manifest_fingerprint,
 };
+pub use file_rx::{
+    FILE_IDLE_TIMEOUT_MS, FILE_TOTAL_DURATION_CAP_MS, FileRx, FileRxAction, FileRxConfig,
+};
+pub use file_serve::{FileServe, MAX_ACTIVE_TRANSFERS, ServeVerdict};
+pub use file_tx::{FileTx, INITIAL_FILE_CREDIT_CHUNKS};
 pub use hotkey::{
     FilterOutcome, HotkeyCombo, HotkeyError, HotkeyFilter, HotkeyId, HotkeySet, ModFamilies,
 };

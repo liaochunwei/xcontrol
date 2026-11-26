@@ -315,7 +315,7 @@ enum  FileEntryKind    { File = 0, Dir = 1 }
 struct FilePullReq     { transfer_id: u32, entry: u32, offset: u64 }
 struct FileChunk       { transfer_id: u32, seq: u32, data: Vec<u8> } // data.len() ≤ 64KiB；发送有效分块 65472B（同 §6.2 物理上限推导）
 struct FileAck         { seq: u32 }
-struct FileEnd         { transfer_id: u32, entry: u32, blake3: [u8; 32] }
+struct FileEnd         { transfer_id: u32, entry: u32, blake3: [u8; 32] }   // 摘要覆盖本次传输区间：全量拉取 = 整条目；offset 续传区间 = 该区间（边流边算）
 struct FileError       { transfer_id: u32, entry: Option<u32>, code: FileErrCode }
 struct FileCancel      { transfer_id: u32 }
 struct FileExpand      { transfer_id: u32, parent: u32, base: u32, entries: Vec<FileEntry> } // 子清单：全局下标自 base 起连续分配

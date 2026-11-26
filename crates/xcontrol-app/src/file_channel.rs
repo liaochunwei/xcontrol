@@ -28,7 +28,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::watch;
-#[cfg(feature = "macos")]
+#[cfg(any(feature = "macos", feature = "wayland"))]
 use xcontrol_clipboard::{ClipboardWatch, PlatformClipboard, open_platform_clipboard};
 use xcontrol_core::clip_plan::WIRE_CHUNK_LEN;
 use xcontrol_core::clock::{Clock, SystemClock};
@@ -626,8 +626,9 @@ async fn run_file_pump(
     let mut staging: Option<StagingEntry> = None;
     // 等待对端 Expand（Dir 拉取已发 PullReq；10s 无响应按条目失败收敛）
     let mut awaiting_expand: Option<(u32, tokio::time::Instant)> = None;
-    // 本机文件引用检测器（b-平台；mac 路径实测，其余平台按 docs/05 §0.2 随实装补齐）。
-    #[cfg(feature = "macos")]
+    // 本机文件引用检测器（b-平台；mac/wayland 面实装——wayland 为 mime 直通
+    // 同构路径；x11/win 按 docs/05 §0.2 随平台实机实装补齐）。
+    #[cfg(any(feature = "macos", feature = "wayland"))]
     let mut detector = LocalFileRefDetector::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -685,7 +686,7 @@ async fn run_file_pump(
                 let mut violated = false;
 
                 // ⑤ 本机文件引用检测（mac 实测路径；变化触发 → 清单发布）
-                #[cfg(feature = "macos")]
+                #[cfg(any(feature = "macos", feature = "wayland"))]
                 {
                     let now_ms = SystemClock::new().now_ms();
                     if let Some(detector) = detector.as_mut() {
@@ -1320,8 +1321,9 @@ fn mount_list(paths: &[PathBuf], why: &str) {
     mount_paths(paths, fingerprint, now_ms);
 }
 
-/// 平台挂板（docs/05 §0.2「挂板」列；mac = write_file_urls 实测路径）。
-#[cfg(feature = "macos")]
+/// 平台挂板（docs/05 §0.2「挂板」列；mac = NSURL 实测路径，wayland =
+/// text/uri-list mime 直通；x11/win 待实装）。
+#[cfg(any(feature = "macos", feature = "wayland"))]
 fn mount_paths(paths: &[PathBuf], fingerprint: [u8; 16], now_ms: u64) {
     // 存在性过滤（暂存面写失败的条目剔除，防把空壳路径挂上剪贴板）
     let existing: Vec<PathBuf> = paths.iter().filter(|path| path.exists()).cloned().collect();
@@ -1343,9 +1345,9 @@ fn mount_paths(paths: &[PathBuf], fingerprint: [u8; 16], now_ms: u64) {
     }
 }
 
-/// 非 mac 平台：挂板路径未实装（docs/05 §0.2 挂板列 pending——win CF_HDROP /
-/// x11 uri-list / wayland mime 随平台实装补齐）；文件已暂存，路径留提示。
-#[cfg(not(feature = "macos"))]
+/// 非 mac/wayland 平台：挂板路径未实装（docs/05 §0.2 挂板列 pending——
+/// win CF_HDROP / x11 uri-list 随平台实机实装补齐）；文件已暂存，路径留提示。
+#[cfg(not(any(feature = "macos", feature = "wayland")))]
 fn mount_paths(paths: &[PathBuf], _fingerprint: [u8; 16], _now_ms: u64) {
     tracing::warn!(target: TARGET,
         paths = ?paths,
@@ -1359,13 +1361,13 @@ fn mount_paths(paths: &[PathBuf], _fingerprint: [u8; 16], _now_ms: u64) {
 
 /// changeCount 基线 + 按变化读 file URLs → 清单发布（挂板回环防线在
 /// hub.publish_local_manifest 内）。
-#[cfg(feature = "macos")]
+#[cfg(any(feature = "macos", feature = "wayland"))]
 struct LocalFileRefDetector {
     clipboard: PlatformClipboard,
     seen: u64,
 }
 
-#[cfg(feature = "macos")]
+#[cfg(any(feature = "macos", feature = "wayland"))]
 impl LocalFileRefDetector {
     fn new() -> Option<Self> {
         match open_platform_clipboard() {

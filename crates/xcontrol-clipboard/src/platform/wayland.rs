@@ -85,12 +85,14 @@
 //!   上抛，上层提示降级（ashpd portal 为移交项）。
 
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use url::Url;
 use wl_clipboard_rs::copy::{
     self as copy_api, MimeSource, MimeType as CopyMimeType, Options as CopyOptions, Source,
 };
@@ -103,13 +105,16 @@ use wl_clipboard_rs::watch::{self as watch_api, CancelHandle};
 use crate::error::ClipboardError;
 use crate::{
     ClipFormatPayload, ClipboardContent, ClipboardWatch, FormatRead, WrittenMark,
-    fingerprint_content, format_read_from,
+    fingerprint_bytes, fingerprint_content, format_read_from,
 };
 
 /// `text/plain;charset=utf-8`（docs/04 §2 线格式 mime；KDE/wlroots 通用）。
 const MIME_TEXT: &str = "text/plain;charset=utf-8";
 /// `image/png`（docs/04 §2 图片交换唯一必选格式）。
 const MIME_PNG: &str = "image/png";
+/// 文件引用清单 mime（FR-7.3，docs/05 §0.2；URI 列表 = 行分隔 `file://` URL，
+/// 注释行以 `#` 开头——X11/GNOME/KDE 通用约定）。
+const MIME_URI_LIST: &str = "text/uri-list";
 /// `text/html`（docs/04 §2 HTML fragment）。
 const MIME_HTML: &str = "text/html";
 
@@ -142,6 +147,101 @@ impl WaylandClipboard {
     }
 
     /// 启动 data-control 监听线程（与 `self` 共享变化计数；docs/04 §4 Wayland
+    /// 写入文件引用清单（FR-7.3 挂板面，docs/05 §0.2；2026-11-27 b-平台补齐）：
+    /// URI 列表（行分隔 `file://` URL）→ `text/uri-list` mime **直通**（零转换，
+    /// 同 PNG 路径——模块文档）。
+    ///
+    /// 路径 → `file://` URL 编码经 `Url::from_file_path`（percent-encoding 由
+    /// url crate 承担——中文/空格名安全）。
+    ///
+    /// # Errors
+    /// [`ClipboardError::Platform`]：空清单 / Wayland 复制失败。
+    pub fn write_file_urls(&mut self, paths: &[PathBuf]) -> Result<WrittenMark, ClipboardError> {
+        if paths.is_empty() {
+            return Err(ClipboardError::Platform {
+                action: "clipboard-write-file-urls",
+                reason: "空清单（无文件引用可挂板）".into(),
+            });
+        }
+        let mut uri_list = String::new();
+        let mut canonical: Vec<(String, bool)> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let url = Url::from_file_path(path).map_err(|()| ClipboardError::Platform {
+                action: "clipboard-write-file-urls",
+                reason: format!("非绝对路径无法转 file URL：{}", path.display()),
+            })?;
+            uri_list.push_str(url.as_str());
+            uri_list.push('\n');
+            canonical.push((path.to_string_lossy().into_owned(), path.is_dir()));
+        }
+        self.copy_bytes(
+            uri_list.as_bytes(),
+            MIME_URI_LIST,
+            "clipboard-write-file-urls",
+        )?;
+        let mut digest_input = Vec::new();
+        for (path, is_dir) in &canonical {
+            digest_input.extend_from_slice(&path.len().to_le_bytes());
+            digest_input.extend_from_slice(path.as_bytes());
+            digest_input.push(u8::from(*is_dir));
+        }
+        let change_count = self.counter.load(Ordering::Relaxed);
+        Ok(WrittenMark {
+            fingerprint: fingerprint_bytes(&digest_input),
+            change_count,
+            written_at: Instant::now(),
+        })
+    }
+
+    /// 读取文件引用清单（FR-7.3 检测面，docs/05 §0.2）：`text/uri-list` mime
+    /// 直通读回 → 解析 `file://` URL → 本机路径。无该 mime → `Ok(None)` 常态。
+    /// 超过 `max_entries` 截断（docs/02 §4.6 防护规则 1 的平台侧配合）。
+    ///
+    /// # Errors
+    /// [`ClipboardError::Platform`]：Wayland 连接失败 / URL 解析失败。
+    pub fn read_file_urls(
+        &mut self,
+        max_entries: usize,
+    ) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+        let bytes = match Self::paste_bytes(
+            PasteMimeType::Specific(MIME_URI_LIST),
+            u64::MAX,
+            "clipboard-read-file-urls",
+        ) {
+            Ok(bytes) => bytes,
+            Err(ClipboardError::Platform { reason, .. }) if reason == "CLIPBOARD_EMPTY" => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut paths = Vec::new();
+        for line in String::from_utf8_lossy(&bytes.unwrap_or_default()).lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue; // 注释行（uri-list 规范允许）
+            }
+            let Ok(url) = Url::parse(line) else {
+                continue; // 非 URL 行：跳过（uri-list 允许注释外文本行）
+            };
+            if url.scheme() != "file" {
+                continue;
+            }
+            match url.to_file_path() {
+                Ok(path) => {
+                    paths.push(path);
+                    if paths.len() >= max_entries {
+                        break;
+                    }
+                }
+                Err(()) => continue, // 非 file 形态（远程 URL 等）：跳过
+            }
+        }
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(paths))
+    }
+
     /// 监听路径）。
     ///
     /// # Errors
@@ -563,7 +663,7 @@ pub fn clipboard_mime_types() -> Result<Vec<String>, ClipboardError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::path::PathBuf;
 
     use xcontrol_proto::clip::ClipAnnounce;
 

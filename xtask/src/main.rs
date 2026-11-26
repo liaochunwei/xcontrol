@@ -241,6 +241,10 @@ const RED_LINE_ALLOWED_DEPS: &[(&str, &[&str])] = &[
             "x11rb",
             "png",
             "wl-clipboard-rs",
+            // 11-27-file-dirs（FR-7.3 b-平台 wayland 面）：text/uri-list 的
+            // file URL percent-encoding/解析（RFC 8089）——url crate（已在
+            // gpui 传递树中，零新增编译面）
+            "url",
         ],
     ),
     (

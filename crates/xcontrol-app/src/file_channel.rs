@@ -60,6 +60,32 @@ pub const FILE_MIN_MINOR: u8 = 2;
 // hub：跨重连/双端共享的文件域状态（进程级单例）
 // ============================================================
 
+/// 拉取会话记账（进度/部分成功/取消判定面）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullSession {
+    /// 会话所属传输。
+    pub transfer_id: u32,
+    /// 清单条目总数。
+    pub total: usize,
+    /// 已校验成功条目数。
+    pub ok: usize,
+    /// 已失败条目数。
+    pub failed: usize,
+    /// 已成功条目的暂存路径（挂板顺序 = pending 顺序；失败条目不入列）。
+    pub staged: Vec<PathBuf>,
+}
+
+/// 文件域配置上限（config `[file_transfer]` → hub 装配面）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// 单清单总字节上限（发送端不发布超限清单；接收端超限拒绝）。
+    pub max_bytes: u64,
+    /// 确认阈值（超过需二次点击；0 = 恒需确认关闭面）。
+    pub confirm_threshold_bytes: u64,
+    /// 文件传输启用面（关闭 = 不发布/不拉取）。
+    pub enabled: bool,
+}
+
 /// 文件域共享状态（进程级单例，[`file_hub`] 取用；同 clip 的 shared_echo 先例）。
 #[derive(Debug, Default)]
 pub struct FileHub {
@@ -81,6 +107,14 @@ pub struct FileHub {
     outbound_paths: Vec<PathBuf>,
     /// 传输 id 分配器（每进程单调；拉取/通告双方独立命名空间）。
     next_transfer_id: u32,
+    /// 拉取会话（切片 d：进度/部分成功/取消的记账面；None = 空闲）。
+    pub session: Option<PullSession>,
+    /// 取消请求（托盘「取消文件传输」入口；泵消费后本地收尾 + 对端 Cancel 帧）。
+    cancel_requested: bool,
+    /// 确认武装（超阈值二次点击语义：第一次点击置位，第二次点击执行拉取）。
+    confirm_armed: bool,
+    /// 配置上限（session_rt 装配点写入；None = 协议默认）。
+    limits: Option<Limits>,
     /// 挂板回环防线（docs/04 §8.2 写入自标记的文件域等价）：物化挂板后的清单
     /// 指纹 + 时刻——本机检测在 2s 窗口内命中同指纹不重新通告（防 B 物化 →
     /// B 检测 → 回传 A 的回环）。跨会话保留（防线不随会话失效）。
@@ -208,6 +242,16 @@ impl FileHub {
                 "本机文件引用为刚物化的挂板回声（2s 窗口命中），不重新通告");
             return;
         }
+        // 配置面（切片 d R4）：总字节超上限 → 不发布（发送端自律）
+        let max_bytes = self
+            .limits
+            .map_or(FileRefAnnounce::DEFAULT_MAX_TOTAL_BYTES, |l| l.max_bytes);
+        let total: u64 = entries.iter().map(|entry| entry.size).sum();
+        if total > max_bytes {
+            tracing::warn!(target: TARGET, total, max_bytes,
+                "本机清单超配置上限（不发布）");
+            return;
+        }
         let transfer_id = self.take_next_transfer_id();
         let copied_at_ms = now_ms;
         match build_manifest(
@@ -248,6 +292,99 @@ impl FileHub {
         self.pull_request = None;
     }
 
+    /// 拉取会话记账面（None = 空闲；托盘进度投影源）。
+    #[must_use]
+    pub fn session(&self) -> Option<&PullSession> {
+        self.session.as_ref()
+    }
+
+    /// 会话建立（泵发起首条拉取时；幂等——同 transfer 重复调用不动）。
+    pub fn ensure_session(&mut self, transfer_id: u32, total: usize) {
+        if self.session.is_none() {
+            self.session = Some(PullSession {
+                transfer_id,
+                total,
+                ok: 0,
+                failed: 0,
+                staged: Vec::new(),
+            });
+        }
+    }
+
+    /// 拉取请求取消（托盘「取消文件传输」入口；泵消费）。
+    pub fn request_cancel(&mut self) {
+        self.cancel_requested = true;
+    }
+
+    /// 取走取消请求。
+    pub fn take_cancel(&mut self) -> bool {
+        std::mem::take(&mut self.cancel_requested)
+    }
+
+    /// 会话进度记账（ok/failed 各计一次；返回是否达成完成判定）。
+    pub fn record_progress(
+        &mut self,
+        transfer_id: u32,
+        ok: bool,
+        staged_path: Option<PathBuf>,
+    ) -> bool {
+        let Some(session) = self.session.as_mut() else {
+            return false;
+        };
+        if session.transfer_id != transfer_id {
+            return false;
+        }
+        if ok {
+            session.ok += 1;
+            if let Some(path) = staged_path {
+                session.staged.push(path);
+            }
+        } else {
+            session.failed += 1;
+        }
+        session.ok + session.failed >= session.total
+    }
+
+    /// 会话收尾（完成判定达成后调用）：返回待挂板路径（空 = 无成功条目——
+    /// pending 保留供重试）；会话与队列随之清理。
+    pub fn finalize_session(&mut self) -> Vec<PathBuf> {
+        let staged = self
+            .session
+            .take()
+            .map(|session| session.staged)
+            .unwrap_or_default();
+        self.pull_queue.clear();
+        self.pull_request = None;
+        staged
+    }
+
+    /// 配置上限装配（session_rt 装配点写入）。
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = Some(limits);
+    }
+
+    /// 配置上限（None = 协议默认，调用方兜底）。
+    #[must_use]
+    pub fn limits(&self) -> Option<Limits> {
+        self.limits
+    }
+
+    /// 超阈值确认武装（第一次点击置位）。
+    pub fn arm_confirm(&mut self) {
+        self.confirm_armed = true;
+    }
+
+    /// 确认武装状态（托盘标签「需确认」投影 + 拉取放行判定）。
+    #[must_use]
+    pub fn confirm_armed(&self) -> bool {
+        self.confirm_armed
+    }
+
+    /// 清确认武装（拉取执行后）。
+    pub fn disarm_confirm(&mut self) {
+        self.confirm_armed = false;
+    }
+
     /// 清空会话期状态（控制会话结束随行清理；跨会话不得残留旧对端清单）。
     pub fn reset_for_new_session(&mut self) {
         self.pending = None;
@@ -259,6 +396,9 @@ impl FileHub {
         self.outbound = None;
         self.outbound_fp = None;
         self.outbound_paths.clear();
+        self.session = None;
+        self.cancel_requested = false;
+        self.confirm_armed = false;
         self.session_minor = None;
     }
 }
@@ -483,6 +623,25 @@ async fn run_file_pump(
                     }
                 }
 
+                // 取消消费（切片 d）：对端 Cancel 帧 + 本地收尾（已成功条目
+                // 照常挂板，prd R3/R2）
+                if lock_hub().take_cancel() {
+                    let tid = lock_hub().session().map(|session| session.transfer_id);
+                    if let Some(transfer_id) = tid {
+                        out.push(FileMsg::Cancel(xcontrol_proto::file::FileCancel {
+                            transfer_id,
+                        }));
+                        let complete =
+                            lock_hub().record_progress(transfer_id, false, None);
+                        serving = None;
+                        staging = None;
+                        serve.release(transfer_id);
+                        tx.reset();
+                        if complete {
+                            mount_list(&lock_hub().finalize_session(), "已取消");
+                        }
+                    }
+                }
                 // ③ 待发拉取请求（size 取自 pending 槽清单；暂存文件同拍建立）。
                 // 接收端空闲门控：上一条目组装中不取下一条（队列顺序拉流语义；
                 // verified 由 record_rx_action 释放 active，下一拍自然继续）。
@@ -499,6 +658,9 @@ async fn run_file_pump(
                         .map(|entry| entry.size);
                     match size {
                         Some(size) => {
+                            let total =
+                                lock_hub().pending().map_or(0, |slot| slot.entries.len());
+                            lock_hub().ensure_session(transfer_id, total);
                             rx.begin_pull(transfer_id, entry, size);
                             // 发送侧条目流同拍开账（本端作为源端的信用窗口记账）
                             let _ = tx.begin_entry(transfer_id, entry, size);
@@ -657,6 +819,25 @@ fn on_file_msg(
         // 元数据面：入 pending 槽（代次失效/去重在 FileRefRx 内承接，docs/04 §8.2）。
         FileMsg::RefAnnounce(announce) => match ref_rx.on_announce(announce) {
             FileRefVerdict::Applied { .. } => {
+                // 配置面（切片 d R4）：超协商上限 → Quota 退回，pending 不入
+                let exceed = lock_hub().limits().is_some_and(|limits| {
+                    lock_hub()
+                        .pending()
+                        .is_some_and(|slot| slot.total_bytes > limits.max_bytes)
+                });
+                if exceed {
+                    let transfer_id = ref_rx.slot().map(|slot| slot.transfer_id);
+                    lock_hub().consume_pending();
+                    if let Some(transfer_id) = transfer_id {
+                        out.push(FileMsg::Error(FileError {
+                            transfer_id,
+                            entry: None,
+                            code: FileErrCode::QUOTA,
+                        }));
+                    }
+                    tracing::warn!(target: TARGET, "对端清单超配置上限（Quota 退回）");
+                    return false;
+                }
                 if let Some(slot) = ref_rx.slot() {
                     lock_hub().set_pending(slot.clone());
                 }
@@ -723,6 +904,17 @@ fn on_file_msg(
             violated
         }
         FileMsg::Cancel(cancel) => {
+            // 源端角色收尾：取消的 transfer 若在本端服务流中 → 停止读取/释放
+            //（对端已放弃，继续读无意义；tx 记账随之重置）。
+            if let Some(stream) = serving
+                .as_ref()
+                .filter(|stream| stream.transfer_id == cancel.transfer_id)
+            {
+                let transfer_id = stream.transfer_id;
+                *serving = None;
+                serve.release(transfer_id);
+                tx.reset();
+            }
             let mut violated = false;
             for action in rx.on_cancel(&cancel) {
                 violated |= record_rx_action(action, out, serve, tx, staging);
@@ -827,12 +1019,11 @@ fn record_rx_action(
             false
         }
         FileRxAction::EntryVerified { transfer_id, entry } => {
-            let (staged_path, total_entries) = {
+            let staged_path = staging.as_ref().map(|s| s.path.clone());
+            let complete = {
                 let mut hub = lock_hub();
-                let staged_path = staging.as_ref().map(|s| s.path.clone());
-                let total = hub.pending().map_or(0, |slot| slot.entries.len());
                 hub.verified.push((transfer_id, entry));
-                (staged_path, total)
+                hub.record_progress(transfer_id, true, staged_path.clone())
             };
             serve.release(transfer_id);
             if tx.should_end() {
@@ -842,18 +1033,12 @@ fn record_rx_action(
             }
             if let Some(staged) = staging.take() {
                 drop(staged.file); // 落盘句柄收尾（write_all 已刷入 OS 页缓存）
-                // 全条目完成才挂板（多文件按 pending 顺序全量挂——与 Finder
-                // 多选复制语义对齐；部分完成继续等后续条目）
-                let done = lock_hub()
-                    .verified
-                    .iter()
-                    .filter(|(tid, _)| *tid == transfer_id)
-                    .count();
-                if done >= total_entries && total_entries > 0 {
-                    mount_staged(transfer_id);
-                }
             }
-            let _ = staged_path;
+            if complete {
+                // 部分成功（prd R3）：成功条目照常挂板，失败清单在 hub
+                finalize_pull();
+            }
+            let _ = entry;
             false
         }
         FileRxAction::EntryFailed {
@@ -864,9 +1049,14 @@ fn record_rx_action(
             lock_hub()
                 .failures
                 .push(format!("transfer {transfer_id}：{reason}"));
+            let complete = lock_hub().record_progress(transfer_id, false, None);
             serve.release(transfer_id);
             tx.reset();
-            *staging = None; // 暂存流随条目失败废弃（可重试语义：重新拉取重建）
+            *staging = None; // 暂存流随条目失败废弃（失败条目不入挂板面）
+            if complete {
+                // 部分成功（prd R3）：已成功条目照常挂板
+                finalize_pull();
+            }
             false
         }
         FileRxAction::Violation { reason } => {
@@ -876,24 +1066,29 @@ fn record_rx_action(
     }
 }
 
-/// 挂板（b-平台写路径，mac 实测；其余平台待实装——暂存文件已就绪，路径提示）。
-fn mount_staged(transfer_id: u32) {
-    let pending_entries = lock_hub()
-        .pending()
-        .filter(|slot| slot.transfer_id == transfer_id)
-        .map(|slot| slot.entries.clone());
-    let Some(entries) = pending_entries else {
+/// 会话收尾（完成判定 = ok+failed ≥ total）：有成功条目 → 挂板（部分成功
+/// 语义，prd R3）+ consume_pending；全失败 → pending 保留（重试面），失败
+/// 清单在 hub.failures。
+fn finalize_pull() {
+    let staged = lock_hub().finalize_session();
+    if staged.is_empty() {
+        tracing::warn!(target: TARGET,
+            "拉取会话收尾：无成功条目（pending 保留，可经托盘重试）");
         return;
-    };
-    let dir = staging_dir();
-    let paths: Vec<PathBuf> = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| dir.join(format!("{transfer_id}-{index}-{}", entry.name)))
-        .collect();
-    let fingerprint = manifest_fingerprint(&entries);
+    }
+    mount_list(&staged, "完成");
+}
+
+/// 挂板（b-平台写路径，mac 实测；其余平台待实装——暂存文件已就绪，路径提示）。
+/// 挂板指纹沿用 pending 槽登记（检测面回声判定口径，docs/04 §8.3；
+/// 部分成功时为成功子集的保守口径）。
+fn mount_list(paths: &[PathBuf], why: &str) {
+    let fingerprint = lock_hub()
+        .pending()
+        .map_or([0; 16], |slot| slot.fingerprint);
     let now_ms = SystemClock::new().now_ms();
-    mount_paths(&paths, fingerprint, now_ms);
+    tracing::info!(target: TARGET, count = paths.len(), why, "拉取会话挂板");
+    mount_paths(paths, fingerprint, now_ms);
 }
 
 /// 平台挂板（docs/05 §0.2「挂板」列；mac = write_file_urls 实测路径）。

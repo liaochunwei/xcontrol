@@ -68,6 +68,9 @@ pub enum CoreCommand {
     /// 重建（会话循环收到后优雅断开并上抛 [`crate::session_rt::SessionEnd::RoleSwitch`]，
     /// main.rs 的运行时 supervisor 据此重建——进程内角色翻转，docs/06 §5.2）。
     SwitchRole,
+    /// 取消文件传输（FR-7.3；托盘「取消文件传输」路径）：终止未完成条目，
+    /// 已成功条目照常挂板（部分成功语义）。
+    CancelFileTransfer,
     /// 接收对端文件（FR-7.3；托盘「接收文件」路径）：会话循环把 pending 槽
     /// 全部条目排入拉取队列（file_channel 泵按信用窗口逐条拉流物化挂板）。
     TransferFiles,

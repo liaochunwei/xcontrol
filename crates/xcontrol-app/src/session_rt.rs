@@ -506,6 +506,16 @@ pub async fn client_session(
             ));
             // 独立文件通道（FR-7.3，docs/02 §4.6，第三条 TCP）：协商 minor ≥ 2
             // 才拨号（泵内门控）；通道失败 3s 独立重连，控制会话结束随行关闭。
+            {
+                let cfg = config
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                crate::file_channel::lock_hub().set_limits(crate::file_channel::Limits {
+                    enabled: cfg.file_transfer.enabled,
+                    max_bytes: cfg.file_transfer.max_bytes,
+                    confirm_threshold_bytes: cfg.file_transfer.confirm_threshold_bytes,
+                });
+            }
             let (file_stop_tx, file_stop_rx) = tokio::sync::watch::channel(false);
             let file_task = tokio::spawn(crate::file_channel::client_file_channel_loop(
                 opts.addr,
@@ -853,6 +863,16 @@ pub async fn client_discover(
                         clip_stop_rx,
                     ));
                     // 独立文件通道（FR-7.3，docs/02 §4.6）：与 client_session 同构。
+                    {
+                        let cfg = config
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        crate::file_channel::lock_hub().set_limits(crate::file_channel::Limits {
+                            enabled: cfg.file_transfer.enabled,
+                            max_bytes: cfg.file_transfer.max_bytes,
+                            confirm_threshold_bytes: cfg.file_transfer.confirm_threshold_bytes,
+                        });
+                    }
                     let (file_stop_tx, file_stop_rx) = tokio::sync::watch::channel(false);
                     let file_task = tokio::spawn(crate::file_channel::client_file_channel_loop(
                         candidate.addr,
@@ -1807,9 +1827,37 @@ async fn drive_session(
                 // 下标（托盘 M4 拓扑投影），经布局装配的全局 id 解析（docs/02 §4.2；
                 // 越界回退原值 = 1.0 语义兼容）。
                 Some(CoreCommand::TransferFiles) => {
-                    // 接收对端文件（FR-7.3 托盘路径）：pending 槽整单入拉取队列
-                    // （file_channel 泵按接收端空闲逐条拉流，全条目完成挂板）。
-                    crate::file_channel::lock_hub().request_pull_all_pending();
+                    // 接收对端文件（FR-7.3 托盘路径）：pending 槽整单入拉取队列。
+                    // 确认阈值（切片 d R4）：超阈值需二次点击（第一次仅武装）。
+                    let mut hub = crate::file_channel::lock_hub();
+                    let total = hub.pending().map_or(0, |slot| slot.total_bytes);
+                    let threshold = hub
+                        .limits()
+                        .map_or(
+                            {
+                                let cfg = config
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                cfg.file_transfer.confirm_threshold_bytes
+                            },
+                            |l| l.confirm_threshold_bytes,
+                        );
+                    if total > threshold && !hub.confirm_armed() {
+                        hub.arm_confirm();
+                        drop(hub);
+                        bus.report(|state| {
+                            state.last_error = Some(
+                                "文件传输超确认阈值：再点一次「接收文件」开始传输".into(),
+                            );
+                        });
+                        bus.flush();
+                    } else {
+                        hub.disarm_confirm();
+                        hub.request_pull_all_pending();
+                    }
+                }
+                Some(CoreCommand::CancelFileTransfer) => {
+                    crate::file_channel::lock_hub().request_cancel();
                 }
                 Some(CoreCommand::SwitchToSlave { target }) => {
                     let actions = if crate::hotkey_rt::switch_allowed(

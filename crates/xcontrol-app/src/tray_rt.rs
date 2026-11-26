@@ -311,7 +311,9 @@ fn to_tray_snapshot(state: &AppState, autostart: Option<&Arc<dyn Autostart>>) ->
 
     // 对端文件清单（FR-7.3）投影直读 hub（进程级单例——托盘 200ms 刷新即反映；
     // 体积 humanize：MiB/KB 二段式，与 pending 槽字节量对齐）。
-    let incoming_files = crate::file_channel::lock_hub().pending().map(|slot| {
+    let hub = crate::file_channel::lock_hub();
+    let transfer_cancelable = hub.session().is_some();
+    let incoming_files = hub.pending().map(|slot| {
         let mib = slot.total_bytes as f64 / (1024.0 * 1024.0);
         let size_label = if mib >= 1.0 {
             format!("{mib:.1} MB")
@@ -332,6 +334,7 @@ fn to_tray_snapshot(state: &AppState, autostart: Option<&Arc<dyn Autostart>>) ->
         slaves,
         host_candidates,
         incoming_files,
+        transfer_cancelable,
         latency_ms: None,
         autostart_enabled: autostart.is_some_and(|backend| backend.is_enabled()),
     }

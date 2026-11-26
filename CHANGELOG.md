@@ -8,6 +8,12 @@
 
 ### Added
 
+- **FR-7.3 切片 d：会话收尾打磨**：部分成功策略（条目失败不废弃整单——已成功
+  条目照常挂板 + 失败清单提示，全失败保留 pending 供重试）；托盘「取消文件
+  传输」（拉取进行中出现，对端 FileCancel + 本地收尾）；配置 `[file_transfer]`
+  （enabled / max_bytes=2GiB / confirm_threshold_bytes=512MiB——发送端超限不
+  发布、接收端超限 Quota 退回、超阈值需托盘二次点击）；断点续传评估结论 = v1
+  选重传（offset 协议面保留，docs/02 §4.6 注记）。
 - **FR-7.3 切片 c：透明文件粘贴**：受控机上直接 Cmd+V/Ctrl+V 即物化——
   注入管线的 sink 包装器拦截粘贴组合（修饰键自跟踪，wire Key 无 mods），
   pending 槽有货时挂起组合键并触发拉流（复用切片 b 管线），挂板完成后自动

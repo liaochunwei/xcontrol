@@ -121,6 +121,8 @@ pub struct TraySnapshot {
     pub host_candidates: Vec<HostCandidateInfo>,
     /// 对端剪贴板文件清单（FR-7.3；`None` = 无货——菜单不渲染该条）。
     pub incoming_files: Option<IncomingFilesInfo>,
+    /// 拉取进行中（FR-7.3 切片 d——「取消文件传输」条目的出现条件）。
+    pub transfer_cancelable: bool,
     /// 平均往返延迟（ms；`None` = 无指标——tooltip 省略延迟段）。
     pub latency_ms: Option<u32>,
     /// 开机自启当前生效状态（`Autostart::is_enabled`，菜单勾选态）。
@@ -258,6 +260,7 @@ mod tests {
                 .collect(),
             host_candidates: Vec::new(),
             incoming_files: None,
+            transfer_cancelable: false,
             latency_ms,
             autostart_enabled: false,
         }

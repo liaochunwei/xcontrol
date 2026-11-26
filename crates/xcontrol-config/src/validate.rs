@@ -513,8 +513,8 @@ mod tests {
     use crate::migrate::CURRENT_CONFIG_VERSION;
     use crate::model::{
         ClipboardConfig, ClipboardFormat, ClipboardScope, Direction, DiscoveryMethod,
-        GeneralConfig, HotkeysConfig, KeymapConfig, KeymapRule, LayoutConfig, LayoutScreen,
-        NetConfig, Role, RuleAction, RuleTrigger,
+        FileTransferConfig, GeneralConfig, HotkeysConfig, KeymapConfig, KeymapRule, LayoutConfig,
+        LayoutScreen, NetConfig, Role, RuleAction, RuleTrigger,
     };
     use crate::testing::load_str;
 
@@ -569,6 +569,7 @@ mod tests {
                 max_bytes: 16 * 1024 * 1024,
                 formats: vec![ClipboardFormat::Text],
             },
+            file_transfer: FileTransferConfig::default(),
         }
     }
 

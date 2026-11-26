@@ -312,7 +312,7 @@ struct FileEntry       { name: String,             // 条目名（UTF-8，**相�
                          kind: FileEntryKind,
                          children: u32 }           // Dir = 子树条目总数（FileExpand 展开前为估计值，可为 0 = 未统计）
 enum  FileEntryKind    { File = 0, Dir = 1 }
-struct FilePullReq     { transfer_id: u32, entry: u32, offset: u64 }
+struct FilePullReq     { transfer_id: u32, entry: u32, offset: u64 }   // offset 断点续传预留：v1 选重传（LAN 带宽下重传成本低于续传状态机复杂度——2026-11-26 评估结论，任务 11-26-file-transfer-polish）
 struct FileChunk       { transfer_id: u32, seq: u32, data: Vec<u8> } // data.len() ≤ 64KiB；发送有效分块 65472B（同 §6.2 物理上限推导）
 struct FileAck         { seq: u32 }
 struct FileEnd         { transfer_id: u32, entry: u32, blake3: [u8; 32] }   // 摘要覆盖本次传输区间：全量拉取 = 整条目；offset 续传区间 = 该区间（边流边算）

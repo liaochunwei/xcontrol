@@ -82,7 +82,7 @@ M0 规范冻结与脚手架 ──► M1 协议与回环 ──► M2 最小可�
 
 ## 延后池（v0.2+）
 
-- **FR-7.3 跨设备文件复制粘贴（已立项，2026-11-26）**：通道拓扑与物化策略已定稿（[ADR-0004](adr/0004-file-transfer-channel-and-materialization.md)）；协议 XCP 1.2 文件通道已入 [02-protocol.md](02-protocol.md) §4.6，剪贴板侧语义入 [04-clipboard.md](04-clipboard.md) §8，平台路径与安全面分别入 [05-platform.md](05-platform.md) §0.2 / [07-security.md](07-security.md) §9。任务树 `.trellis/tasks/11-26-file-transfer/`：规范 → 元数据面 → 通道拉流 → 透明粘贴 → 打磨，五切片独立验收
+- **FR-7.3 跨设备文件复制粘贴（已立项，2026-11-26）**：通道拓扑与物化策略已定稿（[ADR-0004](adr/0004-file-transfer-channel-and-materialization.md)）；协议 XCP 1.2 文件通道已入 [02-protocol.md](02-protocol.md) §4.6，剪贴板侧语义入 [04-clipboard.md](04-clipboard.md) §8，平台路径与安全面分别入 [05-platform.md](05-platform.md) §0.2 / [07-security.md](07-security.md) §9。任务树 `.trellis/tasks/11-26-file-transfer/`：规范 → 元数据面 → 通道拉流 → 透明粘贴 → 打磨，五切片独立验收（2026-11-26：前四切片完成归档；断点续传评估结论 = v1 选重传，docs/02 §4.6 FilePullReq 注记）
 - **FR-7.1 共享文件夹 / FR-7.2 拖放文件**（对标 Deskflow 延伸方向）：复用 FR-7.3 文件通道（[ADR-0004](adr/0004-file-transfer-channel-and-materialization.md)）；实现路径（内置文件服务 vs FUSE vs 系统共享）开工前另需 ADR
 - FR-3.5 按应用映射；FR-4.6 文件路径同步（FR-7.3 落地后作为降级形态保留）；FR-2.8 更细的边界策略
 - 多显示器单机多屏布局；HiDPI 混合缩放精化

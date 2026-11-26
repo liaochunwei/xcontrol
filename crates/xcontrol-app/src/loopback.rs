@@ -344,6 +344,9 @@ fn run_chain(
                 CoreCommand::TransferFiles => {
                     crate::file_channel::lock_hub().request_pull_all_pending();
                 }
+                CoreCommand::CancelFileTransfer => {
+                    crate::file_channel::lock_hub().request_cancel();
+                }
                 CoreCommand::Pause => {
                     host.on_local(LocalCmd::Pause, bus)?;
                     bus.report(|state| state.conn = ConnState::Running { paused: true });

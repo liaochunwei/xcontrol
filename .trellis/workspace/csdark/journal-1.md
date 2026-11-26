@@ -48,3 +48,20 @@
 3. 规范先行让实装切片的 prd 可以直接引用条文章节号，切片任务 Planning 成本大幅下降（a–d 的 prd 已带引用）。
 
 **遗留/后续**：切片 a–d 待启动（子任务已挂上下文种子）；分支未合 main（待评审/PR）；golden fixtures 与 fuzz 随切片 a 实装补。
+
+## 2026-11-26 · 任务 11-26-file-ref-announce（FR-7.3 切片 a：文件引用元数据面）
+
+**结果**：分支 `feat/file-transfer-spec`（未合 main，按用户指示验证后再合）。proto + core 两批提交全绿：文件域九消息（kind 0x58–0x60、fixtures 26→35、PROTO_MINOR 1→2、Caps bit4）+ `file_ref` 模块（清单构建/pending 槽/代次失效/回环指纹）+ mock 文件引用槽 + 三层测试（proto 内嵌 11 组 / file_flow 集成 3 条 / 既有套件回归）。质量门：clippy -D warnings 零警告、fmt 干净、workspace 32 套件全绿、check-deps PASS。
+
+**关键设计落地**：
+- 回环指纹 = (name, size) 有序序列 blake3 截断，len 前缀帧式布局防拼接碰撞；不含 mtime/绝对路径（docs/04 §8.3）——mtime/kind/children 不参与有单测钉死
+- pending 单槽代次失效：同源同 seq 重放 Duplicate、低 seq 过期拒绝、跨来源覆盖（最后复制者赢）、invalidate 由调用方显式触发（模块不嗅探剪贴板）
+- origin 去重（防线 2）在本模块首次真实落地（剪贴板域的同名机制一直是占位）
+
+**经验教训**（已回写规则卡/CHANGELOG）：
+1. **物理上限先行自查**：初稿"条目 ≤4096、清单 ≤1MiB"与帧层 64KiB 物理上限矛盾（65472B 教训同源）——实装前自查修正为 512 条/256B/单帧承载，写进 docs/02 修订注记。
+2. **特性门控不得用实现级版本常量**：session.rs Layout 门控错用 PROTO_MINOR，minor 提到 1.2 会误停 1.1 对端布局下发——新增 LAYOUT_MIN_MINOR 常量分离两个概念；net 层测试同步改锚 PROTO_MINOR 消除 minor 硬编码涟漪。
+3. **kind 占用会污染"未知 kind"探针**：0x60 被文件域占用后，stream/scenarios/session 三处用它当未知探针的测试全部失真——探针统一改 0x61（文件域后第一空档）。
+4. 大段插入文档用标题作锚点会吞标题（§4.6 插入吞了 §5 标题，立即发现修复）——插入后必须回读前后结构。
+
+**遗留/后续**：切片 b（文件 TCP 通道 + FileBind 绑定 + 拉流 + 真实平台检测 + app 泵接线 + 托盘提示）承接；会话 minor ≥ 2 发送门控随发送路径落地。

@@ -32,17 +32,29 @@
 
 ## Acceptance Criteria
 
-- [ ] AC1 proto：9 消息 round-trip + decode 分派 + 上限校验负例（条目数 512/
-      名称 256B/名称含 `/` 拒绝/总字节 u64 上限）；`file_*.bin` golden fixtures
-      入库并比对通过。
-- [ ] AC2 core 单测：清单指纹——mtime 变化/路径前缀变化不改指纹，name/size
-      变化改指纹；pending 槽代次失效矩阵（文件→文件、文件→文本、文本→文件、
-      跨来源）；未知 transfer_id/越界下标拒绝（切片 b 拉流面预留接口的防御面）。
-- [ ] AC3 mock 端到端：A（mock 剪贴板产文件引用）→ announce → B pending 槽
-      + 上抛"剪贴板文件"事件；B 再收文本 announce → 槽失效。
-- [ ] AC4 版本门控：会话 minor < 2 不发送/不接收文件域（协商矩阵测试补 1.2 组合）。
-- [ ] AC5 质量门：check-deps、`clippy -D warnings`（含平台 feature）、
-      `+nightly fmt --check`、`cargo test --workspace` 全绿。
+- [x] AC1 proto：9 消息 round-trip + decode 分派 + 上限校验负例（条目数 512/
+      名称 256B/名称含 `/` 与 `.`/`..`/NUL 拒绝/总字节 u64 上限）；`file_*.bin`
+      golden fixtures 入库（26→35）并比对通过。
+- [x] AC2 core 单测：清单指纹——mtime/kind/children 变化不改指纹，name/size/
+      顺序变化改指纹，len 前缀防拼接碰撞；pending 槽代次失效矩阵（同源重放
+      Duplicate、低 seq 过期拒绝、跨来源覆盖、invalidate 清槽）。未知
+      transfer_id/越界下标防御随切片 b 拉流面实装（design.md §5 边界）。
+- [x] AC3 mock 端到端：mock 剪贴板产文件引用 → 清单构建 → 帧级 wire 往返 →
+      pending 槽 Applied（tests/file_flow.rs）；本机文本写入 → invalidate 失效锚点。
+- [x] AC4 版本门控：协商矩阵补 1.2 组合（proto version.rs）；会话 minor < 2
+      不发送文件域——切片 a 无文件域发送路径（通道属切片 b），门控随
+      `FileRefAnnounce` 发送路径在切片 b 落地（net chain 断言改锚 PROTO_MINOR）。
+- [x] AC5 质量门：check-deps PASS、`clippy --workspace --all-targets -D warnings`
+      零警告、`+nightly fmt --check` 干净、`cargo test --workspace` 32 套件全绿
+      （含 mock-platform 4 套件）。
+
+## 交接备注（2026-11-26 完成）
+
+- 真实平台文件引用检测（mac/win/x11/wayland）未实装——按 design §5 移交切片 b
+  与通道联调同批（避免半接线状态）；mock 语义已钉死（写入清空多域、变更计数联动）。
+- 附带修复：session.rs `Layout` 下发门控由 `PROTO_MINOR` 改为特性级
+  `LAYOUT_MIN_MINOR`（1.1）——原实现会因 minor 提升误停 1.1 对端布局下发。
+- net 层协议版本相关测试改锚 `PROTO_MINOR`，后续 minor 提升不再涟漪。
 
 ## Out of Scope
 

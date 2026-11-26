@@ -38,6 +38,7 @@
 pub mod clip_channel;
 pub mod clip_rt;
 pub mod edge;
+pub mod file_channel;
 pub mod hotkey_rt;
 pub mod layout_rt;
 pub mod logging;

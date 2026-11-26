@@ -64,6 +64,8 @@ pub const CLIP_BIND_PEEK_WINDOW: Duration = Duration::from_millis(300);
 pub enum IncomingClass {
     /// 剪贴板通道（`ChannelBind` 校验通过，泵任务已 spawn）。
     ClipChannel(ClipChannelGuard),
+    /// 文件通道（`FileBind` 校验通过，泵任务已 spawn，docs/02 §4.6）。
+    FileChannel(crate::file_channel::FileChannelGuard),
     /// 控制连接（首帧未消费——客户端静默等 `Hello`，原样交付给会话驱动；
     /// 会话期间到达时由调用方持有，当前会话结束后优先驱动）。
     /// `Box` 收敛变体尺寸差（`Connection` 携带 stream + 传输态）。
@@ -76,9 +78,11 @@ pub enum IncomingClass {
 enum FirstFrame {
     /// `ChannelBind`（剪贴板连接的合法首帧）。
     ChannelBind(ChannelBind),
+    /// `FileBind`（文件连接的合法首帧，docs/02 §4.6）。
+    FileBind(xcontrol_proto::file::FileBind),
     /// 其他剪贴板帧（0x51–0x54）——未 bind 先传，违规。
     ClipWithoutBind(u8),
-    /// 非剪贴板帧——控制连接不应有首帧（客户端静默等 `Hello`），违规面。
+    /// 非剪贴板/文件域帧——控制连接不应有首帧（客户端静默等 `Hello`），违规面。
     NonClip(u8),
 }
 
@@ -90,6 +94,12 @@ fn first_frame_class(buf: &[u8]) -> Option<FirstFrame> {
     if kind_value == kind::CLIP_CHANNEL_BIND {
         match xcontrol_proto::clip::decode_clip(kind_value, frame.payload) {
             Ok(Some(ClipMsg::Bind(bind))) => Some(FirstFrame::ChannelBind(bind)),
+            // 声称 bind 却解码失败 = 违规面。
+            _ => None,
+        }
+    } else if kind_value == kind::FILE_BIND {
+        match xcontrol_proto::file::decode_file(kind_value, frame.payload) {
+            Ok(Some(xcontrol_proto::FileMsg::Bind(bind))) => Some(FirstFrame::FileBind(bind)),
             // 声称 bind 却解码失败 = 违规面。
             _ => None,
         }
@@ -139,6 +149,17 @@ pub async fn classify_incoming(
                     stop_rx,
                 ));
                 IncomingClass::ClipChannel(ClipChannelGuard { stop_tx, handle })
+            }
+            Some(FirstFrame::FileBind(bind)) => {
+                if bind.session_id != control_session_id {
+                    tracing::warn!(target: TARGET, peer = %peer,
+                        "文件通道 FileBind 会话不匹配（断开该连接，docs/02 §4.6）");
+                    transport.shutdown().await;
+                    return IncomingClass::Rejected;
+                }
+                let guard =
+                    crate::file_channel::accept_file_channel(transport, control_session_id, peer);
+                IncomingClass::FileChannel(guard)
             }
             Some(FirstFrame::ClipWithoutBind(kind_value)) => {
                 tracing::warn!(target: TARGET, peer = %peer,
@@ -211,6 +232,15 @@ fn decode_clip_channel_frames(stream: &[u8]) -> Result<Vec<ClipMsg>, String> {
         }
         let frame = decode_frame(rest).map_err(|error| format!("帧解析失败：{error}"))?;
         let total = frame.total_len();
+        // 文件域帧出现在剪贴板通道 = 对端误路由（docs/02 §4.6 域隔离防御面）：
+        // 剥出丢弃告警，不断连（文件通道有自己的独立连接）。
+        if xcontrol_proto::frame::is_file_kind(frame.header.kind) {
+            tracing::warn!(target: TARGET,
+                kind = format!("0x{:02X}", frame.header.kind),
+                "剪贴板通道出现文件域帧（剥出丢弃告警，docs/02 §4.6 域隔离）");
+            rest = &rest[total..];
+            continue;
+        }
         match xcontrol_proto::clip::decode_clip(frame.header.kind, frame.payload) {
             Ok(Some(msg)) => msgs.push(msg),
             // kind 不在剪贴板表：控制/输入帧出现在剪贴板通道 = 误路由（违规）。
@@ -623,6 +653,41 @@ mod tests {
             matches!(class, IncomingClass::Rejected),
             "会话不匹配 = 拒绝"
         );
+    }
+
+    /// 首帧分类：FileBind（文件域合法首帧）识别（docs/02 §4.6）。
+    #[test]
+    fn first_frame_class_recognizes_file_bind() {
+        let bind = xcontrol_proto::file::FileBind {
+            session_id: [3; 16],
+        }
+        .encode_frame(0)
+        .expect("file bind 编码");
+        assert!(matches!(
+            first_frame_class(&bind),
+            Some(FirstFrame::FileBind(_))
+        ));
+    }
+
+    /// 域隔离防御面：剪贴板通道收到文件域帧 = 剥出丢弃（不违规、不断连）。
+    #[test]
+    fn decode_channel_frames_strips_file_frames() {
+        let announce = xcontrol_proto::file::FileRefAnnounce {
+            transfer_id: 1,
+            origin_id: [0; 16],
+            origin_seq: 1,
+            entries: Vec::new(),
+            total_bytes: 0,
+            copied_at_ms: 0,
+        }
+        .encode_frame(1)
+        .expect("file announce 编码");
+        let clip_ack = ClipAck { seq: 0 }.encode_frame(2).expect("ack 编码");
+        let mut stream = announce;
+        stream.extend_from_slice(&clip_ack);
+        let msgs = decode_clip_channel_frames(&stream).expect("文件域帧剥离后其余照常");
+        assert_eq!(msgs.len(), 1, "文件域帧剥离，剪贴板帧照常解出");
+        assert!(matches!(msgs[0], ClipMsg::Ack(_)));
     }
 
     /// 客户端通道循环：max_bytes=0（禁用）不拨号，stop 信号即退出。

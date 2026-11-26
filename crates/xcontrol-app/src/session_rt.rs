@@ -504,6 +504,16 @@ pub async fn client_session(
                 crate::clip_channel::clip_max_bytes(&config),
                 clip_stop_rx,
             ));
+            // 独立文件通道（FR-7.3，docs/02 §4.6，第三条 TCP）：协商 minor ≥ 2
+            // 才拨号（泵内门控）；通道失败 3s 独立重连，控制会话结束随行关闭。
+            let (file_stop_tx, file_stop_rx) = tokio::sync::watch::channel(false);
+            let file_task = tokio::spawn(crate::file_channel::client_file_channel_loop(
+                opts.addr,
+                opts.psk,
+                opts.throttle,
+                clip_session_id,
+                file_stop_rx,
+            ));
             // 从机不轮询本机光标（边缘切换是主控侧语义，docs/03 §5；反向移出由
             // 对端 EnterScreen/LeaveScreen 路由，M3 布局协商收口）。
             // 会话结束（干净断开/错误断开均在函数内投影+日志）→ 回环退避重连。
@@ -524,11 +534,15 @@ pub async fn client_session(
             )
             .await
             .map(|(end, _pending)| end); // client 侧无暂存控制连接
-            // 控制会话结束：剪贴板通道随行关闭（独立通道生命周期锚定控制会话；
-            // stop 信号优雅退出 + abort 兜底，await 回收 watcher 线程）。
+            // 控制会话结束：剪贴板/文件通道随行关闭（独立通道生命周期锚定
+            // 控制会话；stop 信号优雅退出 + abort 兜底，await 回收 watcher 线程）。
             let _ = clip_stop_tx.send(true);
             clip_task.abort();
             let _ = clip_task.await;
+            let _ = file_stop_tx.send(true);
+            file_task.abort();
+            let _ = file_task.await;
+            crate::file_channel::lock_hub().reset_for_new_session();
             // 错误断开的 tracing 留痕（与主控侧会话结束 warn 同纪律；11-21 观测
             // 日志瘦身移除逐帧【观测】后，错误详情由本条承载——快照 last_error
             // 之外仍有日志可查）。干净断开（Ok）不告警。
@@ -838,6 +852,15 @@ pub async fn client_discover(
                         crate::clip_channel::clip_max_bytes(&config),
                         clip_stop_rx,
                     ));
+                    // 独立文件通道（FR-7.3，docs/02 §4.6）：与 client_session 同构。
+                    let (file_stop_tx, file_stop_rx) = tokio::sync::watch::channel(false);
+                    let file_task = tokio::spawn(crate::file_channel::client_file_channel_loop(
+                        candidate.addr,
+                        psk,
+                        opts.throttle,
+                        clip_session_id,
+                        file_stop_rx,
+                    ));
                     // 会话结束（干净断开/错误断开均在函数内投影+日志）→ 下一轮
                     // 重新扫描（刷新候选，docs/02 §2.2）。
                     let identity = opts.identity.clone();
@@ -857,10 +880,14 @@ pub async fn client_discover(
                     )
                     .await
                     .map(|(end, _pending)| end); // client 侧无暂存控制连接
-                    // 控制会话结束：剪贴板通道随行关闭（stop 信号 + abort 兜底）。
+                    // 控制会话结束：剪贴板/文件通道随行关闭（stop 信号 + abort 兜底）。
                     let _ = clip_stop_tx.send(true);
                     clip_task.abort();
                     let _ = clip_task.await;
+                    let _ = file_stop_tx.send(true);
+                    file_task.abort();
+                    let _ = file_task.await;
+                    crate::file_channel::lock_hub().reset_for_new_session();
                     // 错误断开的 tracing 留痕（同 client_session 手动路径——
                     // 快照 last_error 之外仍有日志可查）。干净断开不告警。
                     if let Err(error) = &end {
@@ -1206,6 +1233,8 @@ async fn drive_session(
     // 独立剪贴板通道句柄（host）：会话期间接入的剪贴板连接（首帧 ChannelBind）
     // 泵任务——会话收尾 / 新通道替换时关闭（新连接优先，防堆积）。
     let mut clip_channel: Option<crate::clip_channel::ClipChannelGuard> = None;
+    // 独立文件通道 guard（FR-7.3，docs/02 §4.6；生命周期同剪贴板通道）。
+    let mut file_channel: Option<crate::file_channel::FileChannelGuard> = None;
     // 会话期间到达的控制连接（重连风暴残余/第二从机）：窥探后暂存，本会话
     // 结束后随返回值交还 accept 循环优先驱动（串行 accept 语义保留）。
     let mut pending_control: Option<Connection> = None;
@@ -1427,6 +1456,15 @@ async fn drive_session(
                         if !clips.is_empty() {
                             tracing::warn!(target: crate::clip_rt::TARGET, count = clips.len(),
                                 "控制连接收到剪贴板帧（双连接裁定下不应出现；剥出丢弃，不断连）");
+                        }
+                        // 文件域帧防御剥离（FR-7.3 域隔离，docs/02 §4.6）：文件帧
+                        // 正常流量走独立文件通道——控制连接上出现即误路由/残留，
+                        // 剥出丢弃告警，不断连（同剪贴板帧防御面语义）。
+                        let (rest_stream, file_kinds) =
+                            crate::file_channel::split_file_frames(&rest_stream);
+                        if !file_kinds.is_empty() {
+                            tracing::warn!(target: crate::file_channel::TARGET, count = file_kinds.len(),
+                                "控制连接收到文件域帧（域隔离下不应出现；剥出丢弃，不断连）");
                         }
                         let mut dispatcher = Dispatcher::new(&mut session);
                         dispatcher.feed(&rest_stream)
@@ -2130,6 +2168,12 @@ async fn drive_session(
                             old.close();
                         }
                     }
+                    crate::clip_channel::IncomingClass::FileChannel(guard) => {
+                        // 新文件通道优先：关闭旧通道（绑定唯一，docs/02 §4.6）。
+                        if let Some(old) = file_channel.replace(guard) {
+                            old.close();
+                        }
+                    }
                     crate::clip_channel::IncomingClass::Control(conn) => {
                         tracing::info!(target: "session::rt", peer = %conn.peer,
                             "会话期间到达控制连接（窥探无首帧；暂存，本会话结束后驱动）");
@@ -2245,6 +2289,10 @@ async fn drive_session(
     // 剪贴板通道收尾（11-21 双连接）：通道生命周期锚定控制会话——会话以任何
     // 方式结束都关闭通道（stop 信号 + abort；泵任务内未完成出站传输随运行时
     // drop 丢弃，watcher 线程随 Drop 退出）。暂存的控制连接交还 accept 循环。
+    if let Some(guard) = file_channel.take() {
+        guard.close();
+    }
+    crate::file_channel::lock_hub().reset_for_new_session();
     if let Some(guard) = clip_channel.take() {
         guard.close();
     }
@@ -3018,6 +3066,8 @@ fn consume_notices(session: &Session<SystemClock>, actions: &[SessionAction], bu
         match action {
             SessionAction::Notice(Notice::HandshakeComplete { minor, .. }) => {
                 let peer_name = session.peer_name().map(str::to_owned);
+                // 文件域协商门控基线（docs/02 §4.6）：minor ≥ 2 才允许文件通道。
+                crate::file_channel::lock_hub().set_session_minor(*minor);
                 tracing::info!(target: "session::rt", minor, "版本协商完成（会话运行中）");
                 bus.report(|state| {
                     state.conn = ConnState::Running { paused: false };

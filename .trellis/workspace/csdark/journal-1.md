@@ -120,3 +120,14 @@
 3. 原子序 store 不能 AcqRel（编译器直接拦）——Release/Acquire 配对够用。
 
 **遗留**：AC5 双机实测移交人工（A 复制 → 控制着 B 直接 Cmd+V）；切片 d（目录 FileExpand 接线/进度 UI/断点评估/配置面）；win/linux 平台面（docs/05 §0.2 pending）。
+
+## 2026-11-27 · 任务 11-26-file-transfer-polish（FR-7.3 切片 d：收尾打磨）
+
+**结果**：提交 dbd8416。部分成功策略（PullSession 记账，条目失败不废弃整单——已成功条目照常挂板，全失败保留 pending 供重试）；托盘「取消文件传输」（FileCancel 双端收尾：源端服务流停止 + 本地已成功条目挂板）；config `[file_transfer]`（enabled/max_bytes/confirm_threshold——发布门控、Quota 退回、二次点击确认）；断点续传评估入档（v1 选重传，offset 面保留）。
+
+**经验**：
+1. 结构体加字段的构造点清单纪律再次生效（TraySnapshot/TrayState/Config 三处测试构造器 + loopback 臂——grep 先行省一半轮次）。
+2. 共享状态重构（record_progress/finalize_session）把散在 record_rx_action 两臂的记账收敛进 hub 单一出处——部分成功语义只改一处。
+3. python 补丁断言失败=整个脚本不落盘（原子性反而是保护）——失败后先核对文件实况再重跑，不盲改锚点。
+
+**功能总账（FR-7.3）**：单文件跨设备复制粘贴全链路完成（mac 实测）；剩余 = 目录（FileExpand 接线）、字节级进度、设置页可视化、win/linux 平台面、双机实测。

@@ -14,18 +14,21 @@ use std::path::{Path, PathBuf};
 use xcontrol_proto::xkey::{CK_VOLUME_UP, KEY_A};
 use xcontrol_proto::{
     Axis, Caps, ChannelBind, ClipAck, ClipAnnounce, ClipChunk, ClipEnd, ClipFormat, ClipMsg,
-    CtrlMsg, ErrCode, InputEvent, KeyState, KindClass, Mods, MouseButton, Options, ProtoError,
-    ProtoVer, ScreenEdge, decode_clip, decode_ctrl, decode_frame, kind_class,
+    CtrlMsg, ErrCode, FileAck, FileBind, FileCancel, FileChunk, FileEnd, FileEntry, FileEntryKind,
+    FileErrCode, FileError, FileExpand, FileMsg, FilePullReq, FileRefAnnounce, InputEvent, KeyState,
+    KindClass, Mods, MouseButton, Options, ProtoError, ProtoVer, ScreenEdge, decode_clip,
+    decode_ctrl, decode_file, decode_frame, kind_class,
 };
 
 const FIXTURE_DIR: &str = "tests/fixtures/xcp";
 
-/// 解码后的期望值（三类消息统一载体）。
+/// 解码后的期望值（四类消息统一载体）。
 #[derive(Debug, PartialEq)]
 enum Sample {
     Input(InputEvent),
     Ctrl(CtrlMsg),
     Clip(ClipMsg),
+    File(FileMsg),
 }
 
 /// kind+payload → 期望样本（与 lib.rs 接收端分派模式一致）。
@@ -34,6 +37,7 @@ fn decode_sample(kind: u8, payload: &[u8]) -> Result<Option<Sample>, ProtoError>
         KindClass::Input => InputEvent::decode(kind, payload)?.map(Sample::Input),
         KindClass::Ctrl => decode_ctrl(kind, payload)?.map(Sample::Ctrl),
         KindClass::Clip => decode_clip(kind, payload)?.map(Sample::Clip),
+        KindClass::File => decode_file(kind, payload)?.map(Sample::File),
         KindClass::Unknown => None,
     })
 }
@@ -150,6 +154,58 @@ fn sample_frames() -> Vec<(&'static str, Vec<u8>, Sample)> {
     let ack = Sample::Clip(ClipMsg::Ack(ClipAck { seq: 3 }));
     let end = Sample::Clip(ClipMsg::End(ClipEnd { clip_id: 7 }));
 
+    let file_entry = FileEntry {
+        name: "report.pdf".to_owned(),
+        size: 2048,
+        mtime_ms: 1_700_000_000_000,
+        kind: FileEntryKind::File,
+        children: 0,
+    };
+    let file_dir = FileEntry {
+        kind: FileEntryKind::Dir,
+        children: 3,
+        ..file_entry.clone()
+    };
+    let file_bind = Sample::File(FileMsg::Bind(FileBind {
+        session_id: [0x11_u8; 16],
+    }));
+    let file_announce = Sample::File(FileMsg::RefAnnounce(FileRefAnnounce {
+        transfer_id: 7,
+        origin_id: [0x22_u8; 16],
+        origin_seq: 42,
+        entries: vec![file_entry.clone(), file_dir],
+        total_bytes: 2048,
+        copied_at_ms: 1_700_000_000_000,
+    }));
+    let file_pull = Sample::File(FileMsg::PullReq(FilePullReq {
+        transfer_id: 7,
+        entry: 2,
+        offset: 4096,
+    }));
+    let file_chunk = Sample::File(FileMsg::Chunk(FileChunk {
+        transfer_id: 7,
+        seq: 3,
+        data: b"deterministic file payload".to_vec(),
+    }));
+    let file_ack = Sample::File(FileMsg::Ack(FileAck { seq: 3 }));
+    let file_end = Sample::File(FileMsg::End(FileEnd {
+        transfer_id: 7,
+        entry: 2,
+        blake3: [0x33_u8; 32],
+    }));
+    let file_error = Sample::File(FileMsg::Error(FileError {
+        transfer_id: 7,
+        entry: Some(2),
+        code: FileErrCode::NOT_FOUND,
+    }));
+    let file_cancel = Sample::File(FileMsg::Cancel(FileCancel { transfer_id: 7 }));
+    let file_expand = Sample::File(FileMsg::Expand(FileExpand {
+        transfer_id: 7,
+        parent: 1,
+        base: 3,
+        entries: vec![file_entry],
+    }));
+
     let samples = [
         ("key", 1u32, key_down),
         (
@@ -181,6 +237,15 @@ fn sample_frames() -> Vec<(&'static str, Vec<u8>, Sample)> {
         ("clip_chunk", 32, chunk),
         ("clip_ack", 33, ack),
         ("clip_end", 34, end),
+        ("file_bind", 40, file_bind),
+        ("file_ref_announce", 41, file_announce),
+        ("file_pull_req", 42, file_pull),
+        ("file_chunk", 43, file_chunk),
+        ("file_ack", 44, file_ack),
+        ("file_end", 45, file_end),
+        ("file_error", 46, file_error),
+        ("file_cancel", 47, file_cancel),
+        ("file_expand", 48, file_expand),
     ];
     let _ = (key_up, CK_VOLUME_UP); // 常量哨兵：保持 import 对齐 docs/03 §2
     samples
@@ -190,6 +255,7 @@ fn sample_frames() -> Vec<(&'static str, Vec<u8>, Sample)> {
                 Sample::Input(event) => event,
                 Sample::Ctrl(msg) => msg,
                 Sample::Clip(msg) => msg.as_message(),
+                Sample::File(msg) => msg.as_message(),
             };
             let bytes = message
                 .encode_frame(seq)
@@ -211,8 +277,8 @@ fn fixtures_match_golden() {
     let samples = sample_frames();
     assert_eq!(
         samples.len(),
-        26,
-        "12 输入 + 9 控制 + 5 剪贴板 = 26 条消息 kind"
+        35,
+        "12 输入 + 9 控制 + 5 剪贴板 + 9 文件 = 35 条消息 kind"
     );
     for (name, bytes, expected) in samples {
         let path = fixture_path(name);

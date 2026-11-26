@@ -9,9 +9,10 @@ use crate::error::ProtoError;
 
 /// 当前协议 major（兼容承诺锚点，docs/02 §5.4）。
 pub const PROTO_MAJOR: u8 = 1;
-/// 当前协议 minor（v1.1：`ScreenInfo.owner` 屏幕归属字段 + ScreenId 全局语义，
-/// docs/02 §4.2/§4.3 修订记录；1.0 = v1 实装起点）。
-pub const PROTO_MINOR: u8 = 1;
+/// 当前协议 minor（v1.2：文件通道消息域 kind 0x58–0x60 + `CAP_FILETRANSFER`
+/// （docs/02 §4.6 / docs/05 §0.1，FR-7.3）；1.1 = `ScreenInfo.owner` 屏幕归属
+/// 字段 + ScreenId 全局语义；1.0 = v1 实装起点）。
+pub const PROTO_MINOR: u8 = 2;
 
 /// 协议版本 `major.minor`（docs/02 §4.3/§5；postcard 按 Rust 类型编码）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -71,7 +72,7 @@ mod tests {
         ProtoVer { major, minor }
     }
 
-    /// docs/02 §8 版本协商矩阵：1.0 ↔ 1.1 ↔ 2.0 全组合。
+    /// docs/02 §8 版本协商矩阵：1.0 ↔ 1.1 ↔ 1.2 ↔ 2.0 全组合。
     #[test]
     fn negotiation_matrix() {
         // 同 major：minor 取 min（对称）
@@ -80,12 +81,16 @@ mod tests {
             (ver(1, 0), ver(1, 1), ver(1, 0)),
             (ver(1, 1), ver(1, 0), ver(1, 0)),
             (ver(1, 1), ver(1, 1), ver(1, 1)),
+            (ver(1, 1), ver(1, 2), ver(1, 1)),
+            (ver(1, 2), ver(1, 1), ver(1, 1)),
+            (ver(1, 0), ver(1, 2), ver(1, 0)),
+            (ver(1, 2), ver(1, 2), ver(1, 2)),
         ] {
             assert_eq!(negotiate(a, b), Ok(expected), "{a:?}↔{b:?}");
             assert_eq!(negotiate(b, a), Ok(expected), "对称：{b:?}↔{a:?}");
         }
-        // major 不等：Err（1.0↔2.0 双向）
-        for (a, b) in [(ver(1, 0), ver(2, 0)), (ver(1, 1), ver(2, 0))] {
+        // major 不等：Err（1.x↔2.0 双向）
+        for (a, b) in [(ver(1, 0), ver(2, 0)), (ver(1, 2), ver(2, 0))] {
             let err = negotiate(a, b).unwrap_err();
             assert!(matches!(err, ProtoError::VersionIncompatible { .. }));
             assert!(negotiate(b, a).is_err());
@@ -98,7 +103,7 @@ mod tests {
     #[test]
     fn current_version() {
         assert_eq!(PROTO_MAJOR, 1);
-        assert_eq!(ProtoVer::CURRENT, ProtoVer { major: 1, minor: 1 });
+        assert_eq!(ProtoVer::CURRENT, ProtoVer { major: 1, minor: 2 });
         assert!(ProtoVer::CURRENT.is_same_major());
         assert!(!ver(2, 0).is_same_major());
     }

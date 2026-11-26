@@ -20,11 +20,12 @@ pub const FRAME_HEADER_LEN: usize = 7;
 /// 帧头 `len: u16` 的物理上限为 65535（≤ 本常量），编码侧以 u16 上限校验。
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 
-/// docs/02 §4.2/§4.3/§4.4 kind 表（**1:1 对应，改表先改 docs/02**）。
+/// docs/02 §4.2/§4.3/§4.4/§4.6 kind 表（**1:1 对应，改表先改 docs/02**）。
 ///
 /// kind 分段：输入事件 `0x01–0x21`（定长手写）；控制消息 `0x40–0x48`（postcard）；
-/// 剪贴板通道 `0x50–0x54`（postcard）。每条消息独立占用一个 kind——新消息随 minor
-/// 提升新增 kind，老对端才能靠"未知 kind 按 len 跳过"无损降级（docs/02 §5.3）。
+/// 剪贴板通道 `0x50–0x54`（postcard）；文件通道 `0x58–0x60`（postcard，XCP 1.2+，
+/// 仅出现在文件连接——docs/02 §4.6 域隔离）。每条消息独立占用一个 kind——新消息
+/// 随 minor 提升新增 kind，老对端才能靠"未知 kind 按 len 跳过"无损降级（docs/02 §5.3）。
 pub mod kind {
     // —— 输入事件（定长手写，docs/02 §4.2）——
     /// `Key`：按键按下/抬起。
@@ -83,6 +84,26 @@ pub mod kind {
     pub const CLIP_ACK: u8 = 0x53;
     /// `ClipEnd`。
     pub const CLIP_END: u8 = 0x54;
+
+    // —— 文件通道（postcard，docs/02 §4.6，XCP 1.2+）——
+    /// `FileBind`：文件连接首帧。
+    pub const FILE_BIND: u8 = 0x58;
+    /// `FileRefAnnounce`：文件引用元数据清单（FR-7.3）。
+    pub const FILE_REF_ANNOUNCE: u8 = 0x59;
+    /// `FilePullReq`：条目索引拉取请求。
+    pub const FILE_PULL_REQ: u8 = 0x5A;
+    /// `FileChunk`：文件数据块。
+    pub const FILE_CHUNK: u8 = 0x5B;
+    /// `FileAck`：信用归还。
+    pub const FILE_ACK: u8 = 0x5C;
+    /// `FileEnd`：条目传输结束（blake3 校验）。
+    pub const FILE_END: u8 = 0x5D;
+    /// `FileError`：条目级/整单失败。
+    pub const FILE_ERROR: u8 = 0x5E;
+    /// `FileCancel`：用户取消。
+    pub const FILE_CANCEL: u8 = 0x5F;
+    /// `FileExpand`：目录子树展开。
+    pub const FILE_EXPAND: u8 = 0x60;
 }
 
 /// kind 大类（帧解出后的分派依据；未知 kind 归入 [`KindClass::Unknown`]，
@@ -96,8 +117,10 @@ pub enum KindClass {
     Ctrl = 1,
     /// 剪贴板通道消息（postcard，docs/02 §4.4/§6）。
     Clip = 2,
+    /// 文件通道消息（postcard，docs/02 §4.6，XCP 1.2+）。
+    File = 3,
     /// 未知 kind（按 len 跳过）。
-    Unknown = 3,
+    Unknown = 4,
 }
 
 /// kind → 大类（与 [`kind`] 表一致）。
@@ -109,6 +132,7 @@ pub const fn kind_class(kind: u8) -> KindClass {
         | kind::SWITCH_REQUEST..=kind::SWITCH_ACK => KindClass::Input,
         kind::CTRL_HELLO..=kind::CTRL_RESUME => KindClass::Ctrl,
         kind::CLIP_CHANNEL_BIND..=kind::CLIP_END => KindClass::Clip,
+        kind::FILE_BIND..=kind::FILE_EXPAND => KindClass::File,
         _ => KindClass::Unknown,
     }
 }
@@ -129,6 +153,12 @@ pub const fn is_ctrl_kind(kind: u8) -> bool {
 #[must_use]
 pub const fn is_clip_kind(kind: u8) -> bool {
     kind_class(kind) as u8 == KindClass::Clip as u8
+}
+
+/// kind 是否属于文件通道表（docs/02 §4.6，XCP 1.2+）。
+#[must_use]
+pub const fn is_file_kind(kind: u8) -> bool {
+    kind_class(kind) as u8 == KindClass::File as u8
 }
 
 /// 帧头（docs/02 §4.1）：`seq u32 LE | kind u8 | len u16 LE`。
@@ -332,6 +362,16 @@ mod tests {
         assert_eq!(kind::CLIP_CHUNK, 0x52);
         assert_eq!(kind::CLIP_ACK, 0x53);
         assert_eq!(kind::CLIP_END, 0x54);
+        // 文件通道（docs/02 §4.6，XCP 1.2+）
+        assert_eq!(kind::FILE_BIND, 0x58);
+        assert_eq!(kind::FILE_REF_ANNOUNCE, 0x59);
+        assert_eq!(kind::FILE_PULL_REQ, 0x5A);
+        assert_eq!(kind::FILE_CHUNK, 0x5B);
+        assert_eq!(kind::FILE_ACK, 0x5C);
+        assert_eq!(kind::FILE_END, 0x5D);
+        assert_eq!(kind::FILE_ERROR, 0x5E);
+        assert_eq!(kind::FILE_CANCEL, 0x5F);
+        assert_eq!(kind::FILE_EXPAND, 0x60);
     }
 
     /// kind 大类划分覆盖每张表的全部 kind（含边界值）。
@@ -379,12 +419,29 @@ mod tests {
         ] {
             assert_eq!(kind_class(k), KindClass::Clip);
             assert!(is_clip_kind(k));
+            assert!(!is_file_kind(k));
         }
         for k in [
-            0x00, 0x08, 0x0F, 0x13, 0x1F, 0x22, 0x30, 0x3F, 0x49, 0x4F, 0x55, 0xFF,
+            kind::FILE_BIND,
+            kind::FILE_REF_ANNOUNCE,
+            kind::FILE_PULL_REQ,
+            kind::FILE_CHUNK,
+            kind::FILE_ACK,
+            kind::FILE_END,
+            kind::FILE_ERROR,
+            kind::FILE_CANCEL,
+            kind::FILE_EXPAND,
+        ] {
+            assert_eq!(kind_class(k), KindClass::File);
+            assert!(is_file_kind(k));
+            assert!(!is_clip_kind(k));
+            assert!(!is_ctrl_kind(k));
+        }
+        for k in [
+            0x00, 0x08, 0x0F, 0x13, 0x1F, 0x22, 0x30, 0x3F, 0x49, 0x4F, 0x55, 0x57, 0x61, 0xFF,
         ] {
             assert_eq!(kind_class(k), KindClass::Unknown);
-            assert!(!is_input_kind(k) && !is_ctrl_kind(k) && !is_clip_kind(k));
+            assert!(!is_input_kind(k) && !is_ctrl_kind(k) && !is_clip_kind(k) && !is_file_kind(k));
         }
     }
 

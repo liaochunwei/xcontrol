@@ -119,6 +119,38 @@ pub enum ProtoError {
         /// 单块上限（64KiB）。
         max: usize,
     },
+    /// 文件清单条目数超上限（docs/02 §4.6 防护规则 1：单帧承载，条目 ≤512）。
+    #[error("文件清单条目数 {count} 超过上限 {max}")]
+    FileEntriesExceeded {
+        /// 实际条目数。
+        count: usize,
+        /// 条目数上限（512，docs/02 §4.6）。
+        max: usize,
+    },
+    /// 文件条目名非法：含 `/`（分层只经目录条目表达）或超 256B UTF-8
+    /// （docs/02 §4.6 防护规则 1；wire 只允许相对纯名）。
+    #[error("文件条目名非法（含 '/' 或超 {max} 字节）")]
+    FileNameInvalid {
+        /// 名称长度上限（256B）。
+        max: usize,
+    },
+    /// `FileRefAnnounce.total_bytes` 超过协商上限（docs/02 §4.6：默认 2GiB 可配，
+    /// 独立于剪贴板 16MiB）。
+    #[error("文件清单总字节 {total_bytes} 超过上限 {max}")]
+    FileTotalBytesExceeded {
+        /// 宣称的内容总字节。
+        total_bytes: u64,
+        /// 协商上限（默认 2GiB）。
+        max: u64,
+    },
+    /// `FileChunk.data` 超过 64KiB 单块上限（docs/02 §4.6，与 ClipChunk 同源）。
+    #[error("file chunk 数据 {len} 字节超过单块上限 {max}")]
+    FileChunkTooLarge {
+        /// 块数据实际长度。
+        len: usize,
+        /// 单块上限（64KiB）。
+        max: usize,
+    },
 }
 
 impl ProtoError {

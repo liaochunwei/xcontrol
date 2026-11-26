@@ -15,7 +15,7 @@ use crate::frame;
 use crate::input::ScreenId;
 use crate::version::ProtoVer;
 
-/// 能力位掩码（docs/05 §0.1；`u32`，bit0-3 已定义，major=1 内只增）。
+/// 能力位掩码（docs/05 §0.1；`u32`，bit0-4 已定义，major=1 内只增）。
 ///
 /// 接收方**必须容忍未知 bit**（新 minor 引入的位按 0 处理，docs/02 §5.3）；
 /// 发送端只发对端掩码声明过的能力（如剪贴板格式协商，docs/04 §2）。
@@ -31,10 +31,14 @@ impl Caps {
     pub const HTML: Self = Self(1 << 2);
     /// 绝对指针映射（bit3，docs/05 §0.1）：可接收 `MouseMoveAbs`。
     pub const ABS_POINTER: Self = Self(1 << 3);
+    /// 文件传输（bit4，docs/05 §0.1，FR-7.3）：文件通道（docs/02 §4.6）可建立；
+    /// 对端未声明时不发送 `FileRefAnnounce`。
+    pub const FILETRANSFER: Self = Self(1 << 4);
 
-    /// 已定义位掩码（bit0-3）；未知位用 [`Caps::known`] 过滤。
-    pub const KNOWN: Self =
-        Self(Self::UNICODE.0 | Self::IMAGE.0 | Self::HTML.0 | Self::ABS_POINTER.0);
+    /// 已定义位掩码（bit0-4）；未知位用 [`Caps::known`] 过滤。
+    pub const KNOWN: Self = Self(
+        Self::UNICODE.0 | Self::IMAGE.0 | Self::HTML.0 | Self::ABS_POINTER.0 | Self::FILETRANSFER.0,
+    );
 
     /// 原始位值。
     #[must_use]
@@ -427,15 +431,16 @@ mod tests {
         assert_eq!(Caps::IMAGE.bits(), 1 << 1);
         assert_eq!(Caps::HTML.bits(), 1 << 2);
         assert_eq!(Caps::ABS_POINTER.bits(), 1 << 3);
-        assert_eq!(Caps::KNOWN.bits(), 0b1111);
+        assert_eq!(Caps::FILETRANSFER.bits(), 1 << 4);
+        assert_eq!(Caps::KNOWN.bits(), 0b1_1111);
         assert!(Caps::default().bits() == 0);
-        let all = Caps::UNICODE | Caps::IMAGE | Caps::HTML | Caps::ABS_POINTER;
+        let all = Caps::UNICODE | Caps::IMAGE | Caps::HTML | Caps::ABS_POINTER | Caps::FILETRANSFER;
         assert!(all.contains(Caps::UNICODE));
-        assert!(all.contains(Caps::HTML));
+        assert!(all.contains(Caps::FILETRANSFER));
         assert!(!all.contains(Caps::from_bits(1 << 9)));
         // 未知位保留 + known 过滤（docs/05 §0.1：接收方必须容忍未知 bit）
-        let with_unknown = Caps::from_bits(all.bits() | (1 << 4) | (1 << 31));
-        assert_eq!(with_unknown.bits(), all.bits() | (1 << 4) | (1 << 31));
+        let with_unknown = Caps::from_bits(all.bits() | (1 << 5) | (1 << 31));
+        assert_eq!(with_unknown.bits(), all.bits() | (1 << 5) | (1 << 31));
         assert_eq!(with_unknown.known(), all);
         assert_eq!(with_unknown.union(Caps::HTML), with_unknown);
     }

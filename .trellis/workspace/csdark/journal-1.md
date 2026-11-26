@@ -143,3 +143,9 @@
 4. **镜像树测试的编号纪律**：Expand base = 当前下标空间上界（不是随意值）——测试里 expand_for(parent, base) 的 (2,3) vs (2,4) 错位导致连环失败。
 
 **遗留**（真实环境依赖，代码面已尽）：win/linux 平台面（docs/05 §0.2 pending 实机）；双机实测（用户冒烟后合 main）。
+
+## 2026-11-27 · 追加：wayland 文件引用面（24b8b03）
+
+**结果**：platform/wayland.rs write/read_file_urls（text/uri-list mime 直通——与 PNG 已实测路径同构，url crate percent-encoding；xtask 白名单过审）；app 检测/挂板 cfg 门控 macos → macos+wayland。linux target 编译级验证 PASS；行为实测待 Wayland 实机。
+
+**经验**：跨平台编译检查的真实边界——clipboard crate 可 --target linux check（纯 Rust 树），app 层 wayland feature 会拉 gpui/zbus/wayland-backend（build script 需系统 wayland 库）——app 级 linux 编译验证只能靠 Linux CI/实机。cfg 门控的语义分层（平台绑定层可 check、组合层靠 CI）是分工关键。

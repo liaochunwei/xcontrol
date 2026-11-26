@@ -16,11 +16,13 @@ use xcontrol_proto::{FileExpand, FilePullReq, FileRefAnnounce};
 /// 每连接同时活动 transfer 上限（docs/02 §4.6 防护规则 7）。
 pub const MAX_ACTIVE_TRANSFERS: usize = 4;
 
-/// 已登记的清单元数据（下标空间 + 条目尺寸表；不含路径）。
+/// 已登记的清单元数据（下标空间 + 条目尺寸/种类表；不含路径）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RegisteredManifest {
     /// 条目尺寸表（下标空间随 announce + FileExpand 连续增长）。
     entry_sizes: Vec<u64>,
+    /// 条目种类表（与 sizes 同序；枚举分支判定）。
+    entry_kinds: Vec<bool>,
 }
 
 /// 拉取校验产出：`Grant` = 许可源端读取该段；`Violation` = 协议违规（断开）。
@@ -102,6 +104,11 @@ impl FileServe {
             announce.transfer_id,
             RegisteredManifest {
                 entry_sizes: announce.entries.iter().map(|entry| entry.size).collect(),
+                entry_kinds: announce
+                    .entries
+                    .iter()
+                    .map(|entry| entry.kind == xcontrol_proto::FileEntryKind::Dir)
+                    .collect(),
             },
         );
     }
@@ -125,6 +132,12 @@ impl FileServe {
         manifest
             .entry_sizes
             .extend(expand.entries.iter().map(|entry| entry.size));
+        manifest.entry_kinds.extend(
+            expand
+                .entries
+                .iter()
+                .map(|entry| entry.kind == xcontrol_proto::FileEntryKind::Dir),
+        );
         Ok(())
     }
 
@@ -186,6 +199,23 @@ impl FileServe {
     #[must_use]
     pub fn manifest_count(&self) -> usize {
         self.manifests.keys.len()
+    }
+
+    /// 指定清单的当前下标空间长度（Expand base 计算；未知 id → 0）。
+    #[must_use]
+    pub fn index_space_len(&self, transfer_id: u32) -> u32 {
+        self.manifests
+            .get(transfer_id)
+            .map_or(0, |manifest| manifest.entry_sizes.len() as u32)
+    }
+
+    /// 指定下标的条目是否目录（枚举分支判定；未知 id/越界 → None）。
+    #[must_use]
+    pub fn entry_is_dir(&self, transfer_id: u32, entry: u32) -> Option<bool> {
+        self.manifests
+            .get(transfer_id)
+            .and_then(|manifest| manifest.entry_kinds.get(entry as usize))
+            .copied()
     }
 }
 

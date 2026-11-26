@@ -40,12 +40,10 @@ use xcontrol_core::file_serve::{FileServe, ServeVerdict};
 use xcontrol_core::file_tx::FileTx;
 use xcontrol_net::transport::TcpTransport;
 use xcontrol_net::{HandshakeThrottle, NetError, serve};
-#[cfg(feature = "macos")]
-use xcontrol_proto::FileEntryKind;
 use xcontrol_proto::file::{
     FileAck, FileBind, FileChunk, FileEnd, FileErrCode, FileError, FileMsg, FilePullReq,
 };
-use xcontrol_proto::{FileEntry, FileRefAnnounce, Message as _, frame};
+use xcontrol_proto::{FileEntry, FileEntryKind, FileRefAnnounce, Message as _, frame};
 
 /// 观测日志 target（文件域独立命名，诊断可分辨于剪贴板流量）。
 pub const TARGET: &str = "session::file";
@@ -105,6 +103,12 @@ pub struct FileHub {
     /// 本机清单对应的实际路径（与 outbound.entries 同序；b-平台：serve 分块
     /// 发送按此打开文件——路径不出 wire、仅本机持有，docs/07 §9 元数据最小化）。
     outbound_paths: Vec<PathBuf>,
+    /// 展开后子条目的本机路径（按全局下标；Expand 时追加——源端枚举/读取面；
+    /// 顶层/未展开下标为 None，读取回退 outbound_paths）。
+    outbound_child_paths: Vec<Option<PathBuf>>,
+    /// 接收端相对路径表（按全局下标；顶层 = 条目名，子条目 = 父相对路径/子名
+    /// ——暂存树与挂板树的还原依据）。
+    rel_paths: Vec<String>,
     /// 传输 id 分配器（每进程单调；拉取/通告双方独立命名空间）。
     next_transfer_id: u32,
     /// 拉取会话（切片 d：进度/部分成功/取消的记账面；None = 空闲）。
@@ -197,6 +201,11 @@ impl FileHub {
         }
     }
 
+    /// 拉取队列批量入队（Expand 后文件子条目续拉；排序 = 下标序）。
+    pub fn extend_pull_queue(&mut self, ids: Vec<(u32, u32)>) {
+        self.pull_queue.extend(ids);
+    }
+
     /// 取走待发拉取请求（泵消费：单条优先，其次队列首条）。
     pub fn take_pull_request(&mut self) -> Option<(u32, u32)> {
         if self.pull_request.is_some() {
@@ -206,6 +215,19 @@ impl FileHub {
             return Some(self.pull_queue.remove(0));
         }
         None
+    }
+
+    /// 拉取面是否仍有待发请求（收敛判定用）。
+    #[must_use]
+    pub fn pull_pending(&self) -> bool {
+        self.pull_request.is_some() || !self.pull_queue.is_empty()
+    }
+
+    /// 目录展开登记（接收端）：父目录壳建立并入挂板面（目录树随顶层目录
+    /// 带出——Finder 粘贴目录即整树）；进度 ok 计数同步（显示面）。
+    pub fn note_expanded_parent(&mut self, transfer_id: u32, parent: u32, shell: PathBuf) {
+        self.record_progress(transfer_id, true, Some(shell));
+        let _ = parent;
     }
 
     /// 拉取队列长度（诊断/测试面）。
@@ -218,6 +240,60 @@ impl FileHub {
     #[must_use]
     pub fn outbound_paths(&self) -> &[PathBuf] {
         &self.outbound_paths
+    }
+
+    /// 全局下标 → 本机路径（子条目经 outbound_child_paths；越界 → None）。
+    #[must_use]
+    pub fn path_at(&self, index: usize) -> Option<PathBuf> {
+        match self.outbound_child_paths.get(index) {
+            // 子条目下标：Some(Some(path)) = 展开登记路径；Some(None) = 无路径
+            Some(child) => child.clone(),
+            // 顶层下标（子表未覆盖）：回退顶层路径表
+            None => self.outbound_paths.get(index).cloned(),
+        }
+    }
+
+    /// Expand 子条目路径登记（源端：与下标空间同步追加——base 前补 None 占位，
+    /// 防子表下标错位）。
+    pub fn push_child_paths(&mut self, base: usize, paths: Vec<Option<PathBuf>>) {
+        while self.outbound_child_paths.len() < base {
+            self.outbound_child_paths.push(None);
+        }
+        self.outbound_child_paths.extend(paths);
+    }
+
+    /// 接收端：Expand 子条目追加进 pending 槽 + 相对路径表（返回新条目区间
+    /// `[base, base+len)`；无 pending → None）。
+    pub fn append_pending_entries(
+        &mut self,
+        base: usize,
+        entries: Vec<FileEntry>,
+        rel_prefix: &str,
+    ) -> Option<(usize, usize)> {
+        let slot = self.pending.as_mut()?;
+        if base != slot.entries.len() {
+            return None;
+        }
+        // rel 表按全局下标对齐（base 前占位，防子表下标错位——同 child_paths）
+        while self.rel_paths.len() < base {
+            self.rel_paths
+                .push(format!("entry-{}", self.rel_paths.len()));
+        }
+        for entry in &entries {
+            self.rel_paths.push(format!("{rel_prefix}/{}", entry.name));
+        }
+        slot.entries.extend(entries);
+        slot.total_bytes = slot.entries.iter().map(|e| e.size).sum();
+        Some((base, slot.entries.len()))
+    }
+
+    /// 全局下标 → 相对路径（落盘树/挂板树还原；越界 → 条目名兜底）。
+    #[must_use]
+    pub fn rel_path_at(&self, index: usize) -> String {
+        self.rel_paths
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| format!("entry-{index}"))
     }
 
     /// 分配下一传输 id（单调）。
@@ -262,7 +338,16 @@ impl FileHub {
             copied_at_ms,
         ) {
             Ok(Some(announce)) => {
-                self.outbound_paths = paths;
+                self.outbound_paths = paths.clone();
+                self.outbound_child_paths.clear();
+                self.rel_paths = paths
+                    .iter()
+                    .map(|path| {
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect();
                 self.publish_manifest(announce);
             }
             Ok(None) => {}
@@ -396,6 +481,8 @@ impl FileHub {
         self.outbound = None;
         self.outbound_fp = None;
         self.outbound_paths.clear();
+        self.outbound_child_paths.clear();
+        self.rel_paths.clear();
         self.session = None;
         self.cancel_requested = false;
         self.confirm_armed = false;
@@ -537,6 +624,8 @@ async fn run_file_pump(
     let mut ref_rx = FileRefRx::new(FileRefRxConfig::default());
     let mut serving: Option<ServingEntry> = None;
     let mut staging: Option<StagingEntry> = None;
+    // 等待对端 Expand（Dir 拉取已发 PullReq；10s 无响应按条目失败收敛）
+    let mut awaiting_expand: Option<(u32, tokio::time::Instant)> = None;
     // 本机文件引用检测器（b-平台；mac 路径实测，其余平台按 docs/05 §0.2 随实装补齐）。
     #[cfg(feature = "macos")]
     let mut detector = LocalFileRefDetector::new();
@@ -561,7 +650,8 @@ async fn run_file_pump(
                         for msg in msgs {
                             violated |= on_file_msg(
                                 msg, &mut serve, &mut tx, &mut rx, &mut ref_rx,
-                                &mut serving, &mut staging, &mut out,
+                                &mut serving, &mut staging, &mut awaiting_expand,
+                                &mut out,
                             );
                         }
                         if violated {
@@ -656,7 +746,22 @@ async fn run_file_pump(
                         .pending()
                         .and_then(|slot| slot.entries.get(entry as usize))
                         .map(|entry| entry.size);
+                    let is_dir = lock_hub()
+                        .pending()
+                        .and_then(|slot| slot.entries.get(entry as usize))
+                        .is_some_and(|entry| entry.kind == FileEntryKind::Dir);
                     match size {
+                        // 目录条目（prd R1）：PullReq 触发对端 Expand——无字节流
+                        //（不 begin_pull/不建暂存）；子条目由 Expand 臂续拉入队
+                        Some(_size) if is_dir => {
+                            awaiting_expand =
+                                Some((transfer_id, tokio::time::Instant::now()));
+                            out.push(FileMsg::PullReq(FilePullReq {
+                                transfer_id,
+                                entry,
+                                offset: 0,
+                            }));
+                        }
                         Some(size) => {
                             let total =
                                 lock_hub().pending().map_or(0, |slot| slot.entries.len());
@@ -664,24 +769,21 @@ async fn run_file_pump(
                             rx.begin_pull(transfer_id, entry, size);
                             // 发送侧条目流同拍开账（本端作为源端的信用窗口记账）
                             let _ = tx.begin_entry(transfer_id, entry, size);
-                            // 暂存文件建立（docs/07 §9 专用暂存面；名字经 proto
+                            // 暂存文件建立（树形 staging/{tid}/{rel}；名字经 proto
                             // 纯名校验——路径拼接无穿越分量）
-                            let staged_name = lock_hub()
-                                .pending()
-                                .and_then(|slot| slot.entries.get(entry as usize))
-                                .map(|entry| entry.name.clone());
-                            if let Some(name) = staged_name {
-                                let dir = staging_dir();
-                                let _ = std::fs::create_dir_all(&dir);
-                                let path = dir.join(format!("{transfer_id}-{entry}-{name}"));
-                                match std::fs::File::create(&path) {
-                                    Ok(file) => {
-                                        staging = Some(StagingEntry { file, path });
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(target: TARGET, %error,
-                                            "暂存文件创建失败（拉取继续，落盘面缺失）");
-                                    }
+                            let rel = lock_hub().rel_path_at(entry as usize);
+                            let tree_root = staging_dir().join(transfer_id.to_string());
+                            let path = tree_root.join(&rel);
+                            if let Some(parent) = path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            match std::fs::File::create(&path) {
+                                Ok(file) => {
+                                    staging = Some(StagingEntry { file, path });
+                                }
+                                Err(error) => {
+                                    tracing::warn!(target: TARGET, %error,
+                                        "暂存文件创建失败（拉取继续，落盘面缺失）");
                                 }
                             }
                             out.push(FileMsg::PullReq(FilePullReq {
@@ -785,6 +887,23 @@ async fn run_file_pump(
                     );
                 }
 
+                // 会话收敛判定（切片 d R1 目录面：事件驱动收敛替代计数完成）——
+                // 队列/请求/接收/服务/等待全空 = 全部条目处理完毕 → 收尾挂板
+                if lock_hub().session().is_some()
+                    && !lock_hub().pull_pending()
+                    && rx.active().is_none()
+                    && serving.is_none()
+                    && awaiting_expand.is_none()
+                {
+                    let staged = lock_hub().finalize_session();
+                    if staged.is_empty() {
+                        tracing::warn!(target: TARGET,
+                            "拉取会话收敛：无成功条目（pending 保留，可经托盘重试）");
+                    } else {
+                        mount_list(&staged, "完成");
+                    }
+                }
+
                 // 违规断开文件通道（独立连接语义；控制/剪贴板不受影响）
                 if violated {
                     break;
@@ -813,6 +932,7 @@ fn on_file_msg(
     ref_rx: &mut FileRefRx,
     serving: &mut Option<ServingEntry>,
     staging: &mut Option<StagingEntry>,
+    awaiting: &mut Option<(u32, tokio::time::Instant)>,
     out: &mut Vec<FileMsg>,
 ) -> bool {
     match msg {
@@ -858,6 +978,35 @@ fn on_file_msg(
                 offset,
                 remaining,
             } => {
+                // 目录条目（prd R1）：有界枚举 → FileExpand（无字节流；子条目
+                // 入接收端下标空间后由其续拉，子目录经再展开递归）
+                if serve.entry_is_dir(transfer_id, entry) == Some(true) {
+                    let base = serve.index_space_len(transfer_id);
+                    let Some(root) = lock_hub().path_at(entry as usize) else {
+                        out.push(FileMsg::Error(FileError {
+                            transfer_id,
+                            entry: Some(entry),
+                            code: FileErrCode::NOT_FOUND,
+                        }));
+                        serve.release(transfer_id);
+                        return false;
+                    };
+                    let (entries, child_paths) = enumerate_dir(&root, 1, DIR_MAX_ENTRIES_PER_BATCH);
+                    let expand = xcontrol_proto::file::FileExpand {
+                        transfer_id,
+                        parent: entry,
+                        base,
+                        entries,
+                    };
+                    if let Err(reason) = serve.register_expand(&expand) {
+                        tracing::warn!(target: TARGET, reason, "源端 Expand 注册失败（断开）");
+                        return true;
+                    }
+                    lock_hub().push_child_paths(base as usize, child_paths);
+                    out.push(FileMsg::Expand(expand));
+                    serve.release(transfer_id);
+                    return false;
+                }
                 match open_serving(transfer_id, entry, offset, remaining) {
                     Ok(stream) => {
                         *serving = Some(stream);
@@ -926,13 +1075,45 @@ fn on_file_msg(
             tracing::warn!(target: TARGET, "文件通道内重复 FileBind（绑定唯一，违规）");
             true
         }
-        // Expand：子树展开（切片 d 目录面）——登记校验面已备（serve），本阶段
-        // 不会被对端发出；收到按登记处理（base 不连续 = 违规断开）。
+        // Expand：子树展开（切片 d 目录面，prd R1）——登记 + pending 追加 +
+        // 目录壳建立 + 文件子条目续拉入队。
         FileMsg::Expand(expand) => {
             if let Err(reason) = serve.register_expand(&expand) {
                 tracing::warn!(target: TARGET, reason, "FileExpand 下标不连续（违规）");
                 true
             } else {
+                let rel_prefix = lock_hub().rel_path_at(expand.parent as usize);
+                let base_usize = expand.base as usize;
+                let appended = lock_hub().append_pending_entries(
+                    base_usize,
+                    expand.entries.clone(),
+                    &rel_prefix,
+                );
+                if let Some((base, new_len)) = appended {
+                    // 暂存树根 + 父目录壳（mkdir -p；顶层父入挂板面）
+                    let tree_root = staging_dir().join(expand.transfer_id.to_string());
+                    let parent_shell = tree_root.join(&rel_prefix);
+                    let _ = std::fs::create_dir_all(&parent_shell);
+                    // 子目录壳（空子目录也落地）
+                    for (offset, entry) in expand.entries.iter().enumerate() {
+                        if entry.kind == FileEntryKind::Dir {
+                            let rel = format!("{rel_prefix}/{}", entry.name);
+                            let _ = std::fs::create_dir_all(tree_root.join(rel));
+                        }
+                        let _ = offset;
+                    }
+                    // 顶层父：壳路径入挂板面（子树随目录带出）
+                    if !rel_prefix.contains('/') {
+                        let transfer_id = expand.transfer_id;
+                        lock_hub().note_expanded_parent(transfer_id, expand.parent, parent_shell);
+                    }
+                    // 文件子条目续拉（下标序；Dir 子条目拉取触发再展开）
+                    let ids: Vec<(u32, u32)> = (base..new_len)
+                        .map(|index| (expand.transfer_id, index as u32))
+                        .collect();
+                    lock_hub().extend_pull_queue(ids);
+                }
+                *awaiting = None;
                 false
             }
         }
@@ -940,6 +1121,75 @@ fn on_file_msg(
         FileMsg::Ack(ack) => {
             let _ = tx.on_ack(ack.seq);
             false
+        }
+    }
+}
+
+/// 目录有界枚举上限：最大深度（父目录 = 第 1 层；docs/02 §4.6 防护规则 2）。
+pub const DIR_MAX_DEPTH: usize = 4;
+/// 单批 Expand 条目上限（同清单单帧承载约束，docs/02 §4.6 防护规则 2）。
+pub const DIR_MAX_ENTRIES_PER_BATCH: usize = 512;
+
+/// 目录有界枚举（源端，prd R1）：深度优先收集子条目（扁平化 + 相对层深），
+/// 单批 ≤ [`DIR_MAX_ENTRIES_PER_BATCH`]、深度 ≤ [`DIR_MAX_DEPTH`]；
+/// 不可读条目跳过（fail-soft）。返回 (条目, 子路径表)。
+fn enumerate_dir(
+    root: &PathBuf,
+    depth_used: usize,
+    remaining: usize,
+) -> (Vec<FileEntry>, Vec<Option<PathBuf>>) {
+    let mut entries = Vec::new();
+    let mut paths: Vec<Option<PathBuf>> = Vec::new();
+    let budget = remaining.min(DIR_MAX_ENTRIES_PER_BATCH);
+    enumerate_recursive(root, depth_used, &mut entries, &mut paths, budget);
+    (entries, paths)
+}
+
+fn enumerate_recursive(
+    dir: &PathBuf,
+    depth_used: usize,
+    entries: &mut Vec<FileEntry>,
+    paths: &mut Vec<Option<PathBuf>>,
+    budget: usize,
+) {
+    if depth_used > DIR_MAX_DEPTH || entries.len() >= budget {
+        return;
+    }
+    let Ok(reader) = std::fs::read_dir(dir) else {
+        return; // 不可读目录：fail-soft（枚举面缺失，不致命）
+    };
+    for item in reader.flatten() {
+        if entries.len() >= budget {
+            return;
+        }
+        let Ok(meta) = item.metadata() else {
+            continue;
+        };
+        let Some(name) = item.file_name().into_string().ok() else {
+            continue; // 非 UTF-8 名：跳过（wire name 要求 UTF-8 纯名）
+        };
+        let is_dir = meta.is_dir();
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+        // 目录 size 记 0（聚合估计不参与拉流判定——目录经 Expand 展开无字节流）
+        let size = if is_dir { 0 } else { meta.len() };
+        entries.push(FileEntry {
+            name,
+            size,
+            mtime_ms,
+            kind: if is_dir {
+                FileEntryKind::Dir
+            } else {
+                FileEntryKind::File
+            },
+            children: 0,
+        });
+        paths.push(Some(item.path()));
+        if is_dir {
+            enumerate_recursive(&item.path(), depth_used + 1, entries, paths, budget);
         }
     }
 }
@@ -1034,11 +1284,7 @@ fn record_rx_action(
             if let Some(staged) = staging.take() {
                 drop(staged.file); // 落盘句柄收尾（write_all 已刷入 OS 页缓存）
             }
-            if complete {
-                // 部分成功（prd R3）：成功条目照常挂板，失败清单在 hub
-                finalize_pull();
-            }
-            let _ = entry;
+            let _ = complete; // 完成判定 = tick 收敛式（队列/接收/服务/等待全空）
             false
         }
         FileRxAction::EntryFailed {
@@ -1049,14 +1295,10 @@ fn record_rx_action(
             lock_hub()
                 .failures
                 .push(format!("transfer {transfer_id}：{reason}"));
-            let complete = lock_hub().record_progress(transfer_id, false, None);
+            lock_hub().record_progress(transfer_id, false, None);
             serve.release(transfer_id);
             tx.reset();
             *staging = None; // 暂存流随条目失败废弃（失败条目不入挂板面）
-            if complete {
-                // 部分成功（prd R3）：已成功条目照常挂板
-                finalize_pull();
-            }
             false
         }
         FileRxAction::Violation { reason } => {
@@ -1064,19 +1306,6 @@ fn record_rx_action(
             true
         }
     }
-}
-
-/// 会话收尾（完成判定 = ok+failed ≥ total）：有成功条目 → 挂板（部分成功
-/// 语义，prd R3）+ consume_pending；全失败 → pending 保留（重试面），失败
-/// 清单在 hub.failures。
-fn finalize_pull() {
-    let staged = lock_hub().finalize_session();
-    if staged.is_empty() {
-        tracing::warn!(target: TARGET,
-            "拉取会话收尾：无成功条目（pending 保留，可经托盘重试）");
-        return;
-    }
-    mount_list(&staged, "完成");
 }
 
 /// 挂板（b-平台写路径，mac 实测；其余平台待实装——暂存文件已就绪，路径提示）。

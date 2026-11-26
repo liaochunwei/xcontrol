@@ -21,6 +21,7 @@
 //! | [`clip_rx`] | [`ClipRx`] 剪贴板接收重组状态机（bind/上限/累计/seq 窗口/10s 超时/blake3 交付） | docs/02 §6，docs/04 §3 |
 //! | [`clip_plan`] | 剪贴板发送计划生成（内容 → 分块 + blake3；超限不传输） | docs/02 §6.2，docs/04 §3 |
 //! | [`clip_tx`] | [`ClipTx`] 剪贴板发送端信用窗口（初始 4 块 + Ack 归还） | docs/02 §6.3 |
+//! | [`file_ref`] | 文件引用清单构建 + pending 槽（代次失效 + `(name,size)` 回环指纹） | docs/02 §4.6，docs/04 §8 |
 //!
 //! # 分层位置
 //!
@@ -72,6 +73,7 @@ pub mod clip_plan;
 pub mod clip_rx;
 pub mod clip_tx;
 pub mod clock;
+pub mod file_ref;
 pub mod hotkey;
 pub mod layout;
 pub mod mapping;
@@ -85,6 +87,9 @@ pub mod sink;
 pub use clip_rx::{CLIP_TIMEOUT_MS, ClipRx, ClipRxAction, ClipRxConfig};
 pub use clip_tx::{ClipTx, INITIAL_CREDIT_CHUNKS};
 pub use clock::{Clock, SystemClock, TestClock};
+pub use file_ref::{
+    FileRefRx, FileRefRxConfig, FileRefVerdict, PendingSlot, build_manifest, manifest_fingerprint,
+};
 pub use hotkey::{
     FilterOutcome, HotkeyCombo, HotkeyError, HotkeyFilter, HotkeyId, HotkeySet, ModFamilies,
 };

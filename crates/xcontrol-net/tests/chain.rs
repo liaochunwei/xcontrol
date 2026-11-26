@@ -207,9 +207,12 @@ fn run_negotiation(
         assert!(
             outcome.actions.iter().any(|action| matches!(
                 action,
-                SessionAction::Notice(Notice::HandshakeComplete { minor: 1, .. })
+                SessionAction::Notice(Notice::HandshakeComplete {
+                    minor: xcontrol_proto::PROTO_MINOR,
+                    ..
+                })
             )),
-            "协商完成通知（minor = min(1,1)，11-19-m5-layout 版本升 1.1）"
+            "协商完成通知（minor = min(双端 CURRENT)，随 PROTO_MINOR 锚点走）"
         );
         apply_actions(&outcome.actions, sink, &mut client_out.on_send());
     }
@@ -231,11 +234,17 @@ fn run_negotiation(
     }
     assert_eq!(
         client_session.negotiated(),
-        Some(ProtoVer { major: 1, minor: 1 })
+        Some(ProtoVer {
+            major: 1,
+            minor: xcontrol_proto::PROTO_MINOR
+        })
     );
     assert_eq!(
         host_session.negotiated(),
-        Some(ProtoVer { major: 1, minor: 1 })
+        Some(ProtoVer {
+            major: 1,
+            minor: xcontrol_proto::PROTO_MINOR
+        })
     );
 }
 

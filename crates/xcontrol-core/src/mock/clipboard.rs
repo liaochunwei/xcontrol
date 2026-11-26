@@ -14,12 +14,15 @@
 // 计划生成已通用化到公开模块 [`crate::clip_plan`]（11-20 app 剪贴板接线：
 // 本机剪贴板读出的文本经同一算法上 wire）——此处类型转发，`transfer_plan`
 // 原签名/返回类型路径不变（mock 消费方与对拍测试零改动）。
+use xcontrol_proto::FileEntry;
+
 pub use crate::clip_plan::{TransferPlan, WIRE_CHUNK_LEN};
 
 /// 内存剪贴板：内容 + 变更计数（watch 触发）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MockClipboard {
     content: Vec<u8>,
+    file_refs: Vec<FileEntry>,
     change_count: u64,
 }
 
@@ -39,6 +42,21 @@ impl MockClipboard {
     pub fn set_content(&mut self, content: Vec<u8>) {
         self.change_count = self.change_count.saturating_add(1);
         self.content = content;
+        self.file_refs.clear();
+    }
+
+    /// 写入文件引用（FR-7.3 元数据面源端；递增变更计数并清空文本/图片内容
+    /// ——同板多域时以最后写入者为准，docs/04 §8.2）。
+    pub fn set_file_refs(&mut self, refs: Vec<FileEntry>) {
+        self.change_count = self.change_count.saturating_add(1);
+        self.file_refs = refs;
+        self.content.clear();
+    }
+
+    /// 当前文件引用（探测路径的读取口，docs/05 §0.2 检测列的 mock 等价物）。
+    #[must_use]
+    pub fn file_refs(&self) -> &[FileEntry] {
+        &self.file_refs
     }
 
     /// 当前内容。

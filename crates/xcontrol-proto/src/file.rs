@@ -187,10 +187,7 @@ impl FileRefAnnounce {
     /// - 任一条目名非法 → [`ProtoError::FileNameInvalid`]；
     /// - `total_bytes > max_total_bytes` → [`ProtoError::FileTotalBytesExceeded`]；
     /// - postcard 解码失败 / 尾部残留 → [`ProtoError::Postcard`]。
-    pub fn decode_with_limit(
-        payload: &[u8],
-        max_total_bytes: u64,
-    ) -> Result<Self, ProtoError> {
+    pub fn decode_with_limit(payload: &[u8], max_total_bytes: u64) -> Result<Self, ProtoError> {
         let announce: Self = frame::decode_postcard(payload)?;
         announce.validate()?;
         if announce.total_bytes > max_total_bytes {
@@ -517,9 +514,7 @@ pub fn decode_file(kind: u8, payload: &[u8]) -> Result<Option<FileMsg>, ProtoErr
     }
     let msg = match kind {
         frame::kind::FILE_BIND => FileMsg::Bind(frame::decode_postcard::<FileBind>(payload)?),
-        frame::kind::FILE_REF_ANNOUNCE => {
-            FileMsg::RefAnnounce(FileRefAnnounce::decode(payload)?)
-        }
+        frame::kind::FILE_REF_ANNOUNCE => FileMsg::RefAnnounce(FileRefAnnounce::decode(payload)?),
         frame::kind::FILE_PULL_REQ => {
             FileMsg::PullReq(frame::decode_postcard::<FilePullReq>(payload)?)
         }
@@ -634,7 +629,10 @@ mod tests {
                     session_id: [0x11; 16],
                 }),
             ),
-            (frame::kind::FILE_REF_ANNOUNCE, FileMsg::RefAnnounce(announce())),
+            (
+                frame::kind::FILE_REF_ANNOUNCE,
+                FileMsg::RefAnnounce(announce()),
+            ),
             (
                 frame::kind::FILE_PULL_REQ,
                 FileMsg::PullReq(FilePullReq {
@@ -762,7 +760,10 @@ mod tests {
                 "名 {name:?} 应拒绝"
             );
             let mut out = Vec::new();
-            assert!(bad.encode_payload(&mut out).is_err(), "名 {name:?} 编码期拒绝");
+            assert!(
+                bad.encode_payload(&mut out).is_err(),
+                "名 {name:?} 编码期拒绝"
+            );
         }
         // 恰好 256B 合法
         let ok = FileRefAnnounce {
@@ -821,7 +822,13 @@ mod tests {
         let mut out = Vec::new();
         let err = big.encode_payload(&mut out).unwrap_err();
         assert!(
-            matches!(err, ProtoError::PayloadTooLarge { max: FileRefAnnounce::MAX_ENCODED_LEN, .. }),
+            matches!(
+                err,
+                ProtoError::PayloadTooLarge {
+                    max: FileRefAnnounce::MAX_ENCODED_LEN,
+                    ..
+                }
+            ),
             "超预算应编码期拒绝：{err}"
         );
         // 常规清单远小于预算

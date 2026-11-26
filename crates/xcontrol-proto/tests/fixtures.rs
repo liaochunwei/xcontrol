@@ -15,8 +15,8 @@ use xcontrol_proto::xkey::{CK_VOLUME_UP, KEY_A};
 use xcontrol_proto::{
     Axis, Caps, ChannelBind, ClipAck, ClipAnnounce, ClipChunk, ClipEnd, ClipFormat, ClipMsg,
     CtrlMsg, ErrCode, FileAck, FileBind, FileCancel, FileChunk, FileEnd, FileEntry, FileEntryKind,
-    FileErrCode, FileError, FileExpand, FileMsg, FilePullReq, FileRefAnnounce, InputEvent, KeyState,
-    KindClass, Mods, MouseButton, Options, ProtoError, ProtoVer, ScreenEdge, decode_clip,
+    FileErrCode, FileError, FileExpand, FileMsg, FilePullReq, FileRefAnnounce, InputEvent,
+    KeyState, KindClass, Mods, MouseButton, Options, ProtoError, ProtoVer, ScreenEdge, decode_clip,
     decode_ctrl, decode_file, decode_frame, kind_class,
 };
 

@@ -385,8 +385,8 @@ fn keyboard_causal_order_strictly_preserved() {
         },
     ]);
     host.pump_capture(&mut source);
-    // 边界注入：未知 kind 帧（0x60，未来 minor 消息）按 len 跳过（docs/02 §4.1）
-    host.inject_unknown_frame(0x60, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    // 边界注入：未知 kind 帧（0x61，文件域止于 0x60 后的下一空档）按 len 跳过（docs/02 §4.1）
+    host.inject_unknown_frame(0x61, &[0xDE, 0xAD, 0xBE, 0xEF]);
     // 批次 2：KeyRepeat C → C↑ → Meta↑（因果顺序 = 脚本顺序）
     source.push(InputEvent::KeyRepeat { code: KEY_C });
     source.push(InputEvent::Key {
@@ -861,12 +861,13 @@ fn heartbeat_dead_after_nine_seconds_silent_peer() {
 
 // ————————————————————————— 场景 7：版本协商 —————————————————————————
 
-/// 场景 7a（docs/02 §5）：1.0 ↔ 1.1 降级共存双向跑通（11-19-m5-layout 起
-/// 本端 CURRENT = 1.1，模拟对端为 1.0）——
-/// ① 真实 1.1 主控会话接受模拟 1.0 从机的 HelloBack{1,0}（协商 minor=0）并按
+/// 场景 7a（docs/02 §5）：1.0 ↔ 本端 CURRENT 降级共存双向跑通（本端 CURRENT
+/// 随 PROTO_MINOR 锚点走——11-19-m5-layout 时为 1.1，11-26 文件域起为 1.2；
+/// 模拟对端恒为 1.0）——
+/// ① 真实主控会话接受模拟 1.0 从机的 HelloBack{1,0}（协商 minor=0）并按
 ///    minor 0 消息集完成 Ping/Pong 往返；
-/// ② 真实 1.1 从机会话接受模拟 1.0 主控的 Hello{1,0}（HelloBack 仍为本端
-///    CURRENT=1.1，模拟 1.0 侧 negotiate 接受）。
+/// ② 真实从机会话接受模拟 1.0 主控的 Hello{1,0}（HelloBack 仍为本端
+///    CURRENT，模拟 1.0 侧 negotiate 接受）。
 #[test]
 fn version_negotiation_minor_downgrade_coexists() {
     // —— ① 真实 host（1.1）↔ 模拟 1.0 从机 ——
@@ -886,7 +887,7 @@ fn version_negotiation_minor_downgrade_coexists() {
     host.apply(&actions);
     host.flush_out();
 
-    // 模拟 1.0 从机收到 Hello{1,1}：negotiate(1.0, 1.1) 接受 → 回 HelloBack{1,0}
+    // 模拟 1.0 从机收到 Hello{CURRENT}：negotiate(1.0, CURRENT) 接受 → 回 HelloBack{1,0}
     let plaintext = recv_decrypted(&mut client_wire, &mut sim_st);
     let frame = must("帧解码", decode_frame(&plaintext));
     let msg = must(
@@ -896,11 +897,11 @@ fn version_negotiation_minor_downgrade_coexists() {
     let Some(CtrlMsg::Hello { proto, .. }) = msg else {
         panic!("应为 Hello：{msg:?}");
     };
-    assert_eq!(proto, ProtoVer::CURRENT, "Hello 恒为本端 CURRENT（1.1）");
+    assert_eq!(proto, ProtoVer::CURRENT, "Hello 恒为本端 CURRENT");
     assert_eq!(
         negotiate(ProtoVer { major: 1, minor: 0 }, proto),
         Ok(ProtoVer { major: 1, minor: 0 }),
-        "1.0 从机接受 1.1 主控（降级共存：会话 minor 取 min）"
+        "1.0 从机接受 CURRENT 主控（降级共存：会话 minor 取 min）"
     );
     let hello_back = CtrlMsg::HelloBack {
         proto: ProtoVer { major: 1, minor: 0 },
@@ -920,7 +921,7 @@ fn version_negotiation_minor_downgrade_coexists() {
             action,
             SessionAction::Notice(Notice::HandshakeComplete { minor: 0, .. })
         )),
-        "主控完成协商：minor = min(0, 1) = 0"
+        "主控完成协商：minor = min(0, CURRENT) = 0"
     );
     assert_eq!(
         host.session.negotiated(),
@@ -1083,7 +1084,10 @@ fn version_negotiation_major_mismatch_rejected() {
         msg,
         Some(CtrlMsg::Error {
             code: xcontrol_proto::ErrCode::UNSUPPORTED_VERSION,
-            msg: "版本不兼容：本地 1.1, 对端 2.0".into(),
+            msg: format!(
+                "版本不兼容：本地 1.{}, 对端 2.0",
+                xcontrol_proto::PROTO_MINOR
+            ),
         })
     );
 

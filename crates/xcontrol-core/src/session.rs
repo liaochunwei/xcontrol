@@ -101,6 +101,12 @@ use crate::mods::ModifierTracker;
 /// ModifierSync 周期：1s（docs/03 §3「心跳内周期性（1s）校验状态一致」）。
 pub const MODIFIER_SYNC_INTERVAL_MS: u64 = 1000;
 
+/// `Layout` 下发所需的会话 minor（docs/02 §4.3 修订 2026-11-19：`ScreenInfo.owner`
+/// 属 1.1 wire 形态）。**特性级版本门控常量，不得用 [`xcontrol_proto::PROTO_MINOR`]**
+/// ——后者随文件域（1.2）提升，会误停 1.1 对端的布局下发（11-26-file-ref-announce
+/// 实装时自查发现并修正）。
+pub const LAYOUT_MIN_MINOR: u8 = 1;
+
 /// 会话角色（docs/01：Host = 主控，Client = 从机；决定 Hello 方向）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -233,8 +239,9 @@ pub enum LocalCmd {
     },
     /// 主控下发当前布局（FR-1.3 协商，M5；`Session::set_layout` 预装后由执行层
     /// 在握手完成/布局配置变更时触发）：出站 `CtrlMsg::Layout{screens}`。
-    /// 内部门控：仅 Host、布局非空、协商 minor ≥ 1（`ScreenInfo.owner` 属 1.1
-    /// wire 形态，docs/02 §4.3 修订记录/§5.3 版本门控）——不满足时无动作。
+    /// 内部门控：仅 Host、布局非空、协商 minor ≥ [`LAYOUT_MIN_MINOR`]（1.1，
+    /// `ScreenInfo.owner` 属 1.1 wire 形态，docs/02 §4.3 修订记录/§5.3 版本门控）
+    /// ——不满足时无动作。
     PublishLayout,
 }
 
@@ -1413,15 +1420,17 @@ impl<C: Clock> Session<C> {
             }
             LocalCmd::PublishLayout => {
                 // M5 布局下发（FR-1.3 协商）：仅 Host、布局非空、协商 minor ≥
-                // 本实现 wire 级（ScreenInfo.owner 属 1.1 形态——1.0 对端按旧
-                // 结构解码会违规断开，docs/02 §4.3 修订记录/§5.3 版本门控）。
+                // Layout 特性自身版本（`LAYOUT_MIN_MINOR`——**不得**用
+                // `PROTO_MINOR`：那是本实现 wire 级，随文件域（1.2）提升，
+                // 门控会误伤 1.1 对端。ScreenInfo.owner 属 1.1 形态——1.0 对端
+                // 按旧结构解码会违规断开，docs/02 §4.3 修订记录/§5.3 版本门控）。
                 // negotiated minor = min(双方) ≤ 本端 minor：≥ 即两端同级。
                 if self.role != Role::Host || self.layout.is_empty() {
                     return Vec::new();
                 }
                 if !self
                     .negotiated
-                    .is_some_and(|ver| ver.minor >= xcontrol_proto::PROTO_MINOR)
+                    .is_some_and(|ver| ver.minor >= LAYOUT_MIN_MINOR)
                 {
                     return Vec::new();
                 }
@@ -2273,7 +2282,7 @@ mod tests {
         for event in [
             SessionEvent::Timer,
             SessionEvent::Local(LocalCmd::Resume),
-            SessionEvent::Frame(FramePayload::Unknown { kind: 0x60 }),
+            SessionEvent::Frame(FramePayload::Unknown { kind: 0x61 }),
         ] {
             assert_eq!(client.step(event), Err(StateError::AlreadyDisconnected));
         }
@@ -2296,7 +2305,7 @@ mod tests {
         assert_eq!(session.state(), &SessionState::Handshaking);
         assert_eq!(session.session_id(), Some(derive_session_id(&[0xAB; 32])));
 
-        // minor 1.1 ↔ 1.7 → 会话 minor = 1
+        // minor 1.2（本端 CURRENT）↔ 1.7 → 会话 minor = 2
         let actions = session
             .step(SessionEvent::Frame(FramePayload::Ctrl(hello_msg(1, 7))))
             .unwrap();
@@ -2317,11 +2326,11 @@ mod tests {
             actions[1],
             SessionAction::Notice(Notice::HandshakeComplete {
                 session_id: derive_session_id(&[0xAB; 32]),
-                minor: 1,
+                minor: 2, // min(本端 CURRENT=1.2, 对端 1.7)
             })
         );
         assert_eq!(session.state(), &SessionState::Running { paused: false });
-        assert_eq!(session.negotiated(), Some(ProtoVer { major: 1, minor: 1 }));
+        assert_eq!(session.negotiated(), Some(ProtoVer { major: 1, minor: 2 }));
         assert_eq!(session.peer_name(), Some("peer"));
         assert_eq!(session.peer_instance_id(), Some([3; 16]));
         assert_eq!(session.peer_caps(), Some(Caps::UNICODE));
@@ -2363,11 +2372,11 @@ mod tests {
             actions,
             vec![SessionAction::Notice(Notice::HandshakeComplete {
                 session_id: derive_session_id(&[0xCD; 32]),
-                minor: 1, // min(1, 7)
+                minor: 2, // min(本端 CURRENT=1.2, 对端 1.7)
             })]
         );
         assert_eq!(session.state(), &SessionState::Running { paused: false });
-        assert_eq!(session.negotiated(), Some(ProtoVer { major: 1, minor: 1 }));
+        assert_eq!(session.negotiated(), Some(ProtoVer { major: 1, minor: 2 }));
     }
 
     /// major 不等 → Error{UnsupportedVersion} + 断开（docs/02 §5.2）。
@@ -2387,7 +2396,7 @@ mod tests {
                 seq: 0,
                 msg: Outbound::Ctrl(CtrlMsg::Error {
                     code: ErrCode::UNSUPPORTED_VERSION,
-                    msg: "版本不兼容：本地 1.1, 对端 2.0".into(),
+                    msg: "版本不兼容：本地 1.2, 对端 2.0".into(),
                 })
             }
         );
@@ -2543,7 +2552,7 @@ mod tests {
         ready_running(&mut session);
         clock.advance(8000);
         session
-            .step(SessionEvent::Frame(FramePayload::Unknown { kind: 0x60 }))
+            .step(SessionEvent::Frame(FramePayload::Unknown { kind: 0x61 }))
             .unwrap();
         clock.advance(8999); // t=16999
         session.step(SessionEvent::Timer).unwrap();

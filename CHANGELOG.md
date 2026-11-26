@@ -8,6 +8,14 @@
 
 ### Added
 
+- **FR-7.3 切片 a：文件引用元数据面（协议与状态机层）**：XCP 1.2 文件域九消息实装
+  （`xcontrol-proto::file`，kind 0x58–0x60，golden fixtures 26→35，解码层强制清单
+  ≤512 条/名称 ≤256B 纯名禁 `/`·`.`·`..`·NUL/总字节 ≤协商上限/chunk ≤64KiB，
+  清单单帧承载编码期校验）；`PROTO_MINOR` 1→2、`CAP_FILETRANSFER`（bit4）；
+  core 新增 `file_ref` 模块——发送侧清单构建（空清单不广播、超限 fail-fast、
+  total_bytes 聚合）+ 接收侧 pending 单槽（代次失效"最后复制者赢"、`(name,size)`
+  blake3 回环指纹不含 mtime/路径、`(origin_id, seq)` 去重首实装）+ mock 剪贴板
+  文件引用槽（`mock-platform`）。文件 TCP 通道与 app 接线随切片 b。
 - **FR-7.3 跨设备文件复制粘贴立项（规范先行，代码未动）**：复制端仅同步文件元数据
   清单，接收端在用户粘贴时才经文件通道拉流物化——跨设备复制对齐本地体验。
   [ADR-0004](docs/adr/0004-file-transfer-channel-and-materialization.md) 定稿通道拓扑
@@ -20,6 +28,11 @@
   （元数据面 → 通道拉流 → 透明粘贴 → 打磨）。
 
 ### Fixed
+
+- **`Layout` 下发门控改用特性级常量 `LAYOUT_MIN_MINOR`（1.1）**：原先错用
+  `PROTO_MINOR` 作门控——文件域实装把 PROTO_MINOR 提到 1.2 后会误停 1.1 对端的
+  布局下发（`ScreenInfo.owner` 属 1.1 形态，docs/02 §4.3 版本门控）。
+  特性门控与实现级版本常量自此分离（任务 11-26-file-ref-announce 实装自查）。
 
 - **热键切入后边缘回切失效**（FR-2.2/FR-2.5，任务 11-24-edge-switch-latency-hotkey-return）：
   热键/托盘切换接管后的回切触发边取反（取了进入边的对侧 = 远离主控的边）——改为与

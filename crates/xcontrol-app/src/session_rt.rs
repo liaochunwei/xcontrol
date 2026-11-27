@@ -1285,27 +1285,17 @@ async fn drive_session(
     };
     // 命中路由通道（捕获 filter / sink filter / 平台注册源三路汇入）。
     let (hotkey_tx, mut hotkey_rx) = mpsc::unbounded_channel::<HotkeyId>();
-    // 透明文件粘贴拦截（FR-7.3 切片 c，docs/04 §8.4）：粘贴组合 × pending 槽
-    // → 挂起/放行（paste_intercept 模块文档）。job 通道 = 拦截命中 → 会话循环
-    // spawn 物化 worker；outcome 通道 = worker → 循环（回注挂起键 / 失败提示）。
-    let (paste_job_tx, mut paste_job_rx) =
-        mpsc::unbounded_channel::<crate::paste_intercept::HeldPaste>();
-    let (paste_outcome_tx, mut paste_outcome_rx) =
-        mpsc::unbounded_channel::<crate::paste_intercept::PasteOutcome>();
-    let materializing = crate::paste_intercept::new_materializing_flag();
+    // 透明文件粘贴拦截【已停用，2026-11-27 方案切换】：合成按键回注在 KDE
+    // 按键语义上边角过多（Meta 单按判定/回注时序/启动器触发——双机实测两轮
+    // 修复仍不完备）。切换为**托盘驱动**：托盘「接收文件」点击 = 直接入队
+    // 拉取（CoreCommand::TransferFiles → request_pull_all_pending），不碰
+    // 粘贴键；文件挂板后用户正常 Meta+V（真实本地板内容，无合成键）。paste_
+    // intercept 类型/测试面保留（回注修复已完成，未来如需重启用一句话）。
     // 注入管线：HotkeyFilterSink（热键在映射之前，docs/03 §4.1）→ MappingSink
-    // → PasteInterceptSink（粘贴拦截，最内层——贴近平台注入面）→ 平台注入
-    // sink（11-20 生产接线：真实 OS 注入，mock 仅编译面回退）。
+    // → 平台注入 sink（11-20 生产接线：真实 OS 注入，mock 仅编译面回退）。
     let mut sink = HotkeyFilterSink::new(
         hotkey_set.clone(),
-        build_mapping_sink(
-            configs.keymap,
-            Box::new(crate::paste_intercept::PasteInterceptSink::new(
-                build_platform_sink(),
-                paste_job_tx,
-                Arc::clone(&materializing),
-            )),
-        ),
+        build_mapping_sink(configs.keymap, build_platform_sink()),
         hotkey_tx.clone(),
     );
     // 平台注册源（win RegisterHotKey / x11 grab_key，两端同型注册；mac 无独立源）。
@@ -2251,60 +2241,6 @@ async fn drive_session(
                     crate::clip_channel::IncomingClass::Rejected => {}
                 }
             },
-
-            // 透明粘贴拦截（FR-7.3 切片 c）：拦截命中 → spawn 物化 worker
-            //（拉流→暂存→挂板，复用切片 b 管线；100ms 拍等挂板指纹变化）。
-            Some(job) = paste_job_rx.recv() => {
-                let baseline = crate::file_channel::lock_hub().mounted_fp();
-                let outcome_tx = paste_outcome_tx.clone();
-                let flag = Arc::clone(&materializing);
-                tokio::spawn(async move {
-                    let ok = crate::paste_intercept::wait_materialized(baseline).await;
-                    let outcome = if ok {
-                        crate::paste_intercept::PasteOutcome::Resume(job)
-                    } else {
-                        crate::paste_intercept::clear_materializing(&flag);
-                        crate::paste_intercept::PasteOutcome::Failed {
-                            reason: "物化超时（120s）或条目失败未收敛：挂起的粘贴已丢弃——可重按或用托盘「接收文件」".into(),
-                        }
-                    };
-                    let _ = outcome_tx.send(outcome);
-                    if ok {
-                        // 单飞位在回注透传后才清（pending 已消费，透传无副作用）
-                        crate::paste_intercept::clear_materializing(&flag);
-                    }
-                });
-            }
-
-            // 物化结果（FR-7.3 切片 c）：回注挂起键 / 失败提示。
-            Some(outcome) = paste_outcome_rx.recv() => {
-                match outcome {
-                    crate::paste_intercept::PasteOutcome::Resume(held) => {
-                        tracing::info!(target: "session::rt", "物化完成：回注挂起的粘贴（文件已挂本机剪贴板）");
-                        // 完整合成按键周期：修饰键↓ → V↓ → 修饰键↑（自包含，
-                        // 不依赖对端修饰键基准——物理 Meta 的转发态在等待期已
-                        // 弹起，裸 V↓ = 幽灵 v；只补 Meta↓ = KDE Meta 单按）。
-                        for (code, state) in held.replay_sequence() {
-                            if code == xcontrol_proto::xkey::KEY_V {
-                                continue; // V↓ 由 held.event 承载（保持原事件语义）
-                            }
-                            let _ = sink.inject(&InputEvent::Key { code, state });
-                        }
-                        let _ = sink.inject(&held.event);
-                        let _ = sink.inject(&InputEvent::Key {
-                            code: xcontrol_proto::xkey::KEY_V,
-                            state: KeyState::Up,
-                        });
-                    }
-                    crate::paste_intercept::PasteOutcome::Failed { reason } => {
-                        tracing::warn!(target: "session::rt", reason, "透明文件粘贴物化失败");
-                        bus.report(|state| {
-                            state.last_error = Some(reason.clone());
-                        });
-                        bus.flush();
-                    }
-                }
-            }
 
             // 热键路由（FR-2.5）：命中 → 角色语义 → 会话动作。主控切换目标 =
             // 布局装配的从机屏全局 id 序（M5，docs/02 §4.2；协商完成后非空——

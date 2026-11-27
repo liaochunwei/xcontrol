@@ -327,23 +327,39 @@ fn to_tray_snapshot(state: &AppState, autostart: Option<&Arc<dyn Autostart>>) ->
         })
         .collect();
 
-    // 对端文件清单（FR-7.3）投影直读 hub（进程级单例——托盘 200ms 刷新即反映；
-    // 体积 humanize：MiB/KB 二段式，与 pending 槽字节量对齐）。
+    // 对端文件清单（FR-7.3）投影直读 hub（进程级单例——托盘 200ms 刷新即反映）。
     let hub = crate::file_channel::lock_hub();
     let transfer_cancelable = hub.session().is_some();
-    let incoming_files = hub.pending().map(|slot| {
-        let kib = slot.total_bytes as f64 / 1024.0;
-        let mib = kib / 1024.0;
-        let size_label = if mib >= 1.0 {
-            format!("{mib:.1} MB")
-        } else if kib >= 1.0 {
-            format!("{kib:.1} KB")
-        } else {
-            format!("{} B", slot.total_bytes)
+    let incoming_files = hub.pending().map(|slot| xcontrol_tray::IncomingFilesInfo {
+        count: slot.entries.len(),
+        size_label: humanize_bytes(slot.total_bytes),
+    });
+    // 拉取进度（FR-7.3 进度条投影）：会话记账直读；总字节未知时按条目
+    // 完成数折算百分比（Expand/目录场景清单聚合缺失的兜底）。
+    let transfer_progress = hub.session().map(|session| {
+        // 字节口径优先，清单聚合缺失（目录展开）退条目口径；checked_div 兜底
+        // 分母 0（ensure_session 前的会话态）。
+        let percent = match session
+            .received_bytes
+            .min(session.total_bytes)
+            .checked_mul(100)
+            .and_then(|scaled| scaled.checked_div(session.total_bytes))
+        {
+            // 字节口径可算（清单聚合在）
+            Some(scaled) => (scaled as u8).min(100),
+            // 清单聚合缺失（目录展开中）退条目口径
+            None => (session
+                .ok
+                .saturating_add(session.failed)
+                .checked_mul(100)
+                .and_then(|scaled| scaled.checked_div(session.total))
+                .unwrap_or(0) as u8)
+                .min(100),
         };
-        xcontrol_tray::IncomingFilesInfo {
-            count: slot.entries.len(),
-            size_label,
+        xcontrol_tray::TransferProgressInfo {
+            percent: percent.min(100),
+            received_label: humanize_bytes(session.received_bytes),
+            total_label: humanize_bytes(session.total_bytes),
         }
     });
 
@@ -356,8 +372,22 @@ fn to_tray_snapshot(state: &AppState, autostart: Option<&Arc<dyn Autostart>>) ->
         host_candidates,
         incoming_files,
         transfer_cancelable,
+        transfer_progress,
         latency_ms: None,
         autostart_enabled: autostart.is_some_and(|backend| backend.is_enabled()),
+    }
+}
+
+/// 字节量 humanize（B/KB/MB 三段式；`size_label` 与进度行共用口径）。
+fn humanize_bytes(bytes: u64) -> String {
+    let kib = bytes as f64 / 1024.0;
+    let mib = kib / 1024.0;
+    if mib >= 1.0 {
+        format!("{mib:.1} MB")
+    } else if kib >= 1.0 {
+        format!("{kib:.1} KB")
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -366,6 +396,14 @@ mod tests {
     use xcontrol_config::Role as ConfigRole;
 
     use super::*;
+
+    /// 字节量 humanize 三段式（FR-7.3：接收文件条目与进度行共用口径）。
+    #[test]
+    fn humanize_bytes_three_tiers() {
+        assert_eq!(humanize_bytes(512), "512 B");
+        assert_eq!(humanize_bytes(1024), "1.0 KB");
+        assert_eq!(humanize_bytes(131_072_000), "125.0 MB");
+    }
 
     /// 快照转换矩阵：ConnState × 角色 → 托盘快照五态字段（FR-6.1 数据面）。
     #[test]

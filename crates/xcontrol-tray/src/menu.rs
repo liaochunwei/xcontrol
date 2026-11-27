@@ -134,6 +134,24 @@ pub fn build_menu(state: &TrayState) -> Vec<MenuItem> {
             TransferFiles,
         ));
     }
+    // 传输进度（FR-7.3）：拉取进行中在接收文件条目下方渲染不可点进度行
+    //（原生菜单无进度条控件——文案进度与百分比，docs/06 §5.2 降级口径）。
+    if let Some(progress) = &state.transfer_progress {
+        items.push(
+            MenuItem::action(
+                xcontrol_i18n::trf(
+                    "menu.transfer_progress",
+                    &[
+                        ("percent", &progress.percent.to_string()),
+                        ("received", &progress.received_label),
+                        ("total", &progress.total_label),
+                    ],
+                ),
+                NoAction,
+            )
+            .disabled(true),
+        );
+    }
     items.extend([
         MenuItem::separator(),
         MenuItem::action(xcontrol_i18n::tr("menu.open_settings"), OpenSettings),
@@ -239,6 +257,7 @@ mod tests {
         TrayState {
             incoming_files: None,
             transfer_cancelable: false,
+            transfer_progress: None,
             role,
             status,
             icon_kind: if status == TrayStatus::Error {
@@ -537,5 +556,38 @@ mod tests {
             _ => false,
         });
         assert!(has_transfer, "接收文件条目携带 TransferFiles 动作");
+    }
+
+    /// 进度行（FR-7.3）：transfer_progress 有货时渲染不可点进度行（百分比 +
+    /// 双体积文案）；无货不渲染（golden 计数不变）。
+    #[test]
+    fn menu_transfer_progress_row() {
+        let mut state = state(
+            TrayRole::Host,
+            TrayStatus::Online,
+            false,
+            true,
+            vec![SlaveInfo {
+                name: "mac-book".to_owned(),
+                latency_ms: Some(8),
+            }],
+        );
+        // 空闲：11 项 golden 形态，无进度行
+        assert_eq!(build_menu(&state).len(), 11, "空闲不渲染进度行");
+
+        state.transfer_progress = Some(crate::project::TransferProgressInfo {
+            percent: 45,
+            received_label: "60.0 MB".to_owned(),
+            total_label: "131.0 MB".to_owned(),
+        });
+        let menu = build_menu(&state);
+        assert_eq!(menu.len(), 12, "进度行在接收文件条目下方 +1 项");
+        let has_progress = menu.iter().any(|item| match item {
+            MenuItem::Action { name, disabled, .. } => {
+                *disabled && name.contains("45%") && name.contains("60.0 MB")
+            }
+            _ => false,
+        });
+        assert!(has_progress, "进度行不可点且文案含百分比与体积");
     }
 }

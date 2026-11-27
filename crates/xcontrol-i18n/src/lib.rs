@@ -377,6 +377,10 @@ const ZH: &[(&str, &str)] = &[
     ("menu.slaves_submenu", "在线工作机"),
     ("menu.receive_files", "接收文件：{count} 项 / {size}"),
     ("menu.cancel_transfer", "取消文件传输"),
+    (
+        "menu.transfer_progress",
+        "接收中 {percent}%（{received} / {total}）",
+    ),
     ("menu.switch_role", "切换角色：主控 ↔ 工作机"),
     (
         "notice.code_rollback_failed",
@@ -855,6 +859,10 @@ const EN: &[(&str, &str)] = &[
         "Receive files: {count} items / {size}",
     ),
     ("menu.cancel_transfer", "Cancel file transfer"),
+    (
+        "menu.transfer_progress",
+        "Receiving {percent}% ({received} / {total})",
+    ),
     ("menu.switch_role", "Switch role: host ↔ client"),
     (
         "notice.code_rollback_failed",

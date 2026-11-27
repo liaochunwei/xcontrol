@@ -71,6 +71,10 @@ pub struct PullSession {
     pub failed: usize,
     /// 已成功条目的暂存路径（挂板顺序 = pending 顺序；失败条目不入列）。
     pub staged: Vec<PathBuf>,
+    /// 已接收字节（chunk 落盘记账——进度条分子；失败不回退，进度保守单调）。
+    pub received_bytes: u64,
+    /// 清单总字节（pending 槽；进度条分母；0 = 未知——按条目数折算百分比）。
+    pub total_bytes: u64,
 }
 
 /// 文件域配置上限（config `[file_transfer]` → hub 装配面）。
@@ -111,6 +115,9 @@ pub struct FileHub {
     rel_paths: Vec<String>,
     /// 传输 id 分配器（每进程单调；拉取/通告双方独立命名空间）。
     next_transfer_id: u32,
+    /// 本机通告代次（每进程单调递增；接收端 (origin_id, origin_seq) 去重键——
+    /// 见 LOCAL_ORIGIN_ID 注释）。
+    origin_seq: u32,
     /// 拉取会话（切片 d：进度/部分成功/取消的记账面；None = 空闲）。
     pub session: Option<PullSession>,
     /// 取消请求（托盘「取消文件传输」入口；泵消费后本地收尾 + 对端 Cancel 帧）。
@@ -192,6 +199,11 @@ impl FileHub {
             .map(|entry| entry.name.clone())
             .collect();
         self.outbound_child_paths.clear();
+        // 最后复制者赢（用户语义：多次复制只待最后一次——前面的复制不一定
+        // 是想做远程粘贴）：新清单到达即作废旧拉取意图（队列/待发请求）；
+        // 进行中条目由源端清单换代自然 FileError 收敛，不强行中断。
+        self.pull_queue.clear();
+        self.pull_request = None;
         self.pending = Some(slot);
     }
 
@@ -339,10 +351,13 @@ impl FileHub {
         }
         let transfer_id = self.take_next_transfer_id();
         let copied_at_ms = now_ms;
+        // 代次递增（接收端去重键的一半；进程内单调——不随会话 reset 回退，
+        // 重连后接收端 FileRefRx 重建、last_seen 清零，无 seq 落差问题）
+        self.origin_seq = self.origin_seq.wrapping_add(1);
         match build_manifest(
             transfer_id,
             LOCAL_ORIGIN_ID,
-            LOCAL_ORIGIN_SEQ,
+            self.origin_seq,
             entries.clone(),
             copied_at_ms,
         ) {
@@ -395,7 +410,8 @@ impl FileHub {
     }
 
     /// 会话建立（泵发起首条拉取时；幂等——同 transfer 重复调用不动）。
-    pub fn ensure_session(&mut self, transfer_id: u32, total: usize) {
+    /// `total_bytes` 取 pending 槽清单聚合（进度条分母；未知传 0）。
+    pub fn ensure_session(&mut self, transfer_id: u32, total: usize, total_bytes: u64) {
         if self.session.is_none() {
             self.session = Some(PullSession {
                 transfer_id,
@@ -403,6 +419,8 @@ impl FileHub {
                 ok: 0,
                 failed: 0,
                 staged: Vec::new(),
+                received_bytes: 0,
+                total_bytes,
             });
         }
     }
@@ -410,6 +428,15 @@ impl FileHub {
     /// 拉取请求取消（托盘「取消文件传输」入口；泵消费）。
     pub fn request_cancel(&mut self) {
         self.cancel_requested = true;
+    }
+
+    /// chunk 字节记账（进度条分子；transfer 不匹配不串账，失败不回退）。
+    pub fn record_chunk_bytes(&mut self, transfer_id: u32, len: usize) {
+        if let Some(session) = self.session.as_mut()
+            && session.transfer_id == transfer_id
+        {
+            session.received_bytes = session.received_bytes.saturating_add(len as u64);
+        }
     }
 
     /// 取走取消请求。
@@ -503,10 +530,11 @@ impl FileHub {
 
 /// 挂板回声抑制窗口：2s（docs/04 §5 防线 1 时间窗的文件域等价）。
 const MOUNT_ECHO_WINDOW_MS: u64 = 2_000;
-/// 本机通告的占位 origin（wire 字段必填；回环防线在挂板指纹——origin 为本端
-/// 自分配固定值，代次去重对本端出站清单不适用）。
+/// 本机通告的 origin 身份（wire 字段必填；单会话拓扑 M4 至多一个对端，固定值
+/// 足够）。**seq 不再是常量**：接收端以 `(origin_id, origin_seq)` 代次去重
+/// （docs/04 §8.2），常量 seq 会让同机第二次起的复制被判 Duplicate 丢弃——
+/// "最后一次复制赢"失效（2026-11-28 双机实测暴露）；现按发布次序进程内单调递增。
 const LOCAL_ORIGIN_ID: [u8; 16] = [0xA1; 16];
-const LOCAL_ORIGIN_SEQ: u32 = 1;
 /// 暂存目录：系统临时目录子目录（docs/07 §9 专用暂存面）。
 fn staging_dir() -> PathBuf {
     std::env::temp_dir().join("xcontrol-file-transfer")
@@ -782,9 +810,13 @@ async fn run_file_pump(
                             }));
                         }
                         Some(size) => {
-                            let total =
-                                lock_hub().pending().map_or(0, |slot| slot.entries.len());
-                            lock_hub().ensure_session(transfer_id, total);
+                            let (total, total_bytes) = lock_hub()
+                                .pending()
+                                .map_or(
+                                    (0usize, 0u64),
+                                    |slot| (slot.entries.len(), slot.total_bytes),
+                                );
+                            lock_hub().ensure_session(transfer_id, total, total_bytes);
                             rx.begin_pull(transfer_id, entry, size);
                             // 暂存文件建立（树形 staging/{tid}/{rel}；名字经 proto
                             // 纯名校验——路径拼接无穿越分量）
@@ -1308,7 +1340,11 @@ fn record_rx_action(
             out.push(FileMsg::Ack(FileAck { seq }));
             false
         }
-        FileRxAction::WriteChunk { data, .. } => {
+        FileRxAction::WriteChunk {
+            transfer_id, data, ..
+        } => {
+            // 进度记账（FR-7.3 进度条投影源；失败不回退——保守单调）。
+            lock_hub().record_chunk_bytes(transfer_id, data.len());
             match staging.as_mut() {
                 Some(entry) => {
                     use std::io::Write;
@@ -1761,5 +1797,115 @@ mod tests {
         let (rest, dropped) = split_file_frames(&truncated);
         assert!(dropped.is_empty());
         assert_eq!(rest, truncated);
+    }
+
+    /// 会话字节记账生命周期（FR-7.3 进度条投影源）：建立幂等 → chunk 累加
+    /// （别 transfer 不串账）→ 完成收尾清空。
+    #[test]
+    fn pull_session_byte_accounting_lifecycle() {
+        let mut hub = FileHub::default();
+        hub.set_session_minor(FILE_MIN_MINOR);
+        hub.ensure_session(7, 2, 1000);
+        hub.ensure_session(7, 2, 1000); // 幂等：重复建立不动
+        hub.record_chunk_bytes(7, 600);
+        hub.record_chunk_bytes(9, 999); // 别的 transfer 不串账
+        hub.record_chunk_bytes(7, 400);
+        let session = hub.session().expect("会话在");
+        assert_eq!(session.received_bytes, 1000, "chunk 字节累加");
+        assert_eq!(session.total_bytes, 1000, "分母取清单聚合");
+        assert_eq!(session.total, 2);
+
+        // 完成判定（ok+failed >= total）→ 收尾清空（进度归零）
+        assert!(!hub.record_progress(7, true, None), "首条目未达完成判定");
+        assert!(hub.record_progress(7, true, None), "次条目达成完成判定");
+        let _ = hub.finalize_session();
+        assert!(hub.session().is_none(), "收尾即清（进度投影归零）");
+        assert!(hub.pull_queue.is_empty(), "收尾清队列");
+    }
+
+    /// 通告代次递增（2026-11-28 双机根因）：同机连续两次复制 → origin_seq
+    /// 递增——接收端 (origin_id, origin_seq) 去重不再把后续复制判 Duplicate
+    ///（修复前 seq 恒 1，第二次复制起全被丢弃，"最后一次复制赢"失效）。
+    #[test]
+    fn origin_seq_increments_per_publish() {
+        let mut hub = FileHub::default();
+        hub.set_session_minor(FILE_MIN_MINOR);
+        let paths = vec![std::env::temp_dir().join("xcontrol-seq-test.txt")];
+        std::fs::write(&paths[0], b"seq").expect("临时文件");
+        let entries = |name: String| {
+            vec![xcontrol_proto::FileEntry {
+                name,
+                size: 3,
+                mtime_ms: 0,
+                kind: xcontrol_proto::FileEntryKind::File,
+                children: 0,
+            }]
+        };
+        hub.publish_local_manifest(entries("a.txt".to_owned()), paths.clone(), 0);
+        let seq1 = hub
+            .outbound()
+            .map(|announce| announce.origin_seq)
+            .expect("首次发布");
+        hub.publish_local_manifest(entries("b.txt".to_owned()), paths, 0);
+        let seq2 = hub
+            .outbound()
+            .map(|announce| announce.origin_seq)
+            .expect("二次发布");
+        assert_eq!((seq1, seq2), (1, 2), "同机连续复制代次必须递增");
+        let _ = std::fs::remove_file(std::env::temp_dir().join("xcontrol-seq-test.txt"));
+
+        // 接收端语义对拍：seq1 应用、seq2 覆盖（不再 Duplicate）
+        let mut rx = xcontrol_core::file_ref::FileRefRx::new(
+            xcontrol_core::file_ref::FileRefRxConfig::default(),
+        );
+        let announce1 = hub
+            .outbound()
+            .map(|announce| {
+                let mut clone = announce.clone();
+                clone.origin_seq = seq1;
+                clone
+            })
+            .expect("清单");
+        assert!(matches!(
+            rx.on_announce(announce1),
+            xcontrol_core::file_ref::FileRefVerdict::Applied { .. }
+        ));
+    }
+
+    /// 最后复制者赢（用户语义）：新 pending 槽覆盖时作废旧拉取意图
+    ///（队列/待发请求）——前面的复制不一定是想做远程粘贴的。
+    #[test]
+    fn newer_pending_discards_stale_pull_intents() {
+        let mut hub = FileHub::default();
+        hub.set_session_minor(FILE_MIN_MINOR);
+        let slot_for = |seq: u32, transfer_id: u32| xcontrol_core::file_ref::PendingSlot {
+            transfer_id,
+            origin_id: [1; 16],
+            origin_seq: seq,
+            entries: vec![xcontrol_proto::FileEntry {
+                name: format!("f-{seq}.bin"),
+                size: 10,
+                mtime_ms: 0,
+                kind: xcontrol_proto::FileEntryKind::File,
+                children: 0,
+            }],
+            total_bytes: 10,
+            copied_at_ms: 0,
+            fingerprint: [0; 16],
+        };
+        hub.set_pending(slot_for(1, 7));
+        hub.request_pull(7, 0);
+        hub.extend_pull_queue(vec![(7, 0)]);
+        assert!(hub.pull_request.is_some() && !hub.pull_queue.is_empty());
+
+        // 第二次复制到达（同源换代）：旧意图全部作废
+        hub.set_pending(slot_for(2, 8));
+        assert!(hub.pull_request.is_none(), "旧待发请求作废");
+        assert!(hub.pull_queue.is_empty(), "旧队列作废");
+        assert_eq!(
+            hub.pending().map(|slot| slot.transfer_id),
+            Some(8),
+            "待接收 = 最后一次复制"
+        );
     }
 }

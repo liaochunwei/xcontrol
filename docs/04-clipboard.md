@@ -23,6 +23,11 @@
 - **HTML round-trip 判据 = fragment 字节级**：mac 写入走 public.html 原样落板（避免 arboard `set_html` 的 `<html><head><meta…></head><body>…</body></html>` 模板包装破坏读回等价性）；win 经 arboard/clipboard-win 的 CF_HTML 包装——读回提取（StartFragment/EndFragment）行为须实机复核（docs/05 §2.2 item 6），若读回形态 ≠ 写入 fragment，回声指纹按读回形态对齐（防线 1 语义不变）。
 - 一次 `ClipAnnounce` 可携带**多格式并存**（text+png+html），接收端按自身能力择优挂载（多格式同挂，由粘贴目标决定取用——Input-Leap 同款语义）。多格式时单传输 content 的分段布局见 [02-protocol.md](02-protocol.md) §6（formats.len()==1 → 原始字节；≥2 → postcard `Vec<Vec<u8>>` 段序同 formats 序）。
 - 格式协商：Caps 位声明（`CAP_IMAGE`/`CAP_HTML`），发送端只发对端声明支持的格式。
+- **文件引用剪贴板不走本表**（FR-7.3，XCP 1.2+）：不是 `ClipFormat` 变体、不经
+  `ClipAnnounce/ClipChunk`——文件域走独立文件通道与消息（[02-protocol.md](02-protocol.md) §4.6，
+  [ADR-0004](adr/0004-file-transfer-channel-and-materialization.md)）；剪贴板侧仅产生元数据
+  清单（§8），对端 pending 槽承接，本机系统剪贴板不被触碰。FR-4.6 的 `text/uri-list`
+  仍是"仅路径文本"的独立最小形态（FR-7.3 不可用时的降级路径，docs/00 FR-4.6 备注）。
 
 ## 3. 传输流程（与协议 §4.4/§6 对应）
 
@@ -73,3 +78,63 @@
 - 状态机（M5 补录）：图片/HTML/多格式 announce→chunk→end 全链路（信用窗口 ≤4 多轮翻转）；图片 16MiB 恰好通过、+1 拒绝（`xcontrol-core` tests/clip_flow.rs 四项 M5 测试）。
 - 大块：16MiB 通过、16MiB+1 拒绝且通知、10s 慢速发送超时清理。
 - 平台手动：六向图片矩阵（mac↔win↔linux）、富文本降级、emoji/组合字符文本；mac 图片/HTML round-trip 已实测（2026-11-19，本仓冒烟 PASS——图片像素级等价 + RGBA 指纹判据、HTML fragment 字节等价 + 格式隔离）；远端 KDE Wayland 文本 round-trip + image/html 直通实测 PASS（配方与结果 docs/05 §4）。
+
+## 8. 文件引用剪贴板（FR-7.3，XCP 1.2+，规划）
+
+> 通道与消息见 [02-protocol.md](02-protocol.md) §4.6；通道拓扑与物化策略决策见
+> [ADR-0004](adr/0004-file-transfer-channel-and-materialization.md)。本节定义剪贴板侧语义：
+> 检测、pending 槽、代次失效、指纹规范形与物化。**随实装切片落地，当前为规范先行。**
+
+### 8.1 检测与元数据面
+
+- 复制端：既有剪贴板监听器（§4 平台路径）新增识别文件引用格式（平台格式矩阵见
+  [05-platform.md](05-platform.md) §0.2）→ stat 元数据（条目名/大小/mtime/是否目录）
+  → `FileRefAnnounce`（仅顶层清单，无内容字节；目录条目 `children` 为子树条目数，
+  可为 0 = 未统计，子树在拉取时经 `FileExpand` 展开）。
+- 接收端：清单入 **pending 文件槽**（会话内状态，独立于系统剪贴板），托盘提示
+  「剪贴板文件：N 项 / X MB（来源机名）」；**不触碰本机系统剪贴板**——挂板只在
+  物化时发生（§8.4）。
+- 与文本/图片同步并存：文件 announce 不改变 text/png/html 的同步行为；pending 槽
+  是剪贴板域之外的附加状态。
+
+### 8.2 代次失效（防线 2 的文件域扩展）
+
+- 任何新的 `FileRefAnnounce`（任意来源机）使对端旧文件槽失效；本机任何新的本地
+  复制（text/png/html/文件引用）同样使槽失效——**最后复制者赢**，与 `origin_seq`
+  代次语义一致（§5 防线 2 复用）。
+- 物化挂板（写系统剪贴板）进入防线 1 写入自标记（写后 500ms 静默窗语义不变）。
+
+### 8.3 指纹规范形（防线 1 的文件域定义）
+
+- 文件清单指纹 = 条目 `(name, size)` 有序序列的 blake3，**不含 mtime、不含绝对
+  路径**——物化落盘必然改变两者，纳入指纹必回环（A 复制 → B 物化挂板 → B 监听器
+  误判为新复制回传 A）。
+- 同板多域并存（文件引用与文本同时挂板）：文件域指纹独立计算、与 text 域指纹
+  分开比较，两域防线互不干扰。
+
+### 8.4 物化（stage-then-mount，[ADR-0004](adr/0004-file-transfer-channel-and-materialization.md)）
+
+- 触发：接收端粘贴动作——切片 c 透明拦截（注入路径拦截自身要注入的粘贴键，先物化
+  再注入）/ 切片 b 托盘显式「传输并粘贴」动作。
+- 流程：`FilePullReq` → 暂存区落盘（专用子目录，剩余空间预检，超阈值需确认，
+  [07-security.md](07-security.md) §9）→ 挂**真实文件引用**到系统剪贴板（win `CF_HDROP` /
+  mac file URLs / X11 `text/uri-list` / Wayland mime 直通，docs/05 §0.2）→ 注入粘贴键
+  （透明路径）。
+- 失败：条目级 `FileError` 可重试（[02-protocol.md](02-protocol.md) §4.6）；源离线 /
+  条目消失给明确提示；部分成功策略随切片 d 定稿。
+
+### 8.5 与 §3「推送决策」的辨析（防规范自相矛盾）
+
+- §3 否决"拉模式"针对**剪贴板内容字节**：源应用可能清板、源可能已退出受控态，
+  粘贴瞬间读源板时序脆弱——故 announce/内容推送按 §3 语义不变。
+- 文件内容持久在文件系统、XControl 常驻运行（不随受控态启停），粘贴时刻拉取的
+  脆弱面仅剩"源机在线"——离线即条目级错误提示，不做重试风暴。元数据面仍是
+  复制瞬间主动推送。两者不冲突。
+
+### 8.6 测试要求
+
+- 指纹规范形单测：mtime 变化 / 路径变化 / 重命名不改变指纹；改名 + 同大小碰撞场景
+  明确为可接受假阴性（§5 边界惯例）。
+- pending 槽代次失效矩阵：文件→文件、文件→文本、文本→文件、跨机并发来源。
+- 三防线故障注入（§7 惯例）扩展到文件域：关闭防线 1/2/静默窗各一，断言无回环传播。
+- mock 平台层物化回环：announce → 拉流 → 挂板 → 监听器触发 → 断言被防线拦截。

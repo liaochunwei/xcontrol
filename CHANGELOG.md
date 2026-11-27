@@ -6,7 +6,78 @@
 
 ## [Unreleased]
 
+### Added
+
+- **FR-7.3 目录复制（FileExpand 接线，切片 d R1）**：复制目录 = 整树落地——
+  源端 PullReq 命中目录条目时有界枚举（深度 ≤4、单批 ≤512，非 UTF-8 名跳过）
+  回 FileExpand；接收端下标空间增长、树形暂存（staging/{tid}/{相对路径}）、
+  文件子条目自动续拉（子目录经再展开递归）；事件驱动收敛判定替代计数完成
+  （队列/接收/服务/等待全空 → 收尾挂板，目录壳随顶层目录带出）。集成测试：
+  目录树（含子目录）真 TCP 端到端逐字节断言 PASS。
+- **FR-7.3 切片 d：会话收尾打磨**：部分成功策略（条目失败不废弃整单——已成功
+  条目照常挂板 + 失败清单提示，全失败保留 pending 供重试）；托盘「取消文件
+  传输」（拉取进行中出现，对端 FileCancel + 本地收尾）；配置 `[file_transfer]`
+  （enabled / max_bytes=2GiB / confirm_threshold_bytes=512MiB——发送端超限不
+  发布、接收端超限 Quota 退回、超阈值需托盘二次点击）；断点续传评估结论 = v1
+  选重传（offset 协议面保留，docs/02 §4.6 注记）。
+- **FR-7.3 切片 c：透明文件粘贴**：受控机上直接 Cmd+V/Ctrl+V 即物化——
+  注入管线的 sink 包装器拦截粘贴组合（修饰键自跟踪，wire Key 无 mods），
+  pending 槽有货时挂起组合键并触发拉流（复用切片 b 管线），挂板完成后自动
+  回注挂起键——目标应用粘到的就是物化后的本地文件，"像本地一样"。单飞
+  语义（物化中不重复触发）、一次性消费（挂板后 pending 清空，随后粘贴行为
+  与无文件槽完全一致）、失败/超时（120s）丢弃挂起键并提示、零系统级 hook、
+  文本粘贴路径零改动（pending 无货时逐字节透传，NFR-1 不回退）。
+- **FR-7.3 切片 b/c 前置：文件拉流与托盘触发面（mac 实测，win/linux 平台面
+  随实装补齐）**：独立文件 TCP 通道（FileBind 三通道分派、域隔离防御、协商
+  门控 minor≥2、3s 独立退避）；真实拉流全链路——本机检测（changeCount 触发 →
+  清单发布，挂板回环防线 2s 窗口）→ 元数据通告 → pending 槽 → **托盘
+  「接收文件：N 项 / X MB」**（docs/06 §5.2 菜单新条，无货不渲染）→ 条目级
+  顺序拉流（信用窗口 + blake3 边流边算）→ 暂存落盘 → 校验 → 挂板系统剪贴板
+  （mac writeObjects(NSURL[]) 实测；其余平台文件已暂存并提示）。集成测试：
+  真 TCP + Noise + 真实磁盘的端到端（暂存内容逐字节断言 + 挂板指纹登记）。
+- **FR-7.3 切片 a：文件引用元数据面（协议与状态机层）**：XCP 1.2 文件域九消息实装
+  （`xcontrol-proto::file`，kind 0x58–0x60，golden fixtures 26→35，解码层强制清单
+  ≤512 条/名称 ≤256B 纯名禁 `/`·`.`·`..`·NUL/总字节 ≤协商上限/chunk ≤64KiB，
+  清单单帧承载编码期校验）；`PROTO_MINOR` 1→2、`CAP_FILETRANSFER`（bit4）；
+  core 新增 `file_ref` 模块——发送侧清单构建（空清单不广播、超限 fail-fast、
+  total_bytes 聚合）+ 接收侧 pending 单槽（代次失效"最后复制者赢"、`(name,size)`
+  blake3 回环指纹不含 mtime/路径、`(origin_id, seq)` 去重首实装）+ mock 剪贴板
+  文件引用槽（`mock-platform`）。文件 TCP 通道与 app 接线随切片 b。
+- **FR-7.3 跨设备文件复制粘贴立项（规范先行，代码未动）**：复制端仅同步文件元数据
+  清单，接收端在用户粘贴时才经文件通道拉流物化——跨设备复制对齐本地体验。
+  [ADR-0004](docs/adr/0004-file-transfer-channel-and-materialization.md) 定稿通道拓扑
+  （独立第三条 TCP，与剪贴板通道同构隔离）与物化策略（统一 stage-then-mount，OS 原生
+  惰性粘贴列为 P2 增强）；XCP 协议 minor 1.1 → 1.2 预留文件通道消息域
+  （kind 0x58–0x60，[docs/02 §4.6](docs/02-protocol.md)）；剪贴板侧 pending 槽/代次
+  失效/回环指纹规范形入 [docs/04 §8](docs/04-clipboard.md)；平台读写路径与实机复核项
+  入 [docs/05 §0.2](docs/05-platform.md)；文件传输安全面（条目索引寻址红线、磁盘耗尽
+  防护、粘贴即授权）入 [docs/07 §9](docs/07-security.md)。后续实装按切片推进
+  （元数据面 → 通道拉流 → 透明粘贴 → 打磨）。
+
 ### Fixed
+
+- **双机实测九连修复（FR-7.3 跨设备文件复制，mac↔Linux KDE Wayland 真实环境）**：
+  ① 入槽 Quota 检查 + 收敛判定的同线程重入死锁；② 文件预览图误判（Finder 文件
+  复制带 icns/tiff 预览被 clip 泵当图片同步）；③ 源端服务流从不开账（Chunk 零
+  发出）；④ 文件通告指纹节流 hub 级共享（对端重启后 announce 发进死通道）；
+  ⑤ detector 独立 wayland 连接互锁（file 泵永不启动）；⑥ 接收端 rel_paths 未
+  初始化（挂板名 entry-N）；⑦ menu_equivalent 漏字段（托盘永不显示接收条目）；
+  ⑧ TransferFiles action 漏声明/漏处理器（点击无反应）；⑨ 全进程双剪贴板实例
+  （外部写入事件投递不可达 detector）。终态：**双向复制 + 挂板 + 托盘直驱真实
+  环境验证通过（131MB 大文件 md5 一致，44 秒完成）**。
+- **双机实测根因修复：文件通告入槽的同线程重入死锁**（FR-7.3，双机冒烟暴露）：
+  `std::sync::Mutex` 不可重入——入槽 Quota 检查（嵌套两层 `lock_hub()`）与会话
+  收敛判定（`&&` 链上两次取锁）在对端清单到达时同线程二次加锁永久卡死，拖死
+  双端心跳（9s 互断、进程存活但会话沉默）。合并为单次持锁；全文件扫描无残留。
+  实测：Finder 复制 → 通告 → 对端入槽后 35s+ 会话持续存活（修复前必死）。
+- **macOS NSPasteboard 进程级访问互斥**（防御加固，同冒烟暴露）：剪贴板读取
+  路径分布在多个后台线程（clip 泵 / 文件检测器 / 监听线程），AppKit 板非线程
+  安全——全部访问点持进程级锁串行化。
+
+- **`Layout` 下发门控改用特性级常量 `LAYOUT_MIN_MINOR`（1.1）**：原先错用
+  `PROTO_MINOR` 作门控——文件域实装把 PROTO_MINOR 提到 1.2 后会误停 1.1 对端的
+  布局下发（`ScreenInfo.owner` 属 1.1 形态，docs/02 §4.3 版本门控）。
+  特性门控与实现级版本常量自此分离（任务 11-26-file-ref-announce 实装自查）。
 
 - **热键切入后边缘回切失效**（FR-2.2/FR-2.5，任务 11-24-edge-switch-latency-hotkey-return）：
   热键/托盘切换接管后的回切触发边取反（取了进入边的对侧 = 远离主控的边）——改为与

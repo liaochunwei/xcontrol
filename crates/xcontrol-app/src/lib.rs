@@ -38,14 +38,25 @@
 pub mod clip_channel;
 pub mod clip_rt;
 pub mod edge;
+pub mod file_channel;
 pub mod hotkey_rt;
 pub mod layout_rt;
 pub mod logging;
 pub mod loopback;
+pub mod paste_intercept;
 pub mod session_rt;
 pub mod state;
 pub mod tray_rt;
 pub mod ui;
+
+/// 测试面支持（hub 进程级单例的跨用例互斥；仅测试目标引用）。
+#[doc(hidden)]
+pub mod test_support {
+    use std::sync::Mutex;
+
+    /// 全局测试互斥（单例状态面的用例串行化）。
+    pub static HUB_TEST_MUTEX: Mutex<()> = Mutex::new(());
+}
 
 #[cfg(test)]
 mod tests {

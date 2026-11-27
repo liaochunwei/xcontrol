@@ -163,6 +163,9 @@ pub struct Config {
     /// 剪贴板同步节（docs/04，FR-4.4/4.5）。
     #[serde(default)]
     pub clipboard: ClipboardConfig,
+    /// 文件传输（FR-7.3，docs/02 §4.6）。
+    #[serde(default)]
+    pub file_transfer: FileTransferConfig,
 }
 
 impl Default for Config {
@@ -180,6 +183,7 @@ impl Default for Config {
             keymap: KeymapConfig::default(),
             hotkeys: HotkeysConfig::default(),
             clipboard: ClipboardConfig::default(),
+            file_transfer: FileTransferConfig::default(),
         }
     }
 }
@@ -498,6 +502,42 @@ fn default_hotkey_pause() -> String {
     DEFAULT_HOTKEY_PAUSE.to_owned()
 }
 
+/// `[file_transfer]` 配置节（FR-7.3，docs/02 §4.6 / docs/07 §9）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferConfig {
+    /// 文件传输启用面（关闭 = 不发布/不拉取）。
+    #[serde(default = "default_file_enabled")]
+    pub enabled: bool,
+    /// 单清单总字节上限（字节；默认 2GiB，docs/02 §4.6 防护规则 1）。
+    #[serde(default = "default_file_max_bytes")]
+    pub max_bytes: u64,
+    /// 确认阈值（字节；超过需托盘二次点击。默认 512MiB，docs/07 §9）。
+    #[serde(default = "default_file_confirm_threshold")]
+    pub confirm_threshold_bytes: u64,
+}
+
+pub fn default_file_enabled() -> bool {
+    true
+}
+
+pub fn default_file_max_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+
+pub fn default_file_confirm_threshold() -> u64 {
+    512 * 1024 * 1024
+}
+
+impl Default for FileTransferConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_file_enabled(),
+            max_bytes: default_file_max_bytes(),
+            confirm_threshold_bytes: default_file_confirm_threshold(),
+        }
+    }
+}
+
 /// `[clipboard]` 配置节（docs/04，FR-4.4/4.5）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipboardConfig {
@@ -746,6 +786,7 @@ formats = ["text", "image", "html"]
                 max_bytes: 1024,
                 formats: vec![ClipboardFormat::Text],
             },
+            file_transfer: FileTransferConfig::default(),
         };
 
         let serialized = toml::to_string_pretty(&original).unwrap();

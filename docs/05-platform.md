@@ -28,10 +28,31 @@
 | 1 | `CAP_IMAGE` | 剪贴板图片：`image/png` 收发（[04-clipboard.md](04-clipboard.md) §2） |
 | 2 | `CAP_HTML` | 剪贴板 HTML：`text/html` 收发（[04-clipboard.md](04-clipboard.md) §2） |
 | 3 | `CAP_ABS_POINTER` | 绝对指针映射：可接收 `MouseMoveAbs`（[02-protocol.md](02-protocol.md) §4.2） |
+| 4 | `CAP_FILETRANSFER` | 文件传输：文件通道（[02-protocol.md](02-protocol.md) §4.6，FR-7.3）可建立；对端未声明时禁止发送 `FileRefAnnounce`（§0.2 路径亦不启用，退 FR-4.6 路径文本或不同步） |
 
-bit4+ 保留，只能随 minor 提升追加（新增位须在本文表格补录后再实现，协议即契约）。
+bit5+ 保留，只能随 minor 提升追加（新增位须在本文表格补录后再实现，协议即契约）。
 
 > 修订记录（2026-11-16，任务 11-16-m1-proto）：本节为 v1 实装新增——原 §0 只述能力矩阵、未钉死协商位；`CAP_UNICODE`/`CAP_ABS_POINTER` 的语义取自 §0 能力矩阵行，`CAP_IMAGE`/`CAP_HTML` 取自 [04-clipboard.md](04-clipboard.md) §2 格式协商，位值与 `xcontrol-proto::Caps` 常量一致。
+> 修订记录（2026-11-26，任务 11-26-file-transfer-spec）：bit4 `CAP_FILETRANSFER` 补录（FR-7.3 立项，[ADR-0004](adr/0004-file-transfer-channel-and-materialization.md)）；仅规范预留，随实装切片落地。
+
+### 0.2 文件引用剪贴板读写路径（FR-7.3——[ADR-0004](adr/0004-file-transfer-channel-and-materialization.md)；mac 实测 / wayland 实装待实测 / x11·win 待实装）
+
+> 检测 = 复制端识别文件引用格式并 stat 元数据（[04-clipboard.md](04-clipboard.md) §8.1）；
+> 挂板 = 接收端物化后把真实文件引用写上系统剪贴板（§8.4）。两者均为**新平台代码**，
+> 依赖邻域已在现有剪贴板栈内（未引入新重量级依赖）。**当前未实装，本表为实装切片的路径定界。**
+
+| 平台 | 检测（复制端） | 挂板（接收端） | 依赖 |
+| --- | --- | --- | --- |
+| macOS | ✅ changeCount 轮询中识别 `public.file-url`（多选 = 多 item；2026-11-26 自往返冒烟 PASS——含中文文件名逐字还原） | ✅ objc2 直写 `NSPasteboard` file URLs（writeObjects(NSURL[])，公开.h 挂载语义） | objc2（已有） |
+| Windows | ⏳ 待实装：`WM_CLIPBOARDUPDATE` 中识别 `CF_HDROP`（`DragQueryFile`） | ⏳ 待实装：clipboard-win 写 `CF_HDROP` | clipboard-win（arboard win 后端同源） |
+| Linux X11 | ⏳ 待实装：XFixes 事件中识别 `text/uri-list` / `x-special/gnome-copied-files`（selection 接管协议为新增面） | ⏳ 待实装：x11rb 写对应 target | x11rb（已有） |
+| Linux Wayland | ✅ data-control 协议 mime（`text/uri-list`；2026-11-27 实装——`wl-clipboard-rs` mime 直通与 PNG 已实测路径同构；linux 目标编译级验证，**行为实测待 Wayland 实机**） | ✅ 同左（`Url` crate percent-encoding，xtask 白名单已过审） | wl-clipboard-rs + url（已有/新增） |
+
+- **OS 原生惰性粘贴（P2 增强，不作为 v1 前提）**：mac `NSFilePromiseReceiver`、win
+  `CFSTR_FILEDESCRIPTOR`+`CFSTR_FILECONTENTS`（shell 虚拟文件，Explorer 侧按需取流）。
+  平台能力不对称（Linux 无对应机制）且粘贴路径支持未验证——v1 统一 stage-then-mount
+  （[04-clipboard.md](04-clipboard.md) §8.4），原生惰性经实机 spike 后另议。
+- 实机复核项（未确认，不得凭记忆断言）见 §8。
 
 ## 1. macOS
 
@@ -667,3 +688,6 @@ Wayland 会话，环境配方同 §3.1——Xwayland :1 rootless + 自建 rootfu
 | GNOME <51 InputCapture v1 无法共享剪贴板 | 已知 | 能力协商上报 + UI 提示升级 |
 | Windows LL hook 超时 | 已知机制 | 回调内零慢操作（投递线程池） |
 | Mutter 对新 uinput 节点的 EACCES 竞态 | 历史 bug | uinput 路径重试 + 报告 |
+| mac Finder 复制文件 → 文本应用粘贴的行为（贴路径还是忽略） | 未确认 | 实装切片实机复核；物化挂板需附带对齐本地行为的格式组合（§0.2） |
+| mac `NSFilePromiseReceiver` 粘贴路径（非拖拽）支持程度 | 未确认 | P2 增强（OS 原生惰性）的前置 spike，结果回写 §0.2 |
+| Windows `CF_HDROP` 写入的长路径（>260）与 Unicode 名 | 未确认 | 实装切片实机复核（`\\?\` 前缀与 WTF-16 路径） |

@@ -82,6 +82,39 @@ static SHARED_ECHO: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<EchoFilt
 
 /// 取进程级共享 EchoFilter 句柄（首次调用惰性构造；其后克隆同一 Arc）。
 #[must_use]
+/// 进程级共享平台剪贴板槽（根因 #5 深层修复，2026-11-27 双机实测）：同一进程
+/// 第二次 `open_platform_clipboard()` 的 wayland 连接在 KWin 上互锁（detector
+/// 卡死 → file 泵永不启动 → 心跳死）。clip 泵与文件检测器共用同一实例
+/// （同一 counter / 同一 data-control 连接 / 同一 watcher 线程）。
+#[cfg(any(
+    feature = "macos",
+    feature = "windows",
+    feature = "x11",
+    feature = "wayland"
+))]
+pub(crate) fn shared_clipboard()
+-> Option<std::sync::Arc<std::sync::Mutex<xcontrol_clipboard::PlatformClipboard>>> {
+    static SHARED: std::sync::OnceLock<
+        Option<std::sync::Arc<std::sync::Mutex<xcontrol_clipboard::PlatformClipboard>>>,
+    > = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| match open_platform_clipboard() {
+            Ok(clip) => {
+                #[cfg(feature = "wayland")]
+                if let Err(error) = clip.watch() {
+                    tracing::warn!(target: TARGET, %error, "共享剪贴板 Watcher 启动失败");
+                }
+                let _ = &clip; // wayland watch 是 &self（counter Arc 已克隆给 watcher 线程）
+                Some(std::sync::Arc::new(std::sync::Mutex::new(clip)))
+            }
+            Err(error) => {
+                tracing::warn!(target: TARGET, %error, "共享剪贴板实例创建失败");
+                None
+            }
+        })
+        .clone()
+}
+
 pub(crate) fn shared_echo() -> std::sync::Arc<std::sync::Mutex<EchoFilter>> {
     SHARED_ECHO
         .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(EchoFilter::default())))
@@ -425,7 +458,9 @@ struct PlatformBackend(PlatformBackendInner);
     feature = "wayland"
 ))]
 struct PlatformBackendInner {
-    inner: Option<xcontrol_clipboard::PlatformClipboard>,
+    /// 共享剪贴板实例（进程级单例——clip 泵与 file 检测器/挂板面共用，
+    /// 根因 #9：独立实例 = 第二 wayland 连接，外部写入事件投递不可靠）。
+    inner: Option<std::sync::Arc<std::sync::Mutex<xcontrol_clipboard::PlatformClipboard>>>,
 }
 
 #[cfg(not(any(
@@ -573,6 +608,25 @@ impl ClipboardRuntime {
         // 读取（11-20 扩展：文本优先 → 图片次之——mac 截图剪贴板无 text，
         // arboard get_text 对纯图片返回 NoContent；FR-4.1/4.2/4.5）。超限/空/
         // 失败都是信号或常态，不外发不报错。
+        // 【2026-11-27 双机实测修复】文件引用板优先探测：Finder 复制文件时板上
+        // 带 public.file-url + icns/tiff/PNGf **文件预览图**——图片优先路径会把
+        // 预览图误判为图片剪贴板内容同步出去（166KB PNG，与文件域通告并发出站）。
+        // 板上有 file-url = 文件复制，本板归文件域接管，clip 泵静默跳过。
+        // 【2026-11-27 双机实测修复】文件引用板优先探测：Finder 复制文件时板上
+        // 带 public.file-url + icns/tiff/PNGf **文件预览图**——图片优先路径会把
+        // 预览图误判为图片剪贴板内容同步出去（166KB PNG，与文件域通告并发出站）。
+        // 板上有 file-url = 文件复制，本板归文件域接管，clip 泵静默跳过。
+        #[cfg(any(feature = "macos", feature = "wayland"))]
+        if let Some(inner_clip) = self.backend.as_mut().and_then(|b| b.0.inner.as_mut())
+            && inner_clip
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read_file_urls(512)
+                .is_ok_and(|r| r.is_some())
+        {
+            tracing::debug!(target: TARGET, "板上有文件引用（文件域接管）：clip 泵跳过");
+            return;
+        }
         // 11-20 实测顺序修正：**图片优先**。macOS 剪贴板对纯图片（截图）会给
         // `get_text` 返回二进制乱码"文本"（TIFF 数据强转）——文本优先把它当
         // 文本发出（非 UTF-8/超 Noise 65519B 加密上限）。图片读取对纯文本剪贴
@@ -866,16 +920,20 @@ fn build_platform_clipboard() -> (Option<PlatformBackend>, Box<dyn ClipWatcherDr
         feature = "wayland"
     ))]
     {
-        match open_platform_backend() {
-            Ok(mut backend) => {
-                let watcher = start_platform_watcher(&mut backend);
+        // 根因 #9（2026-11-27 双机实测）：改用进程级共享实例——clip 泵与
+        // file 检测器/挂板面共用同一 PlatformClipboard（同一 wayland 连接 /
+        // 同一 counter / 同一 watcher）。原 open_platform_backend 独立实例 =
+        // 第二连接，外部写入事件投递不可靠（detector 失明）。
+        match shared_clipboard() {
+            Some(shared) => {
+                let watcher = start_platform_watcher_from_shared(&shared);
                 let boxed = Some(PlatformBackend(PlatformBackendInner {
-                    inner: Some(backend),
+                    inner: Some(shared),
                 }));
                 (boxed, watcher)
             }
-            Err(error) => {
-                tracing::debug!(target: TARGET, %error, "平台剪贴板打开失败");
+            None => {
+                tracing::debug!(target: TARGET, "共享剪贴板实例不可用");
                 (None, Box::new(NullWatcher))
             }
         }
@@ -892,10 +950,6 @@ fn build_platform_clipboard() -> (Option<PlatformBackend>, Box<dyn ClipWatcherDr
 }
 
 #[cfg(feature = "macos")]
-fn open_platform_backend() -> Result<xcontrol_clipboard::PlatformClipboard, ClipboardError> {
-    xcontrol_clipboard::open_platform_clipboard()
-}
-
 #[cfg(any(feature = "windows", feature = "x11", feature = "wayland"))]
 fn open_platform_backend() -> Result<xcontrol_clipboard::PlatformClipboard, ClipboardError> {
     xcontrol_clipboard::open_platform_clipboard()
@@ -903,8 +957,8 @@ fn open_platform_backend() -> Result<xcontrol_clipboard::PlatformClipboard, Clip
 
 /// 平台 watcher 启动（与打开成功的后端同拍启动；失败 = NullWatcher 降级）。
 #[cfg(feature = "macos")]
-fn start_platform_watcher(
-    _backend: &mut xcontrol_clipboard::PlatformClipboard,
+fn start_platform_watcher_from_shared(
+    _shared: &std::sync::Arc<std::sync::Mutex<xcontrol_clipboard::PlatformClipboard>>,
 ) -> Box<dyn ClipWatcherDrain> {
     // mac：changeCount 轮询线程独立于读写句柄（ns_change_count 原语全局）。
     match xcontrol_clipboard::ClipboardWatcher::start(xcontrol_clipboard::DEFAULT_POLL_INTERVAL) {
@@ -917,8 +971,8 @@ fn start_platform_watcher(
 }
 
 #[cfg(feature = "windows")]
-fn start_platform_watcher(
-    _backend: &mut xcontrol_clipboard::PlatformClipboard,
+fn start_platform_watcher_from_shared(
+    _shared: &std::sync::Arc<std::sync::Mutex<xcontrol_clipboard::PlatformClipboard>>,
 ) -> Box<dyn ClipWatcherDrain> {
     match xcontrol_clipboard::ClipboardWatcher::start() {
         Ok(watcher) => Box::new(PollWatcherAdapter(watcher)),
@@ -927,6 +981,16 @@ fn start_platform_watcher(
             Box::new(NullWatcher)
         }
     }
+}
+
+#[cfg(feature = "x11")]
+fn start_platform_watcher_from_shared(
+    shared: &std::sync::Arc<std::sync::Mutex<xcontrol_clipboard::PlatformClipboard>>,
+) -> Box<dyn ClipWatcherDrain> {
+    let mut guard = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    return start_platform_watcher(&mut guard);
 }
 
 #[cfg(feature = "x11")]
@@ -942,6 +1006,16 @@ fn start_platform_watcher(
             Box::new(NullWatcher)
         }
     }
+}
+
+#[cfg(feature = "wayland")]
+fn start_platform_watcher_from_shared(
+    shared: &std::sync::Arc<std::sync::Mutex<xcontrol_clipboard::PlatformClipboard>>,
+) -> Box<dyn ClipWatcherDrain> {
+    let mut guard = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    return start_platform_watcher(&mut guard);
 }
 
 #[cfg(feature = "wayland")]
@@ -1028,8 +1102,11 @@ fn read_platform_text(
         .as_mut()
         .map(|PlatformBackend(inner)| inner.inner.take());
     match inner {
-        Some(Some(mut clipboard)) => {
-            let result = clipboard.read_text(max_bytes);
+        Some(Some(clipboard)) => {
+            let result = clipboard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read_text(max_bytes);
             // 放回（下次拍继续用同一句柄；X11 常驻 serve 线程语义保留）。
             if let Some(backend) = backend.as_mut() {
                 backend.0.inner = Some(clipboard);
@@ -1058,8 +1135,11 @@ fn read_platform_image(
         .as_mut()
         .map(|PlatformBackend(inner)| inner.inner.take());
     match inner {
-        Some(Some(mut clipboard)) => {
-            let result = clipboard.read_image_png(max_bytes);
+        Some(Some(clipboard)) => {
+            let result = clipboard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read_image_png(max_bytes);
             if let Some(backend) = backend.as_mut() {
                 backend.0.inner = Some(clipboard);
             }
@@ -1087,8 +1167,11 @@ fn write_platform_text(
         .as_mut()
         .map(|PlatformBackend(inner)| inner.inner.take());
     match inner {
-        Some(Some(mut clipboard)) => {
-            let result = clipboard.write_text(text);
+        Some(Some(clipboard)) => {
+            let result = clipboard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .write_text(text);
             if let Some(backend) = backend.as_mut() {
                 backend.0.inner = Some(clipboard);
             }
@@ -1167,8 +1250,11 @@ fn write_platform_image(
         .as_mut()
         .map(|PlatformBackend(inner)| inner.inner.take());
     match inner {
-        Some(Some(mut clipboard)) => {
-            let result = clipboard.write_image_png(png);
+        Some(Some(clipboard)) => {
+            let result = clipboard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .write_image_png(png);
             if let Some(backend) = backend.as_mut() {
                 backend.0.inner = Some(clipboard);
             }
@@ -1204,6 +1290,13 @@ fn write_platform_text(
 
 #[allow(unused_imports)]
 use _format_read_from as _;
+#[cfg(any(
+    feature = "macos",
+    feature = "windows",
+    feature = "x11",
+    feature = "wayland"
+))]
+use xcontrol_clipboard::open_platform_clipboard;
 use xcontrol_clipboard::{ClipFormatPayload, format_read_from as _format_read_from};
 
 // ============================================================

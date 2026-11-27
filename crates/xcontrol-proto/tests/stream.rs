@@ -27,8 +27,8 @@ fn mixed_stream_dispatch_and_skip() {
             state: KeyState::Down,
         },
     );
-    // 未知 kind（未来 minor 才有的 0x60）：len=4
-    stream.extend_from_slice(&encode_frame(2, 0x60, &[1, 2, 3, 4]).unwrap());
+    // 未知 kind（未来 minor 才有的 0x61——文件域止于 0x60）：len=4
+    stream.extend_from_slice(&encode_frame(2, 0x61, &[1, 2, 3, 4]).unwrap());
     let ctrl = CtrlMsg::SetOptions {
         options: Options::defaults(),
     };
@@ -67,9 +67,9 @@ fn mixed_stream_dispatch_and_skip() {
                 assert!(matches!(msg, xcontrol_proto::ClipMsg::Ack(_)));
                 assert_eq!(msg.as_message().kind(), frame::kind::CLIP_ACK);
             }
-            0x60 => {
+            0x61 => {
                 assert_eq!(frame.payload, &[1, 2, 3, 4]); // 未知 kind 保留 payload 供上层自行跳过
-                assert_eq!(kind_class(0x60), KindClass::Unknown);
+                assert_eq!(kind_class(0x61), KindClass::Unknown);
             }
             other => panic!("意外 kind 0x{other:02X}"),
         }
@@ -78,7 +78,7 @@ fn mixed_stream_dispatch_and_skip() {
         seen,
         vec![
             frame::kind::KEY,
-            0x60,
+            0x61,
             frame::kind::CTRL_SET_OPTIONS,
             frame::kind::CLIP_ACK,
             frame::kind::MOUSE_MOVE_REL
@@ -156,6 +156,7 @@ fn pseudorandom_stream_never_panics() {
                     let _ = InputEvent::decode(frame.header.kind, frame.payload);
                     let _ = decode_ctrl(frame.header.kind, frame.payload);
                     let _ = decode_clip(frame.header.kind, frame.payload);
+                    let _ = xcontrol_proto::decode_file(frame.header.kind, frame.payload);
                 }
                 Err(_) => break, // 截断/越界：调用方断开（协议违规）
             }
@@ -167,10 +168,11 @@ fn pseudorandom_stream_never_panics() {
 /// Hello/HelloBack 携带各自版本 → 协商 → 会话 minor 决定 HelloBack 的 wire 版本值。
 #[test]
 fn version_handshake_matrix() {
-    let local = ProtoVer::CURRENT; // 1.0
+    let local = ProtoVer::CURRENT; // 1.2
     let peers = [
         (ProtoVer { major: 1, minor: 0 }, true),
         (ProtoVer { major: 1, minor: 1 }, true),
+        (ProtoVer { major: 1, minor: 2 }, true),
         (ProtoVer { major: 2, minor: 0 }, false),
     ];
     for (peer, compatible) in peers {

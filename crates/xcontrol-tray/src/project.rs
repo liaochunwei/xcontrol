@@ -95,6 +95,15 @@ pub struct MenuCheckstates {
     pub autostart_checked: bool,
 }
 
+/// 对端剪贴板文件清单投影（FR-7.3 托盘条目载荷）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingFilesInfo {
+    /// 条目数。
+    pub count: usize,
+    /// 体积文案（humanize 后；投影层格式化，菜单直接拼接）。
+    pub size_label: String,
+}
+
 /// 投影输入快照（app 层从 `AppState` + 自启实测状态转换；crate 内轻量类型）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TraySnapshot {
@@ -110,6 +119,10 @@ pub struct TraySnapshot {
     pub slaves: Vec<SlaveInfo>,
     /// 候选主控（FR-5.5 从机；发现循环投影——空 = 无候选/非发现模式）。
     pub host_candidates: Vec<HostCandidateInfo>,
+    /// 对端剪贴板文件清单（FR-7.3；`None` = 无货——菜单不渲染该条）。
+    pub incoming_files: Option<IncomingFilesInfo>,
+    /// 拉取进行中（FR-7.3 切片 d——「取消文件传输」条目的出现条件）。
+    pub transfer_cancelable: bool,
     /// 平均往返延迟（ms；`None` = 无指标——tooltip 省略延迟段）。
     pub latency_ms: Option<u32>,
     /// 开机自启当前生效状态（`Autostart::is_enabled`，菜单勾选态）。
@@ -140,6 +153,10 @@ pub struct TrayState {
     pub slaves: Vec<SlaveInfo>,
     /// 候选主控子菜单数据（FR-5.5 从机；其余角色为空）。
     pub host_candidates: Vec<HostCandidateInfo>,
+    /// 对端剪贴板文件清单（FR-7.3；`None` = 无货——菜单不渲染该条）。
+    pub incoming_files: Option<IncomingFilesInfo>,
+    /// 拉取进行中（FR-7.3 切片 d——「取消文件传输」条目的出现条件）。
+    pub transfer_cancelable: bool,
 }
 
 /// 托盘投影器（无状态；`project` 为纯函数）。
@@ -221,6 +238,8 @@ impl TrayAdapter {
             },
             slaves: snapshot.slaves.clone(),
             host_candidates: snapshot.host_candidates.clone(),
+            incoming_files: snapshot.incoming_files.clone(),
+            transfer_cancelable: snapshot.transfer_cancelable,
         }
     }
 }
@@ -243,6 +262,8 @@ mod tests {
                 })
                 .collect(),
             host_candidates: Vec::new(),
+            incoming_files: None,
+            transfer_cancelable: false,
             latency_ms,
             autostart_enabled: false,
         }

@@ -75,26 +75,40 @@
 // M2 曾预留给 M5 HTML 挂载的 msg_send unsafe 未被消耗——objc2-app-kit 0.3.2 的
 // setString_forType 是安全绑定，见模块文档 API 版本依据）。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use objc2::ClassType;
 use objc2::rc::autoreleasepool;
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypeHTML};
-use objc2_foundation::NSString;
+use objc2::runtime::ProtocolObject;
+use objc2_app_kit::{NSPasteboard, NSPasteboardTypeHTML, NSPasteboardWriting};
+use objc2_foundation::{NSArray, NSString, NSURL};
 
 use crate::error::ClipboardError;
 use crate::{
     ClipFormatPayload, ClipboardContent, ClipboardWatch, FormatRead, WrittenMark,
-    fingerprint_content, format_read_from,
+    fingerprint_bytes, fingerprint_content, format_read_from,
 };
 
 /// 默认轮询间隔：250ms（docs/04 §4；macOS 无剪贴板通知 API，rustdesk 同款
 /// 333ms 量级——250ms 满足 FR-4.1「复制后 <200ms 可粘贴」的端到端预算中
 /// 监听环节的份额，可经 [`ClipboardWatcher::start`] 配置）。
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// 进程级 NSPasteboard 访问互斥（2026-11-27 双机实测教训）：AppKit 的
+/// `NSPasteboard` **非线程安全**——本 crate 的读路径分布在多个后台线程
+/// （clip 泵的 arboard 读取 / file 检测器的 read_file_urls / 监听线程的
+/// changeCount 采样），Finder 大混合板（文件 + PNG 预览 + 20 余种格式）上
+/// 并发读取触发 AppKit 内部死锁（实测：双端 9s 心跳互死，进程存活但全线程
+/// park）。全部 NSPasteboard 访问点持此锁串行化——临界区为毫秒级读写。
+pub(crate) fn pasteboard_gate() -> &'static std::sync::Mutex<()> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Mutex::new(()))
+}
 
 // ============================================================
 // changeCount 采样（docs/04 §4 监听原语）
@@ -113,6 +127,9 @@ pub fn ns_change_count() -> u64 {
     // 线程约束：NSPasteboard 非 MainThreadOnly（extern_class! 未标注），
     // 本函数可在任意线程调用（轮询线程，docs/04 §4）。
     // method_family = none（绑定声明），Retained 所有权语义正确。
+    let _gate = pasteboard_gate()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let count = NSPasteboard::generalPasteboard().changeCount();
     // NSInteger = isize；changeCount 恒 >= 0（内部版本号语义），负值只可能是
     // 平台异常——兜底 0 保持基准不动。
@@ -347,6 +364,124 @@ impl MacClipboard {
                 reason: error.to_string(),
             }),
         }
+    }
+
+    /// 写入文件引用清单（FR-7.3 挂板面，docs/05 §0.2「挂板」列；2026-11-26
+    /// b-平台）：`clearContents()` + `writeObjects(NSURL[])`——NSURL 符合
+    /// `NSPasteboardWriting`（objc2-app-kit 0.3.2 生成 `unsafe impl`，见
+    /// nspasteboard.rs 的 NSURLNSPasteboardSupport 类目），落板形态 = Finder
+    /// 语义的 `public.file-url`（多选 = 多 item），目标应用按本地文件处理。
+    ///
+    /// [`WrittenMark`] 指纹 = 路径+目录位规范形哈希（文件域独立指纹，与 clip
+    /// 三格式指纹互不干扰，docs/04 §8.3 同板多域语义；本 crate 不依赖 core，
+    /// 算法本地实现 [`fingerprint_bytes`]）。剪贴板域读取路径（text/png/html）
+    /// 读不到文件引用 → 挂板不会触发 clip 域回声，域隔离天然成立。
+    ///
+    /// # Errors
+    /// [`ClipboardError::Platform`]：空清单 / `writeObjects` 返回 false。
+    pub fn write_file_urls(&mut self, paths: &[PathBuf]) -> Result<WrittenMark, ClipboardError> {
+        if paths.is_empty() {
+            return Err(ClipboardError::Platform {
+                action: "clipboard-write-file-urls",
+                reason: "空清单（无文件引用可挂板）".into(),
+            });
+        }
+        let _gate = pasteboard_gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 规范形（写入基线指纹输入）：路径 lossy 文本 + 目录位，len 前缀帧式
+        // 布局防拼接碰撞（同 core 清单指纹惯例）。
+        let mut canonical: Vec<(String, bool)> = Vec::with_capacity(paths.len());
+        let success = autoreleasepool(|_| {
+            let pasteboard = NSPasteboard::generalPasteboard();
+            pasteboard.clearContents();
+            let urls: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    canonical.push((path.to_string_lossy().into_owned(), path.is_dir()));
+                    let ns = NSString::from_str(&path.to_string_lossy());
+                    NSURL::fileURLWithPath_isDirectory(&ns, path.is_dir())
+                })
+                .collect();
+            let objects: Vec<&ProtocolObject<dyn NSPasteboardWriting>> = urls
+                .iter()
+                .map(|url| {
+                    let url_ref: &NSURL = url;
+                    ProtocolObject::from_ref(url_ref)
+                })
+                .collect();
+            let array = NSArray::from_slice(&objects);
+            // writeObjects 为安全绑定（objc2 0.6 生成；返回 false = 落板失败
+            // fail loud 上抛，同 write_html 纪律）。
+            pasteboard.writeObjects(&array)
+        });
+        if !success {
+            return Err(ClipboardError::Platform {
+                action: "clipboard-write-file-urls",
+                reason: "NSPasteboard writeObjects 返回 false".into(),
+            });
+        }
+        let mut digest_input = Vec::new();
+        for (path, is_dir) in &canonical {
+            digest_input.extend_from_slice(&path.len().to_le_bytes());
+            digest_input.extend_from_slice(path.as_bytes());
+            digest_input.push(u8::from(*is_dir));
+        }
+        let change_count = ns_change_count();
+        Ok(WrittenMark {
+            fingerprint: fingerprint_bytes(&digest_input),
+            change_count,
+            written_at: Instant::now(),
+        })
+    }
+
+    /// 读取文件引用清单（FR-7.3 检测面，docs/05 §0.2「检测」列）：
+    /// `readObjectsForClasses(NSURL)` 读出全部 file URL（多选 = 多条目，顺序 =
+    /// Finder 复制顺序的 Apple 契约）。无文件引用（空剪贴板 / 文本/图片/HTML
+    /// 剪贴板）→ `Ok(None)` 常态——按类读取一步到位，无需类型探测
+    /// （`pasteboardTypes` 未进 0.3.2 绑定，且按类过滤语义等价）。
+    ///
+    /// 超过 `max_entries` 截断（调用方按清单上限语义告警，docs/02 §4.6 防护
+    /// 规则 1 的平台侧配合）。
+    ///
+    /// # Errors
+    /// [`ClipboardError::Platform`]：下标越界（usize→u64 防御面）。
+    pub fn read_file_urls(
+        &mut self,
+        max_entries: usize,
+    ) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+        let _gate = pasteboard_gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        autoreleasepool(|_| {
+            let pasteboard = NSPasteboard::generalPasteboard();
+            let classes = [NSURL::class()];
+            let class_array = NSArray::from_slice(&classes);
+            // SAFETY: class_array 仅含 NSURL 类对象（objc2-app-kit 0.3.2 声明
+            // `unsafe impl NSPasteboardReading for NSURL`——Apple 契约 NSURL 符合
+            // NSPasteboardReading 协议，readObjectsForClasses 按类过滤返回元素
+            // 恒为 NSURL 实例）；options = None（默认读取选项，Apple 文档语义）。
+            // readObjectsForClasses_options 为 unsafe 绑定（生成器标注泛型要求
+            // 无法静态证明）；本调用点的不变量由上述类数组构成保证。
+            let read = unsafe { pasteboard.readObjectsForClasses_options(&class_array, None) };
+            let Some(array) = read else {
+                return Ok(None);
+            };
+            let count = array.count();
+            let take = count.min(max_entries);
+            let mut paths = Vec::with_capacity(take);
+            for index in 0..take {
+                let object = array.objectAtIndex(index);
+                let Ok(url) = object.downcast::<NSURL>() else {
+                    continue; // 按类过滤后理论不可达；防御面跳过
+                };
+                let Some(path) = url.path() else {
+                    continue; // 非 file 形态 URL（fileURLWithPath 构造恒有 path）
+                };
+                paths.push(PathBuf::from(path.to_string()));
+            }
+            Ok(Some(paths))
+        })
     }
 }
 
@@ -872,5 +1007,58 @@ mod tests {
         );
 
         watcher.stop().expect("显式 stop 干净 join");
+    }
+
+    /// 文件引用 round-trip（#[ignore]：**写系统剪贴板**，人工运行同上；FR-7.3
+    /// b-平台验收项「mac 自往返」）。
+    ///
+    /// 临时文件 write_file_urls → read_file_urls 还原路径全链路；经守卫恢复
+    /// 原剪贴板内容。
+    #[test]
+    #[ignore = "写系统剪贴板（无论成败均恢复原内容）：cargo test -p xcontrol-clipboard --features macos -- --ignored"]
+    fn file_urls_round_trip_smoke() {
+        let _serial = CLIPBOARD_SMOKE_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        println!("{SMOKE_NOTE}");
+        let mut clipboard = MacClipboard::new().expect("arboard 初始化");
+        let original = clipboard.read_text(u64::MAX).expect("读取失败");
+        let _restore = RestoreGuard {
+            clipboard: arboard::Clipboard::new().expect("恢复守卫初始化"),
+            original: original.clone(),
+        };
+
+        // 两个临时文件（真实存在——writeObjects 落板不校验存在性，但 Finder
+        // 语义要求；read 路径也不校验，round-trip 只看 URL 字符串还原）。
+        let dir = std::env::temp_dir().join("xcontrol-file-urls-smoke");
+        std::fs::create_dir_all(&dir).expect("临时目录创建");
+        let first = dir.join("xcontrol-冒烟-α.txt");
+        let second = dir.join("second-β.pdf");
+        std::fs::write(&first, b"smoke").expect("临时文件一");
+        std::fs::write(&second, b"smoke2").expect("临时文件二");
+
+        let paths = vec![first.clone(), second.clone()];
+        let mark = clipboard.write_file_urls(&paths).expect("文件引用写入");
+        assert!(
+            clipboard.has_changes_since(mark.change_count.saturating_sub(1)),
+            "写入后计数相对写入前基准应推进"
+        );
+        let read_back = clipboard
+            .read_file_urls(64)
+            .expect("读取不失败")
+            .expect("有文件引用");
+        assert_eq!(read_back.len(), 2, "多 item 读回");
+        // URL path 还原（%20 解码由 NSURL.path 承担；中文文件名直接比对）
+        assert_eq!(
+            read_back,
+            vec![
+                first.to_string_lossy().into_owned(),
+                second.to_string_lossy().into_owned()
+            ],
+            "round-trip 路径还原"
+        );
+
+        // 清理临时面（剪贴板恢复由守卫承接）
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

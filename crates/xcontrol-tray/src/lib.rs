@@ -59,12 +59,12 @@ pub use autostart::{Autostart, AutostartError, platform_autostart};
 // —— gpui 集成区 re-export（gpui feature）——
 #[cfg(feature = "gpui")]
 pub use menu::{
-    ConfirmHost, DisconnectRescan, OpenSettings, QuitApp, SwitchRole, SwitchToSlave,
-    ToggleAutostart, TogglePause,
+    CancelFileTransfer, ConfirmHost, DisconnectRescan, OpenSettings, QuitApp, SwitchRole,
+    SwitchToSlave, ToggleAutostart, TogglePause, TransferFiles,
 };
 pub use project::{
-    HostCandidateInfo, IconKind, MenuCheckstates, SlaveInfo, TrayAdapter, TrayRole, TraySnapshot,
-    TrayState, TrayStatus,
+    HostCandidateInfo, IconKind, IncomingFilesInfo, MenuCheckstates, SlaveInfo, TrayAdapter,
+    TrayRole, TraySnapshot, TrayState, TrayStatus,
 };
 #[cfg(feature = "gpui")]
 pub use tray::{SnapshotProvider, TrayController, TrayUpdate};

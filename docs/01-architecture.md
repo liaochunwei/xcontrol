@@ -129,5 +129,6 @@ formats = ["text", "image", "html"]
 | gpui 依赖方式与托盘集成策略 | [ADR-0001](adr/0001-gpui-and-tray.md) |
 | 传输层/加密/发现选型（TCP×2 + Noise + 三层发现） | [ADR-0002](adr/0002-transport-and-discovery.md) |
 | 各平台输入/剪贴板实现路径 | [ADR-0003](adr/0003-platform-input-paths.md) |
+| 文件传输通道拓扑与物化策略（独立文件 TCP + stage-then-mount，FR-7.3） | [ADR-0004](adr/0004-file-transfer-channel-and-materialization.md) |
 
 （输入抽象与映射语义不设 ADR：属规范本体，见 [03-input.md](03-input.md)。）

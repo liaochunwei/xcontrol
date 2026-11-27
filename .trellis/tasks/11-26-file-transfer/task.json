@@ -1,0 +1,32 @@
+{
+  "id": "file-transfer",
+  "name": "file-transfer",
+  "title": "跨设备文件复制粘贴（粘贴时才传输）",
+  "description": "复制端只发元数据清单，接收端在用户粘贴时才经文件通道拉流物化。剪贴板同步的自然延伸，落点 FR-7.3。",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P1",
+  "creator": "csdark",
+  "assignee": "csdark",
+  "createdAt": "2026-11-26",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "11-26-file-transfer-spec",
+    "11-26-file-ref-announce",
+    "11-26-file-channel-pull",
+    "11-26-paste-materialize",
+    "11-26-file-transfer-polish"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

@@ -1,0 +1,7 @@
+{"file": "docs/00-requirements.md", "reason": "需求事实源：FR-7.3 落点、§4.7/§6 编号与非目标惯例"}
+{"file": "docs/02-protocol.md", "reason": "协议事实源：kind 分配/wire 钉死/修订记录/防护惯例，XCP 1.2 变更主体"}
+{"file": "docs/04-clipboard.md", "reason": "剪贴板规范：回环三防线、指纹规范形、§3 推送决策辨析落点"}
+{"file": "docs/05-platform.md", "reason": "平台矩阵：四平台文件引用读写路径与实机复核项惯例"}
+{"file": "docs/07-security.md", "reason": "安全模型：文件传输安全面（索引寻址红线）落点"}
+{"file": "docs/adr/README.md", "reason": "ADR 模板与索引惯例（ADR-0004 遵循）"}
+{"file": "docs/09-roadmap.md", "reason": "延后池条目：FR-7.x 表述需随立项同步"}

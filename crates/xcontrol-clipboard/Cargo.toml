@@ -92,6 +92,7 @@ windows = { workspace = true, optional = true, features = [
 # 并集后仍零 unsafe）→ platform/x11.rs 保持零 unsafe；wl-clipboard-rs 同为纯 Rust
 # Wayland 客户端（crate 内 deny(unsafe_code)），platform/wayland.rs 零 unsafe。
 [target.'cfg(target_os = "linux")'.dependencies]
+url = { workspace = true, optional = true }
 x11rb = { workspace = true, optional = true }
 wl-clipboard-rs = { workspace = true, optional = true }
 
@@ -105,7 +106,7 @@ wl-clipboard-rs = { workspace = true, optional = true }
 macos = ["dep:arboard", "dep:objc2-app-kit", "dep:objc2", "dep:objc2-foundation"]
 windows = ["dep:arboard", "dep:windows"]
 x11 = ["dep:arboard", "dep:x11rb"]
-wayland = ["dep:wl-clipboard-rs"]
+wayland = ["dep:wl-clipboard-rs", "dep:url"]
 
 # dev-dep：xcontrol-core 仅测试消费——用 M1 的 MockClipboard 对拍 ClipboardWatch
 # trait 语义（design.md 测试策略；docs/08 §1 依赖图无新增生产方向，先例：net 的

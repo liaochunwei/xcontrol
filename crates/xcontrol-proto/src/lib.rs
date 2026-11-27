@@ -16,6 +16,7 @@
 //! | [`input`] | 12 种输入事件（**定长手写**小端）+ [`RelMerger`] 合帧辅助 | docs/02 §4.2 |
 //! | [`ctrl`] | [`CtrlMsg`] 控制消息（postcard）+ Caps/ScreenInfo/Options/ErrCode | docs/02 §4.3 |
 //! | [`clip`] | 剪贴板通道五消息（postcard）+ 接收端限额校验 | docs/02 §4.4/§6 |
+//! | [`file`] | 文件通道九消息（postcard，XCP 1.2+）+ 接收端清单/分块校验 | docs/02 §4.6 |
 //! | [`version`] | [`negotiate`] 版本协商（major 不等即 Err、minor 取 min） | docs/02 §5 |
 //! | [`xkey`] | [`XKey`] 抽象键码 + HID 值域常量表（保留区拒绝） | docs/03 §2 |
 //!
@@ -52,6 +53,9 @@
 //!         KindClass::Clip => {
 //!             let _ = xcontrol_proto::decode_clip(frame.header.kind, frame.payload);
 //!         }
+//!         KindClass::File => {
+//!             let _ = xcontrol_proto::decode_file(frame.header.kind, frame.payload);
+//!         }
 //!         KindClass::Unknown => {}                      // 未知 kind：按 len 跳过（前向兼容）
 //!     }
 //! }
@@ -64,6 +68,7 @@
 pub mod clip;
 pub mod ctrl;
 pub mod error;
+pub mod file;
 pub mod frame;
 pub mod input;
 pub mod version;
@@ -74,9 +79,13 @@ pub use clip::{
 };
 pub use ctrl::{Caps, CtrlMsg, ErrCode, Options, ScreenInfo, decode_ctrl};
 pub use error::ProtoError;
+pub use file::{
+    FileAck, FileBind, FileCancel, FileChunk, FileEnd, FileEntry, FileEntryKind, FileErrCode,
+    FileError, FileExpand, FileMsg, FilePullReq, FileRefAnnounce, decode_file,
+};
 pub use frame::{
     FRAME_HEADER_LEN, Frame, FrameHeader, KindClass, MAX_FRAME_PAYLOAD, decode_frame, encode_frame,
-    encode_frame_into, is_clip_kind, is_ctrl_kind, is_input_kind, kind, kind_class,
+    encode_frame_into, is_clip_kind, is_ctrl_kind, is_file_kind, is_input_kind, kind, kind_class,
 };
 pub use input::{
     Axis, InputEvent, KeyState, MAX_TEXT_LEN, Mods, MouseButton, RelMerger, ScreenEdge, ScreenId,

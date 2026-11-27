@@ -341,6 +341,12 @@ fn run_chain(
         // 命令轮询（UI / 托盘，docs/06 §6；M2 命令低频，逐条处理）。
         while let Some(command) = CoreHandle::try_recv(rx_cmd) {
             match command {
+                CoreCommand::TransferFiles => {
+                    crate::file_channel::lock_hub().request_pull_all_pending();
+                }
+                CoreCommand::CancelFileTransfer => {
+                    crate::file_channel::lock_hub().request_cancel();
+                }
                 CoreCommand::Pause => {
                     host.on_local(LocalCmd::Pause, bus)?;
                     bus.report(|state| state.conn = ConnState::Running { paused: true });

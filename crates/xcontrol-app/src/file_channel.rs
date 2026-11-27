@@ -616,6 +616,9 @@ async fn run_file_pump(
     session_id: [u8; 16],
     mut stop: watch::Receiver<bool>,
 ) {
+    // 通道级出站节流标记（根因 #4：原 hub 级指纹跨泵共享——双泵并存时
+    // announce 只发一次且发进死通道。每泵本地 fp + 泵退出清 hub 标记。）
+    let mut channel_sent_fp: Option<[u8; 16]> = None;
     if *stop.borrow_and_update() {
         return; // 通道建立即被要求停止（控制会话已收尾）
     }
@@ -707,11 +710,12 @@ async fn run_file_pump(
                 };
                 if let Some(announce) = announce {
                     let fingerprint = manifest_fingerprint(&announce.entries);
-                    let already_sent =
-                        lock_hub().outbound_sent_fp() == Some(fingerprint);
+                    // 根因 #4：节流改通道级（原 hub 级跨泵共享——双泵并存时
+                    // announce 只发一次且发进死通道）
+                    let already_sent = channel_sent_fp == Some(fingerprint);
                     if !already_sent {
                         serve.register(&announce);
-                        lock_hub().mark_outbound_sent(fingerprint);
+                        channel_sent_fp = Some(fingerprint);
                         tracing::info!(target: TARGET, transfer_id = announce.transfer_id,
                             entries = announce.entries.len(), "FileRefAnnounce 出站");
                         out.push(FileMsg::RefAnnounce(announce));
@@ -929,6 +933,8 @@ async fn run_file_pump(
         }
     }
     transport.shutdown().await;
+    // 通道死亡：清 hub 出站指纹（同清单经新通道重发）
+    lock_hub().outbound_fp = None;
     tracing::info!(target: TARGET, %peer, "文件通道关闭（重连由调用方按 3s 退避承接）");
 }
 

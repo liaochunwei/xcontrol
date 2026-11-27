@@ -59,7 +59,7 @@ use xcontrol_core::clip_plan::plan_chunks;
 use xcontrol_core::clip_rx::{ClipRx, ClipRxAction, ClipRxConfig};
 use xcontrol_core::clip_tx::ClipTx;
 use xcontrol_proto::clip::{ClipFormat, ClipMsg};
-use xcontrol_proto::{ClipAck, ClipAnnounce, ClipChunk, ClipEnd, FileRefAnnounce};
+use xcontrol_proto::{ClipAck, ClipAnnounce, ClipChunk, ClipEnd};
 
 /// 剪贴板运行时 logging target（logging-targets.md 审计表新增行）。
 pub(crate) const TARGET: &str = "session::clip";
@@ -82,6 +82,39 @@ static SHARED_ECHO: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<EchoFilt
 
 /// 取进程级共享 EchoFilter 句柄（首次调用惰性构造；其后克隆同一 Arc）。
 #[must_use]
+/// 进程级共享平台剪贴板槽（根因 #5 深层修复，2026-11-27 双机实测）：同一进程
+/// 第二次 `open_platform_clipboard()` 的 wayland 连接在 KWin 上互锁（detector
+/// 卡死 → file 泵永不启动 → 心跳死）。clip 泵与文件检测器共用同一实例
+/// （同一 counter / 同一 data-control 连接 / 同一 watcher 线程）。
+#[cfg(any(
+    feature = "macos",
+    feature = "windows",
+    feature = "x11",
+    feature = "wayland"
+))]
+pub(crate) fn shared_clipboard()
+-> Option<std::sync::Arc<std::sync::Mutex<xcontrol_clipboard::PlatformClipboard>>> {
+    static SHARED: std::sync::OnceLock<
+        Option<std::sync::Arc<std::sync::Mutex<xcontrol_clipboard::PlatformClipboard>>>,
+    > = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| match open_platform_clipboard() {
+            Ok(clip) => {
+                #[cfg(feature = "wayland")]
+                if let Err(error) = clip.watch() {
+                    tracing::warn!(target: TARGET, %error, "共享剪贴板 Watcher 启动失败");
+                }
+                let _ = &clip; // wayland watch 是 &self（counter Arc 已克隆给 watcher 线程）
+                Some(std::sync::Arc::new(std::sync::Mutex::new(clip)))
+            }
+            Err(error) => {
+                tracing::warn!(target: TARGET, %error, "共享剪贴板实例创建失败");
+                None
+            }
+        })
+        .clone()
+}
+
 pub(crate) fn shared_echo() -> std::sync::Arc<std::sync::Mutex<EchoFilter>> {
     SHARED_ECHO
         .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(EchoFilter::default())))
@@ -583,9 +616,7 @@ impl ClipboardRuntime {
         // 板上有 file-url = 文件复制，本板归文件域接管，clip 泵静默跳过。
         #[cfg(any(feature = "macos", feature = "wayland"))]
         if let Some(inner_clip) = self.backend.as_mut().and_then(|b| b.0.inner.as_mut())
-            && inner_clip
-                .read_file_urls(FileRefAnnounce::MAX_ENTRIES)
-                .is_ok_and(|r| r.is_some())
+            && inner_clip.read_file_urls(512).is_ok_and(|r| r.is_some())
         {
             tracing::debug!(target: TARGET, "板上有文件引用（文件域接管）：clip 泵跳过");
             return;
@@ -1221,6 +1252,13 @@ fn write_platform_text(
 
 #[allow(unused_imports)]
 use _format_read_from as _;
+#[cfg(any(
+    feature = "macos",
+    feature = "windows",
+    feature = "x11",
+    feature = "wayland"
+))]
+use xcontrol_clipboard::open_platform_clipboard;
 use xcontrol_clipboard::{ClipFormatPayload, format_read_from as _format_read_from};
 
 // ============================================================

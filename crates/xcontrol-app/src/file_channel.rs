@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 #[cfg(any(feature = "macos", feature = "wayland"))]
-use xcontrol_clipboard::{ClipboardWatch, PlatformClipboard, open_platform_clipboard};
+use xcontrol_clipboard::{ClipboardError, ClipboardWatch, PlatformClipboard};
 use xcontrol_core::clip_plan::WIRE_CHUNK_LEN;
 use xcontrol_core::clock::{Clock, SystemClock};
 use xcontrol_core::file_ref::{
@@ -181,8 +181,17 @@ impl FileHub {
         self.pending.as_ref()
     }
 
-    /// pending 槽写入（泵在合法 announce 应用后调用）。
+    /// pending 槽写入（泵在合法 announce 应用后调用）。同步初始化接收端
+    /// rel_paths 表（根因 #6：接收端无 publish 面.rel_paths 恒空 → 暂存/
+    /// 挂板文件名走 entry-N 占位——2026-11-27 双机实测暴露）。子树展开经
+    /// append_pending_entries 追加。
     pub fn set_pending(&mut self, slot: xcontrol_core::file_ref::PendingSlot) {
+        self.rel_paths = slot
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        self.outbound_child_paths.clear();
         self.pending = Some(slot);
     }
 
@@ -1376,7 +1385,17 @@ fn mount_paths(paths: &[PathBuf], fingerprint: [u8; 16], now_ms: u64) {
         tracing::warn!(target: TARGET, "挂板面为空（暂存文件缺失），跳过");
         return;
     }
-    match open_platform_clipboard().and_then(|mut clipboard| clipboard.write_file_urls(&existing)) {
+    let mount_result = match crate::clip_rt::shared_clipboard() {
+        Some(shared) => shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_file_urls(&existing),
+        None => Err(ClipboardError::Platform {
+            action: "clipboard-mount",
+            reason: "共享剪贴板实例不可用".into(),
+        }),
+    };
+    match mount_result {
         Ok(_) => {
             lock_hub().set_mounted(fingerprint, now_ms);
             // 一次性消费（切片 c：透明粘贴/托盘条目随之消失；回环防线指纹已登记）
@@ -1408,32 +1427,42 @@ fn mount_paths(paths: &[PathBuf], _fingerprint: [u8; 16], _now_ms: u64) {
 /// hub.publish_local_manifest 内）。
 #[cfg(any(feature = "macos", feature = "wayland"))]
 struct LocalFileRefDetector {
-    clipboard: PlatformClipboard,
+    clipboard: std::sync::Arc<std::sync::Mutex<PlatformClipboard>>,
     seen: u64,
 }
 
 #[cfg(any(feature = "macos", feature = "wayland"))]
 impl LocalFileRefDetector {
     fn new() -> Option<Self> {
-        match open_platform_clipboard() {
-            Ok(clipboard) => {
-                let seen = clipboard.change_count();
-                Some(Self { clipboard, seen })
-            }
-            Err(error) => {
-                tracing::warn!(target: TARGET, %error, "文件引用检测器初始化失败（检测面停用）");
-                None
-            }
-        }
+        // 根因 #5 终极修复：detector 复用 clip 泵的共享剪贴板实例（同一
+        // wayland 连接 / 同一 counter / 同一 watcher）——独立实例 = 第二条
+        // data-control 连接，KWin 上互锁（实测卡死 file 泵 → 心跳死）。
+        let clipboard = crate::clip_rt::shared_clipboard()?;
+        let seen = clipboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .change_count();
+        tracing::info!(target: TARGET, "【诊断】detector 就绪（共享实例，seen={seen}）");
+        Some(Self {
+            clipboard: clipboard.clone(),
+            seen,
+        })
     }
 
     fn poll(&mut self, now_ms: u64) {
-        if !self.clipboard.has_changes_since(self.seen) {
+        let mut clipboard = self
+            .clipboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tracing::info!(target: TARGET, seen = self.seen, now = clipboard.change_count(),
+            "【诊断】poll 心跳");
+        if !clipboard.has_changes_since(self.seen) {
             return;
         }
-        self.seen = self.clipboard.change_count();
+        tracing::info!(target: TARGET, seen = self.seen, now = clipboard.change_count(), "检测器：变化确认");
+        self.seen = clipboard.change_count();
         tracing::info!(target: TARGET, "检测器：剪贴板变化（change_count={}）", self.seen);
-        let Ok(Some(paths)) = self.clipboard.read_file_urls(FileRefAnnounce::MAX_ENTRIES) else {
+        let Ok(Some(paths)) = clipboard.read_file_urls(FileRefAnnounce::MAX_ENTRIES) else {
             tracing::debug!(target: TARGET, "检测器：非文件引用（文件域静默）");
             return;
         };

@@ -2281,12 +2281,20 @@ async fn drive_session(
                 match outcome {
                     crate::paste_intercept::PasteOutcome::Resume(held) => {
                         tracing::info!(target: "session::rt", "物化完成：回注挂起的粘贴（文件已挂本机剪贴板）");
-                        // 组合重放：修饰键↓（拦截时快照）→ V↓——物化等待的数秒里
-                        // 用户可能已松开物理修饰键，裸 V↓ = 单独 v 字母（幽灵键）。
-                        for (code, state) in held.modifier_replay() {
+                        // 完整合成按键周期：修饰键↓ → V↓ → 修饰键↑（自包含，
+                        // 不依赖对端修饰键基准——物理 Meta 的转发态在等待期已
+                        // 弹起，裸 V↓ = 幽灵 v；只补 Meta↓ = KDE Meta 单按）。
+                        for (code, state) in held.replay_sequence() {
+                            if code == xcontrol_proto::xkey::KEY_V {
+                                continue; // V↓ 由 held.event 承载（保持原事件语义）
+                            }
                             let _ = sink.inject(&InputEvent::Key { code, state });
                         }
                         let _ = sink.inject(&held.event);
+                        let _ = sink.inject(&InputEvent::Key {
+                            code: xcontrol_proto::xkey::KEY_V,
+                            state: KeyState::Up,
+                        });
                     }
                     crate::paste_intercept::PasteOutcome::Failed { reason } => {
                         tracing::warn!(target: "session::rt", reason, "透明文件粘贴物化失败");

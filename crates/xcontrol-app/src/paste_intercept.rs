@@ -60,10 +60,15 @@ pub struct HeldPaste {
 }
 
 impl HeldPaste {
-    /// 回注的修饰键重放序列（拦截时快照里的粘贴修饰键 → Down 序列）。
-    /// 物化等待的数秒里用户可能已松开物理修饰键——裸 V↓ = 单独 v 字母。
+    /// 回注的完整合成按键序列：修饰键↓ → V↓ → 修饰键↑（完整按压周期）。
+    ///
+    /// 为什么不依赖目标应用的修饰键状态：物化等待的数秒里，用户的物理
+    /// Meta↓/↑ 已被正常转发（目标应用视角修饰键已弹起）；若只回注裸 V↓ =
+    /// 单独 v 字母（幽灵键）。若只回注修饰键↓ + V↓ = 第二次 Meta↓ 会先被
+    /// KDE 当作 Meta 单按（触发启动器——『先按一次 Meta 再 Meta+V』）。
+    /// 完整周期是自包含的合成按键，不依赖对端修饰键基准。
     #[must_use]
-    pub fn modifier_replay(&self) -> Vec<(xcontrol_proto::xkey::XKey, KeyState)> {
+    pub fn replay_sequence(&self) -> Vec<(xcontrol_proto::xkey::XKey, KeyState)> {
         let mut out = Vec::new();
         for (mods_bit, key) in [
             (Mods::LMETA, xcontrol_proto::xkey::KEY_LEFT_META),
@@ -73,6 +78,17 @@ impl HeldPaste {
         ] {
             if self.mods_snapshot.contains(mods_bit) {
                 out.push((key, KeyState::Down));
+            }
+        }
+        out.push((xcontrol_proto::xkey::KEY_V, KeyState::Down));
+        for (mods_bit, key) in [
+            (Mods::LMETA, xcontrol_proto::xkey::KEY_LEFT_META),
+            (Mods::RMETA, xcontrol_proto::xkey::KEY_RIGHT_META),
+            (Mods::LCTRL, xcontrol_proto::xkey::KEY_LEFT_CTRL),
+            (Mods::RCTRL, xcontrol_proto::xkey::KEY_RIGHT_CTRL),
+        ] {
+            if self.mods_snapshot.contains(mods_bit) {
+                out.push((key, KeyState::Up));
             }
         }
         out

@@ -36,6 +36,7 @@ gpui::actions!(
         SwitchRole,
         DisconnectRescan,
         TransferFiles,
+        CancelFileTransfer,
         OpenSettings,
         ToggleAutostart,
         QuitApp

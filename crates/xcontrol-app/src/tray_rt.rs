@@ -206,6 +206,24 @@ fn register_action_handlers(
         });
     });
 
+    // 接收对端文件（FR-7.3）：命令通道 → 会话循环入队拉取（切片 b 管线）。
+    let core_transfer = core.clone();
+    cx.on_action(
+        move |_action: &xcontrol_tray::TransferFiles, _cx: &mut App| {
+            tracing::info!(target: "app::tray", "托盘动作：接收文件（FR-7.3，入队拉取）");
+            core_transfer.send(CoreCommand::TransferFiles);
+        },
+    );
+
+    // 取消文件传输（FR-7.3）：命令通道 → 会话循环请求取消（部分成功语义）。
+    let core_cancel = core.clone();
+    cx.on_action(
+        move |_action: &xcontrol_tray::CancelFileTransfer, _cx: &mut App| {
+            tracing::info!(target: "app::tray", "托盘动作：取消文件传输（FR-7.3）");
+            core_cancel.send(CoreCommand::CancelFileTransfer);
+        },
+    );
+
     // 断开并重扫（从机）：命令通道 → 会话优雅断开 → 发现/重连循环接手。
     let core_rescan = core.clone();
     cx.on_action(
@@ -314,11 +332,14 @@ fn to_tray_snapshot(state: &AppState, autostart: Option<&Arc<dyn Autostart>>) ->
     let hub = crate::file_channel::lock_hub();
     let transfer_cancelable = hub.session().is_some();
     let incoming_files = hub.pending().map(|slot| {
-        let mib = slot.total_bytes as f64 / (1024.0 * 1024.0);
+        let kib = slot.total_bytes as f64 / 1024.0;
+        let mib = kib / 1024.0;
         let size_label = if mib >= 1.0 {
             format!("{mib:.1} MB")
+        } else if kib >= 1.0 {
+            format!("{kib:.1} KB")
         } else {
-            format!("{:.0} KB", slot.total_bytes as f64 / 1024.0)
+            format!("{} B", slot.total_bytes)
         };
         xcontrol_tray::IncomingFilesInfo {
             count: slot.entries.len(),

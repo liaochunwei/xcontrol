@@ -664,7 +664,6 @@ pub fn clipboard_mime_types() -> Result<Vec<String>, ClipboardError> {
 #[cfg(test)]
 #[cfg(feature = "wayland")]
 mod tests {
-    use std::path::PathBuf;
     use std::time::Duration;
 
     use xcontrol_proto::clip::ClipAnnounce;

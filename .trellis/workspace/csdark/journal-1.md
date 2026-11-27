@@ -149,3 +149,21 @@
 **结果**：platform/wayland.rs write/read_file_urls（text/uri-list mime 直通——与 PNG 已实测路径同构，url crate percent-encoding；xtask 白名单过审）；app 检测/挂板 cfg 门控 macos → macos+wayland。linux target 编译级验证 PASS；行为实测待 Wayland 实机。
 
 **经验**：跨平台编译检查的真实边界——clipboard crate 可 --target linux check（纯 Rust 树），app 层 wayland feature 会拉 gpui/zbus/wayland-backend（build script 需系统 wayland 库）——app 级 linux 编译验证只能靠 Linux CI/实机。cfg 门控的语义分层（平台绑定层可 check、组合层靠 CI）是分工关键。
+
+## 2026-11-27 · 双机真实冒烟：三根因连环修复，全链路首次真实闭合
+
+**结果**：分支 df225b7（已推 origin）。Mac↔Linux(KDE Wayland) 双机真实环境，单文件跨设备复制粘贴全链路打通：Finder 复制 → 检测 → 通告 → 对端入槽 → 透明粘贴拦截 → PullReq → 源端服务流 → Chunk 传输 → 挂板——全程同秒完成，日志链完整。
+
+**三根因**（bisect 定位，用户观察『我只复制了文件，为什么有图片传输』直接命中 #2）：
+1. 同线程重入死锁（std Mutex 二次 lock）——入槽 Quota 检查 + 收敛判定
+2. 文件预览图误判——Finder 文件复制带 icns/tiff/PNGf 预览图，clip 泵图片优先路径误判为图片同步（166KB 假图片）
+3. 源端开账缺失——begin_entry 只在接收端误调，源端 can_send() 恒 false，Chunk 零发出
+
+**方法教训**（本轮最值钱的）：
+1. **跨端时序问题单机测试全绿不可信**——三个根因全部只在双机真实环境暴露。bisect 链（五轮，逐面摘除）+ 端到端 info 打点（Chunk/End 两端进出）是定位手段；实测打点要进日志级别（debug 级在 host 默认 info 下不可见，本轮为此空转一轮）。
+2. **环境坑链**：ssh 断开杀测试进程（→ systemd-run 托管）；多实例残留占端口/板状态（→ pkill 全清）；用户复制时处于受控切换边缘（Cmd+C 被转发到 Linux，板未更新——先查"动作是否真的发生"再查代码）。
+3. **用户观察即根因线索**：『为什么有图片传输』一句直接命中误判根因；『像死了一样』指向死锁。信任用户的表面现象描述。
+
+**运维沉淀**：工作机跑法 = `systemd-run --user --unit=<名> ./target/release/xcontrol-app --client <ip>:4243 --code <码> --name <名>`（env 前缀 WAYLAND_DISPLAY/XDG_RUNTIME_DIR；ssh 断开安全）；日志 `journalctl --user -u <名> -f`。
+
+**待办**：用户验收（反向/目录/取消三条路径）→ 合 main；win/x11 平台面（实机时另立）。

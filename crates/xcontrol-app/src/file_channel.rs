@@ -1373,6 +1373,9 @@ fn mount_list(paths: &[PathBuf], why: &str) {
     let now_ms = SystemClock::new().now_ms();
     tracing::info!(target: TARGET, count = paths.len(), why, "拉取会话挂板");
     mount_paths(paths, fingerprint, now_ms);
+    // 挂板完成后消费 pending（托盘「接收文件」条目随之消失——原仅透明粘贴
+    // 路径有 consume，托盘直驱路径漏掉导致菜单残留，2026-11-27 用户反馈）。
+    lock_hub().consume_pending();
 }
 
 /// 平台挂板（docs/05 §0.2「挂板」列；mac = NSURL 实测路径，wayland =

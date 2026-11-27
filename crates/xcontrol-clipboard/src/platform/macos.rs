@@ -99,6 +99,17 @@ use crate::{
 /// 监听环节的份额，可经 [`ClipboardWatcher::start`] 配置）。
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// 进程级 NSPasteboard 访问互斥（2026-11-27 双机实测教训）：AppKit 的
+/// `NSPasteboard` **非线程安全**——本 crate 的读路径分布在多个后台线程
+/// （clip 泵的 arboard 读取 / file 检测器的 read_file_urls / 监听线程的
+/// changeCount 采样），Finder 大混合板（文件 + PNG 预览 + 20 余种格式）上
+/// 并发读取触发 AppKit 内部死锁（实测：双端 9s 心跳互死，进程存活但全线程
+/// park）。全部 NSPasteboard 访问点持此锁串行化——临界区为毫秒级读写。
+pub(crate) fn pasteboard_gate() -> &'static std::sync::Mutex<()> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 // ============================================================
 // changeCount 采样（docs/04 §4 监听原语）
 // ============================================================
@@ -116,6 +127,9 @@ pub fn ns_change_count() -> u64 {
     // 线程约束：NSPasteboard 非 MainThreadOnly（extern_class! 未标注），
     // 本函数可在任意线程调用（轮询线程，docs/04 §4）。
     // method_family = none（绑定声明），Retained 所有权语义正确。
+    let _gate = pasteboard_gate()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let count = NSPasteboard::generalPasteboard().changeCount();
     // NSInteger = isize；changeCount 恒 >= 0（内部版本号语义），负值只可能是
     // 平台异常——兜底 0 保持基准不动。
@@ -372,6 +386,9 @@ impl MacClipboard {
                 reason: "空清单（无文件引用可挂板）".into(),
             });
         }
+        let _gate = pasteboard_gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // 规范形（写入基线指纹输入）：路径 lossy 文本 + 目录位，len 前缀帧式
         // 布局防拼接碰撞（同 core 清单指纹惯例）。
         let mut canonical: Vec<(String, bool)> = Vec::with_capacity(paths.len());
@@ -433,6 +450,9 @@ impl MacClipboard {
         &mut self,
         max_entries: usize,
     ) -> Result<Option<Vec<PathBuf>>, ClipboardError> {
+        let _gate = pasteboard_gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         autoreleasepool(|_| {
             let pasteboard = NSPasteboard::generalPasteboard();
             let classes = [NSURL::class()];

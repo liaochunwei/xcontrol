@@ -334,10 +334,12 @@ impl FileHub {
             transfer_id,
             LOCAL_ORIGIN_ID,
             LOCAL_ORIGIN_SEQ,
-            entries,
+            entries.clone(),
             copied_at_ms,
         ) {
             Ok(Some(announce)) => {
+                tracing::info!(target: TARGET, transfer_id, entries = entries.len(),
+                    "本机清单已发布（待泵推送）");
                 self.outbound_paths = paths.clone();
                 self.outbound_child_paths.clear();
                 self.rel_paths = paths
@@ -710,6 +712,8 @@ async fn run_file_pump(
                     if !already_sent {
                         serve.register(&announce);
                         lock_hub().mark_outbound_sent(fingerprint);
+                        tracing::info!(target: TARGET, transfer_id = announce.transfer_id,
+                            entries = announce.entries.len(), "FileRefAnnounce 出站");
                         out.push(FileMsg::RefAnnounce(announce));
                     }
                 }
@@ -889,13 +893,17 @@ async fn run_file_pump(
                 }
 
                 // 会话收敛判定（切片 d R1 目录面：事件驱动收敛替代计数完成）——
-                // 队列/请求/接收/服务/等待全空 = 全部条目处理完毕 → 收尾挂板
-                if lock_hub().session().is_some()
-                    && !lock_hub().pull_pending()
-                    && rx.active().is_none()
-                    && serving.is_none()
-                    && awaiting_expand.is_none()
-                {
+                // 队列/请求/接收/服务/等待全空 = 全部条目处理完毕 → 收尾挂板。
+                // 【同线程重入修复】单次持锁完成全部判定（std Mutex 不可重入）。
+                let converged = {
+                    let hub = lock_hub();
+                    hub.session().is_some()
+                        && !hub.pull_pending()
+                        && rx.active().is_none()
+                        && serving.is_none()
+                        && awaiting_expand.is_none()
+                };
+                if converged {
                     let staged = lock_hub().finalize_session();
                     if staged.is_empty() {
                         tracing::warn!(target: TARGET,
@@ -938,14 +946,22 @@ fn on_file_msg(
 ) -> bool {
     match msg {
         // 元数据面：入 pending 槽（代次失效/去重在 FileRefRx 内承接，docs/04 §8.2）。
-        FileMsg::RefAnnounce(announce) => match ref_rx.on_announce(announce) {
+        FileMsg::RefAnnounce(announce) => match ref_rx.on_announce(announce.clone()) {
             FileRefVerdict::Applied { .. } => {
-                // 配置面（切片 d R4）：超协商上限 → Quota 退回，pending 不入
-                let exceed = lock_hub().limits().is_some_and(|limits| {
-                    lock_hub()
-                        .pending()
-                        .is_some_and(|slot| slot.total_bytes > limits.max_bytes)
-                });
+                tracing::info!(target: TARGET, transfer_id = announce.transfer_id,
+                    entries = announce.entries.len(), "对端清单入 pending 槽");
+                // 配置面（切片 d R4）：超协商上限 → Quota 退回，pending 不入。
+                // 【2026-11-27 双机冒烟根因修复】原实现两次独立 lock_hub()——
+                // 外层 guard 在 is_some_and 闭包内存活、内层再 lock 同线程 =
+                // std Mutex 不可重入 → **同线程死锁**（Linux 端入槽即沉默死，
+                // 双端心跳互断）。合并为单次持锁。
+                let exceed = {
+                    let hub = lock_hub();
+                    hub.limits().is_some_and(|limits| {
+                        hub.pending()
+                            .is_some_and(|slot| slot.total_bytes > limits.max_bytes)
+                    })
+                };
                 if exceed {
                     let transfer_id = ref_rx.slot().map(|slot| slot.transfer_id);
                     lock_hub().consume_pending();
@@ -1387,9 +1403,14 @@ impl LocalFileRefDetector {
             return;
         }
         self.seen = self.clipboard.change_count();
+        tracing::info!(target: TARGET, "检测器：剪贴板变化（change_count={}）", self.seen);
         let Ok(Some(paths)) = self.clipboard.read_file_urls(FileRefAnnounce::MAX_ENTRIES) else {
-            return; // 无文件引用（文本/图片剪贴板）：文件域静默
+            tracing::debug!(target: TARGET, "检测器：非文件引用（文件域静默）");
+            return;
         };
+        tracing::info!(target: TARGET, count = paths.len(), "检测器：文件引用命中");
+        // 【bisect-3 结论：不发布就不断连 → 根因在 announce 出站/入槽一对动作；
+        // 检测器读面本身无害。恢复发布（bisect-4 两端托盘投影仍摘）。】
         // stat → 清单条目（不存在/读取失败的条目剔除——发送面只服务可得文件）
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut valid: Vec<PathBuf> = Vec::new();

@@ -155,6 +155,8 @@ pub struct TrayState {
     pub host_candidates: Vec<HostCandidateInfo>,
     /// 对端剪贴板文件清单（FR-7.3；`None` = 无货——菜单不渲染该条）。
     pub incoming_files: Option<IncomingFilesInfo>,
+    /// 拉取进行中（FR-7.3 切片 d——「取消文件传输」条目的出现条件）。
+    pub transfer_cancelable: bool,
 }
 
 /// 托盘投影器（无状态；`project` 为纯函数）。
@@ -237,6 +239,7 @@ impl TrayAdapter {
             slaves: snapshot.slaves.clone(),
             host_candidates: snapshot.host_candidates.clone(),
             incoming_files: snapshot.incoming_files.clone(),
+            transfer_cancelable: snapshot.transfer_cancelable,
         }
     }
 }

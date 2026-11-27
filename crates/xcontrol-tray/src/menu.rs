@@ -237,6 +237,7 @@ mod tests {
         };
         TrayState {
             incoming_files: None,
+            transfer_cancelable: false,
             role,
             status,
             icon_kind: if status == TrayStatus::Error {

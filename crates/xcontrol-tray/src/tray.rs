@@ -165,6 +165,9 @@ fn menu_equivalent(previous: &TrayState, current: &TrayState) -> bool {
         && previous.paused == current.paused
         && previous.menu_checkstates == current.menu_checkstates
         && previous.slaves == current.slaves
+        && previous.host_candidates == current.host_candidates
+        && previous.incoming_files == current.incoming_files
+        && previous.transfer_cancelable == current.transfer_cancelable
 }
 
 #[cfg(test)]
@@ -214,6 +217,7 @@ mod tests {
             slaves,
             host_candidates: Vec::new(),
             incoming_files: None,
+            transfer_cancelable: false,
         }
     }
 

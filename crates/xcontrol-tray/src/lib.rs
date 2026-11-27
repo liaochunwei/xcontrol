@@ -63,8 +63,8 @@ pub use menu::{
     SwitchToSlave, ToggleAutostart, TogglePause, TransferFiles,
 };
 pub use project::{
-    HostCandidateInfo, IconKind, IncomingFilesInfo, MenuCheckstates, SlaveInfo, TrayAdapter,
-    TrayRole, TraySnapshot, TrayState, TrayStatus, TransferProgressInfo,
+    HostCandidateInfo, IconKind, IncomingFilesInfo, MenuCheckstates, SlaveInfo,
+    TransferProgressInfo, TrayAdapter, TrayRole, TraySnapshot, TrayState, TrayStatus,
 };
 #[cfg(feature = "gpui")]
 pub use tray::{SnapshotProvider, TrayController, TrayUpdate};

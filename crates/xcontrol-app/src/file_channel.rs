@@ -1340,7 +1340,9 @@ fn record_rx_action(
             out.push(FileMsg::Ack(FileAck { seq }));
             false
         }
-        FileRxAction::WriteChunk { transfer_id, data, .. } => {
+        FileRxAction::WriteChunk {
+            transfer_id, data, ..
+        } => {
             // 进度记账（FR-7.3 进度条投影源；失败不回退——保守单调）。
             lock_hub().record_chunk_bytes(transfer_id, data.len());
             match staging.as_mut() {

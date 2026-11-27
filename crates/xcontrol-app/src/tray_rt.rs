@@ -330,11 +330,9 @@ fn to_tray_snapshot(state: &AppState, autostart: Option<&Arc<dyn Autostart>>) ->
     // 对端文件清单（FR-7.3）投影直读 hub（进程级单例——托盘 200ms 刷新即反映）。
     let hub = crate::file_channel::lock_hub();
     let transfer_cancelable = hub.session().is_some();
-    let incoming_files = hub.pending().map(|slot| {
-        xcontrol_tray::IncomingFilesInfo {
-            count: slot.entries.len(),
-            size_label: humanize_bytes(slot.total_bytes),
-        }
+    let incoming_files = hub.pending().map(|slot| xcontrol_tray::IncomingFilesInfo {
+        count: slot.entries.len(),
+        size_label: humanize_bytes(slot.total_bytes),
     });
     // 拉取进度（FR-7.3 进度条投影）：会话记账直读；总字节未知时按条目
     // 完成数折算百分比（Expand/目录场景清单聚合缺失的兜底）。

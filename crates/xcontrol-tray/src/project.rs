@@ -104,6 +104,17 @@ pub struct IncomingFilesInfo {
     pub size_label: String,
 }
 
+/// 拉取进度（FR-7.3：托盘进度条投影；`None` = 无进行中传输）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferProgressInfo {
+    /// 百分比（0–100；总字节未知时按条目完成数折算）。
+    pub percent: u8,
+    /// 已接收体积文案（humanize 后；投影层格式化，与 `size_label` 同口径）。
+    pub received_label: String,
+    /// 总体积文案。
+    pub total_label: String,
+}
+
 /// 投影输入快照（app 层从 `AppState` + 自启实测状态转换；crate 内轻量类型）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TraySnapshot {
@@ -123,6 +134,8 @@ pub struct TraySnapshot {
     pub incoming_files: Option<IncomingFilesInfo>,
     /// 拉取进行中（FR-7.3 切片 d——「取消文件传输」条目的出现条件）。
     pub transfer_cancelable: bool,
+    /// 拉取进度（FR-7.3 进度条投影；`None` = 空闲——菜单不渲染进度行）。
+    pub transfer_progress: Option<TransferProgressInfo>,
     /// 平均往返延迟（ms；`None` = 无指标——tooltip 省略延迟段）。
     pub latency_ms: Option<u32>,
     /// 开机自启当前生效状态（`Autostart::is_enabled`，菜单勾选态）。
@@ -157,6 +170,8 @@ pub struct TrayState {
     pub incoming_files: Option<IncomingFilesInfo>,
     /// 拉取进行中（FR-7.3 切片 d——「取消文件传输」条目的出现条件）。
     pub transfer_cancelable: bool,
+    /// 拉取进度（FR-7.3 进度条投影；`None` = 空闲——菜单不渲染进度行）。
+    pub transfer_progress: Option<TransferProgressInfo>,
 }
 
 /// 托盘投影器（无状态；`project` 为纯函数）。
@@ -240,6 +255,7 @@ impl TrayAdapter {
             host_candidates: snapshot.host_candidates.clone(),
             incoming_files: snapshot.incoming_files.clone(),
             transfer_cancelable: snapshot.transfer_cancelable,
+            transfer_progress: snapshot.transfer_progress.clone(),
         }
     }
 }
@@ -264,6 +280,7 @@ mod tests {
             host_candidates: Vec::new(),
             incoming_files: None,
             transfer_cancelable: false,
+            transfer_progress: None,
             latency_ms,
             autostart_enabled: false,
         }

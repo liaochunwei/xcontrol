@@ -64,7 +64,7 @@ pub use menu::{
 };
 pub use project::{
     HostCandidateInfo, IconKind, IncomingFilesInfo, MenuCheckstates, SlaveInfo, TrayAdapter,
-    TrayRole, TraySnapshot, TrayState, TrayStatus,
+    TrayRole, TraySnapshot, TrayState, TrayStatus, TransferProgressInfo,
 };
 #[cfg(feature = "gpui")]
 pub use tray::{SnapshotProvider, TrayController, TrayUpdate};

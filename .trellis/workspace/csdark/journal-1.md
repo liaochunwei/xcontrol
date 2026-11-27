@@ -167,3 +167,15 @@
 **运维沉淀**：工作机跑法 = `systemd-run --user --unit=<名> ./target/release/xcontrol-app --client <ip>:4243 --code <码> --name <名>`（env 前缀 WAYLAND_DISPLAY/XDG_RUNTIME_DIR；ssh 断开安全）；日志 `journalctl --user -u <名> -f`。
 
 **待办**：用户验收（反向/目录/取消三条路径）→ 合 main；win/x11 平台面（实机时另立）。
+
+## 2026-11-28 FR-7.3 收尾三件套（PR #2/#3，用户实测收口）
+
+**用户实测通过后合入 main（流程：PR + CI 绿 + 用户确认，不再直推）**：PR #2（wayland tests CI 第三轮修复）CI 四项全绿合并；PR #3（进度条 + 最后复制赢）同样全绿合并。
+
+**根因级发现——origin_seq 常量**：发布侧 `LOCAL_ORIGIN_SEQ` 恒 1 → 接收端 `(origin_id, origin_seq)` 去重把同机第二次起的复制判 Duplicate **静默丢弃**——"复制多次待接收应是最后一次"从未生效且无任何报错。修复 = seq 进程内单调递增；单测对拍接收端 Applied 语义。教训已回写 protocol-rules.md（去重键的一半不能是常量）+ docs/04 §8.2 发送侧契约。
+
+**进度条**：PullSession 字节记账（WriteChunk 累加）→ TraySnapshot.TransferProgressInfo → 菜单不可点进度行（接收中 N%（已收/总量））；50MB 真机实测进度可见、完成清菜单（consume_pending 此前已合）。
+
+**流程教训**：本地 stable fmt 与 CI nightly fmt 口径差（rustfmt.toml 不稳定选项 imports_granularity/group_imports）——本地验证须 `cargo +nightly fmt`，本轮为此空转一轮 CI。
+
+**遗留（另立任务）**：macos feature 下 file_channel_isolation 挂板路径卡死（NSPasteboard 测试上下文疑似主线程派发；基线同样复现、无 macos feature 3/3 过、CI ubuntu/windows 不受影响）；win/x11 平台面待实机。

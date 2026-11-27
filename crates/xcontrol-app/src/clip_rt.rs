@@ -59,7 +59,7 @@ use xcontrol_core::clip_plan::plan_chunks;
 use xcontrol_core::clip_rx::{ClipRx, ClipRxAction, ClipRxConfig};
 use xcontrol_core::clip_tx::ClipTx;
 use xcontrol_proto::clip::{ClipFormat, ClipMsg};
-use xcontrol_proto::{ClipAck, ClipAnnounce, ClipChunk, ClipEnd};
+use xcontrol_proto::{ClipAck, ClipAnnounce, ClipChunk, ClipEnd, FileRefAnnounce};
 
 /// 剪贴板运行时 logging target（logging-targets.md 审计表新增行）。
 pub(crate) const TARGET: &str = "session::clip";
@@ -573,6 +573,23 @@ impl ClipboardRuntime {
         // 读取（11-20 扩展：文本优先 → 图片次之——mac 截图剪贴板无 text，
         // arboard get_text 对纯图片返回 NoContent；FR-4.1/4.2/4.5）。超限/空/
         // 失败都是信号或常态，不外发不报错。
+        // 【2026-11-27 双机实测修复】文件引用板优先探测：Finder 复制文件时板上
+        // 带 public.file-url + icns/tiff/PNGf **文件预览图**——图片优先路径会把
+        // 预览图误判为图片剪贴板内容同步出去（166KB PNG，与文件域通告并发出站）。
+        // 板上有 file-url = 文件复制，本板归文件域接管，clip 泵静默跳过。
+        // 【2026-11-27 双机实测修复】文件引用板优先探测：Finder 复制文件时板上
+        // 带 public.file-url + icns/tiff/PNGf **文件预览图**——图片优先路径会把
+        // 预览图误判为图片剪贴板内容同步出去（166KB PNG，与文件域通告并发出站）。
+        // 板上有 file-url = 文件复制，本板归文件域接管，clip 泵静默跳过。
+        #[cfg(any(feature = "macos", feature = "wayland"))]
+        if let Some(inner_clip) = self.backend.as_mut().and_then(|b| b.0.inner.as_mut())
+            && inner_clip
+                .read_file_urls(FileRefAnnounce::MAX_ENTRIES)
+                .is_ok_and(|r| r.is_some())
+        {
+            tracing::debug!(target: TARGET, "板上有文件引用（文件域接管）：clip 泵跳过");
+            return;
+        }
         // 11-20 实测顺序修正：**图片优先**。macOS 剪贴板对纯图片（截图）会给
         // `get_text` 返回二进制乱码"文本"（TIFF 数据强转）——文本优先把它当
         // 文本发出（非 UTF-8/超 Noise 65519B 加密上限）。图片读取对纯文本剪贴

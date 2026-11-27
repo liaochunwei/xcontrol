@@ -136,6 +136,7 @@ impl<S: InputSink> InputSink for PasteInterceptSink<S> {
             {
                 // 单飞登记（worker 完成后清）；整单入拉取队列（复用切片 b 管线）。
                 self.materializing.store(true, Ordering::Release);
+                tracing::info!(target: "session::file", "【透明粘贴】拦截命中：挂起粘贴键并触发整单拉取");
                 lock_hub().request_pull_all_pending();
                 let _ = self.job_tx.send(HeldPaste {
                     event: event.clone(),

@@ -747,6 +747,7 @@ async fn run_file_pump(
                         .filter(|_| hub.file_capable() && idle)
                 };
                 if let Some((transfer_id, entry)) = pull {
+                    tracing::info!(target: TARGET, transfer_id, entry, "PullReq 出站（待发拉取消费）");
                     let size = lock_hub()
                         .pending()
                         .and_then(|slot| slot.entries.get(entry as usize))
@@ -772,8 +773,6 @@ async fn run_file_pump(
                                 lock_hub().pending().map_or(0, |slot| slot.entries.len());
                             lock_hub().ensure_session(transfer_id, total);
                             rx.begin_pull(transfer_id, entry, size);
-                            // 发送侧条目流同拍开账（本端作为源端的信用窗口记账）
-                            let _ = tx.begin_entry(transfer_id, entry, size);
                             // 暂存文件建立（树形 staging/{tid}/{rel}；名字经 proto
                             // 纯名校验——路径拼接无穿越分量）
                             let rel = lock_hub().rel_path_at(entry as usize);
@@ -850,6 +849,8 @@ async fn run_file_pump(
                             }
                             let transfer_id = stream.transfer_id;
                             let entry = stream.entry;
+                            tracing::info!(target: TARGET, transfer_id, seq,
+                                len = data.len(), "【源端】FileChunk 出站");
                             out.push(FileMsg::Chunk(FileChunk {
                                 transfer_id,
                                 seq,
@@ -988,67 +989,87 @@ fn on_file_msg(
         },
         // 拉流面（源端角色）：PullReq 校验 → 服务流建立（真实文件读取，b-app
         // 接线）。路径在本端 hub（docs/07 §9：路径不出 wire、源端私有映射）。
-        FileMsg::PullReq(req) => match serve.on_pull(&req) {
-            ServeVerdict::Grant {
-                transfer_id,
-                entry,
-                offset,
-                remaining,
-            } => {
-                // 目录条目（prd R1）：有界枚举 → FileExpand（无字节流；子条目
-                // 入接收端下标空间后由其续拉，子目录经再展开递归）
-                if serve.entry_is_dir(transfer_id, entry) == Some(true) {
-                    let base = serve.index_space_len(transfer_id);
-                    let Some(root) = lock_hub().path_at(entry as usize) else {
-                        out.push(FileMsg::Error(FileError {
+        FileMsg::PullReq(req) => {
+            tracing::info!(target: TARGET, transfer_id = req.transfer_id, entry = req.entry,
+                offset = req.offset, "【源端】PullReq 到达");
+            match serve.on_pull(&req) {
+                ServeVerdict::Grant {
+                    transfer_id,
+                    entry,
+                    offset,
+                    remaining,
+                } => {
+                    // 目录条目（prd R1）：有界枚举 → FileExpand（无字节流；子条目
+                    // 入接收端下标空间后由其续拉，子目录经再展开递归）
+                    if serve.entry_is_dir(transfer_id, entry) == Some(true) {
+                        let base = serve.index_space_len(transfer_id);
+                        let Some(root) = lock_hub().path_at(entry as usize) else {
+                            out.push(FileMsg::Error(FileError {
+                                transfer_id,
+                                entry: Some(entry),
+                                code: FileErrCode::NOT_FOUND,
+                            }));
+                            serve.release(transfer_id);
+                            return false;
+                        };
+                        let (entries, child_paths) =
+                            enumerate_dir(&root, 1, DIR_MAX_ENTRIES_PER_BATCH);
+                        let expand = xcontrol_proto::file::FileExpand {
                             transfer_id,
-                            entry: Some(entry),
-                            code: FileErrCode::NOT_FOUND,
-                        }));
+                            parent: entry,
+                            base,
+                            entries,
+                        };
+                        if let Err(reason) = serve.register_expand(&expand) {
+                            tracing::warn!(target: TARGET, reason, "源端 Expand 注册失败（断开）");
+                            return true;
+                        }
+                        lock_hub().push_child_paths(base as usize, child_paths);
+                        out.push(FileMsg::Expand(expand));
                         serve.release(transfer_id);
                         return false;
-                    };
-                    let (entries, child_paths) = enumerate_dir(&root, 1, DIR_MAX_ENTRIES_PER_BATCH);
-                    let expand = xcontrol_proto::file::FileExpand {
-                        transfer_id,
-                        parent: entry,
-                        base,
-                        entries,
-                    };
-                    if let Err(reason) = serve.register_expand(&expand) {
-                        tracing::warn!(target: TARGET, reason, "源端 Expand 注册失败（断开）");
-                        return true;
                     }
-                    lock_hub().push_child_paths(base as usize, child_paths);
-                    out.push(FileMsg::Expand(expand));
-                    serve.release(transfer_id);
-                    return false;
-                }
-                match open_serving(transfer_id, entry, offset, remaining) {
-                    Ok(stream) => {
-                        *serving = Some(stream);
-                        false
-                    }
-                    Err(code) => {
-                        // 路径查无/打开失败：条目级软错误（可重试，不断连）
-                        out.push(FileMsg::Error(FileError {
-                            transfer_id,
-                            entry: Some(entry),
-                            code,
-                        }));
-                        serve.release(transfer_id);
-                        false
+                    match open_serving(transfer_id, entry, offset, remaining) {
+                        Ok(stream) => {
+                            // 源端条目流开账（切片 b-core 遗漏——原 begin_entry
+                            // 只在接收端发 PullReq 拍误调，源端从未开账 →
+                            // FileTx.stream()=None → can_send() 恒 false →
+                            // 分块泵一拍不跑 → Chunk 永不发出（2026-11-27 双机
+                            // 实测根因 #3）。
+                            if let Err(error) = tx.begin_entry(transfer_id, entry, remaining) {
+                                tracing::warn!(target: TARGET, %error,
+                                    "源端条目流开账失败（重置后继续）");
+                                tx.reset();
+                                let _ = tx.begin_entry(transfer_id, entry, remaining);
+                            }
+                            tracing::info!(target: TARGET, transfer_id, entry,
+                                remaining, "【源端】服务流建立（开始分块发送）");
+                            *serving = Some(stream);
+                            false
+                        }
+                        Err(code) => {
+                            // 路径查无/打开失败：条目级软错误（可重试，不断连）
+                            out.push(FileMsg::Error(FileError {
+                                transfer_id,
+                                entry: Some(entry),
+                                code,
+                            }));
+                            serve.release(transfer_id);
+                            false
+                        }
                     }
                 }
-            }
-            ServeVerdict::Violation { reason } => {
-                tracing::warn!(target: TARGET, reason,
+                ServeVerdict::Violation { reason } => {
+                    tracing::warn!(target: TARGET, reason,
                     "PullReq 违规（断开文件通道，docs/07 §9 索引寻址红线）");
-                true
+                    true
+                }
             }
-        },
+        }
         // 拉流面（接收端角色）：组装/校验/软失败。
         FileMsg::Chunk(chunk) => {
+            tracing::info!(target: TARGET, transfer_id = chunk.transfer_id, seq = chunk.seq,
+                len = chunk.data.len(), "【接收端】FileChunk 到达");
             let mut violated = false;
             for action in rx.on_chunk(&chunk) {
                 violated |= record_rx_action(action, out, serve, tx, staging);
@@ -1056,6 +1077,8 @@ fn on_file_msg(
             violated
         }
         FileMsg::End(end) => {
+            tracing::info!(target: TARGET, transfer_id = end.transfer_id, entry = end.entry,
+                "【接收端】FileEnd 到达");
             let mut violated = false;
             for action in rx.on_end(&end) {
                 violated |= record_rx_action(action, out, serve, tx, staging);

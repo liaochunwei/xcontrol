@@ -984,6 +984,16 @@ fn start_platform_watcher_from_shared(
 }
 
 #[cfg(feature = "x11")]
+fn start_platform_watcher_from_shared(
+    shared: &std::sync::Arc<std::sync::Mutex<xcontrol_clipboard::PlatformClipboard>>,
+) -> Box<dyn ClipWatcherDrain> {
+    let mut guard = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    return start_platform_watcher(&mut guard);
+}
+
+#[cfg(feature = "x11")]
 fn start_platform_watcher(
     backend: &mut xcontrol_clipboard::PlatformClipboard,
 ) -> Box<dyn ClipWatcherDrain> {
@@ -996,6 +1006,16 @@ fn start_platform_watcher(
             Box::new(NullWatcher)
         }
     }
+}
+
+#[cfg(feature = "wayland")]
+fn start_platform_watcher_from_shared(
+    shared: &std::sync::Arc<std::sync::Mutex<xcontrol_clipboard::PlatformClipboard>>,
+) -> Box<dyn ClipWatcherDrain> {
+    let mut guard = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    return start_platform_watcher(&mut guard);
 }
 
 #[cfg(feature = "wayland")]

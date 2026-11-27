@@ -2281,6 +2281,11 @@ async fn drive_session(
                 match outcome {
                     crate::paste_intercept::PasteOutcome::Resume(held) => {
                         tracing::info!(target: "session::rt", "物化完成：回注挂起的粘贴（文件已挂本机剪贴板）");
+                        // 组合重放：修饰键↓（拦截时快照）→ V↓——物化等待的数秒里
+                        // 用户可能已松开物理修饰键，裸 V↓ = 单独 v 字母（幽灵键）。
+                        for (code, state) in held.modifier_replay() {
+                            let _ = sink.inject(&InputEvent::Key { code, state });
+                        }
                         let _ = sink.inject(&held.event);
                     }
                     crate::paste_intercept::PasteOutcome::Failed { reason } => {

@@ -54,6 +54,29 @@ pub const PASTE_MATERIALIZATION_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct HeldPaste {
     /// 挂起的 V↓ 事件（原样回注）。
     pub event: InputEvent,
+    /// 拦截时的粘贴修饰键快照（回注重放——物化等待的数秒里用户可能已松开
+    /// 物理 Meta/Ctrl，裸 V↓ = 单独 v 字母的幽灵键）。
+    pub mods_snapshot: Mods,
+}
+
+impl HeldPaste {
+    /// 回注的修饰键重放序列（拦截时快照里的粘贴修饰键 → Down 序列）。
+    /// 物化等待的数秒里用户可能已松开物理修饰键——裸 V↓ = 单独 v 字母。
+    #[must_use]
+    pub fn modifier_replay(&self) -> Vec<(xcontrol_proto::xkey::XKey, KeyState)> {
+        let mut out = Vec::new();
+        for (mods_bit, key) in [
+            (Mods::LMETA, xcontrol_proto::xkey::KEY_LEFT_META),
+            (Mods::RMETA, xcontrol_proto::xkey::KEY_RIGHT_META),
+            (Mods::LCTRL, xcontrol_proto::xkey::KEY_LEFT_CTRL),
+            (Mods::RCTRL, xcontrol_proto::xkey::KEY_RIGHT_CTRL),
+        ] {
+            if self.mods_snapshot.contains(mods_bit) {
+                out.push((key, KeyState::Down));
+            }
+        }
+        out
+    }
 }
 
 /// 物化结果（worker → 会话循环；Resume = 回注挂起键，Failed = 丢弃 + 提示）。
@@ -140,6 +163,7 @@ impl<S: InputSink> InputSink for PasteInterceptSink<S> {
                 lock_hub().request_pull_all_pending();
                 let _ = self.job_tx.send(HeldPaste {
                     event: event.clone(),
+                    mods_snapshot: self.tracker.pressed(),
                 });
                 return Ok(()); // 挂起：不注入（物化完成后由会话循环回注）
             }

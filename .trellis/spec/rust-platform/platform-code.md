@@ -107,3 +107,10 @@
 4. **ssh 长命令静默期会被断开**（构建 `| tail -5` 期间无流量，连接被掐 exit 255）——长构建放远端 `nohup ... > log 2>&1 &` 后台 + 轮询日志；ssh 加 `-o ServerAliveInterval=15`。
 
 5. **feature 按会话类型选**：Linux 部署命令的 feature 跟随桌面会话（`XDG_SESSION_TYPE`）——Wayland 会话用 `--features wayland`（wl-clipboard-rs 原生，image/png 可读），Xorg 才用 x11。x11 变体在 KDE Wayland 下走 Xwayland 桥：文本通、**图片 MIME 同步缺口**（实测症状：文字正常截图发不回 + 启动缺 `连接基线：既有剪贴板已登记` 行）。剪贴板 crate x11/wayland 互斥门禁意味着选错即静默降级，判定读图能力看基线行而非进程存活（docs/10 §3.3.1）。
+
+## 进程锁嵌套红线（2026-11-28 挂板自死锁实测，FR-7.3）
+
+1. **持锁函数体内禁止调用会拿同一把锁的函数**——std Mutex 非重入，同线程二次 lock = 无条件自死锁（CPU 0%、全线程 park、无任何报错）。实测案例：`write_file_urls` 持 `pasteboard_gate` 落板后调 `ns_change_count`（也拿 gate）→ Mac 接收方挂板必死，潜伏两天才暴露（测试都是 Mac 当发送方）。修法：抽 `_locked` 后缀变体（调用方保证已持锁），公共函数保持拿锁。
+2. **给既有函数加锁时必须审计其调用闭包内的全部取锁点**（d7c1d42 教训：gate 加锁只看了函数体本身，漏了内部调用的 ns_change_count）。
+3. **死锁定位手段**：`sample <pid> 5` 全线程采样，grep `__psynch_mutexwait`——栈顶锁等待 + 调用链即完整证据，比日志推测快一个数量级。
+4. **集成测试禁接驳真实系统资源**（剪贴板/挂板）：共享实例懒初始化会让测试读到宿主机真实剪贴板（残留文件引用污染 transfer_id/暂存树，并行时序放大）。测试隔离开关挂 hub（不要用 env var——2024 edition set_var 是 unsafe 且进程全局有竞态）；测试的循环退出条件必须用 tid 域计数，不用跨会话保留的全局态（mounted_fp）。

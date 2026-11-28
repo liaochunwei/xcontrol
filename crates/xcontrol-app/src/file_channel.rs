@@ -126,6 +126,9 @@ pub struct FileHub {
     confirm_armed: bool,
     /// 配置上限（session_rt 装配点写入；None = 协议默认）。
     limits: Option<Limits>,
+    /// 文件检测器隔离开关（测试专用；生产恒 false）。置位 = 泵不接驳共享
+    /// 剪贴板（防集成测试读宿主机真实剪贴板——见 run_file_pump 检测器注释）。
+    file_detector_disabled: bool,
     /// 挂板回环防线（docs/04 §8.2 写入自标记的文件域等价）：物化挂板后的清单
     /// 指纹 + 时刻——本机检测在 2s 窗口内命中同指纹不重新通告（防 B 物化 →
     /// B 检测 → 回传 A 的回环）。跨会话保留（防线不随会话失效）。
@@ -486,6 +489,18 @@ impl FileHub {
         self.limits = Some(limits);
     }
 
+    /// 文件检测器隔离开关（集成测试置位；`reset_for_new_session` 不重置——
+    /// 测试在 reset 后置位，泵 spawn 前生效）。
+    pub fn set_file_detector_disabled(&mut self) {
+        self.file_detector_disabled = true;
+    }
+
+    /// 检测器隔离开关读取（泵 spawn 点）。
+    #[must_use]
+    pub fn file_detector_disabled(&self) -> bool {
+        self.file_detector_disabled
+    }
+
     /// 配置上限（None = 协议默认，调用方兜底）。
     #[must_use]
     pub fn limits(&self) -> Option<Limits> {
@@ -670,8 +685,17 @@ async fn run_file_pump(
     let mut awaiting_expand: Option<(u32, tokio::time::Instant)> = None;
     // 本机文件引用检测器（b-平台；mac/wayland 面实装——wayland 为 mime 直通
     // 同构路径；x11/win 按 docs/05 §0.2 随平台实机实装补齐）。
+    // 测试隔离（[`FileHub::set_file_detector_disabled`]）：hub 开关置位时
+    // 不接驳共享剪贴板——集成测试进程的检测器会读**真实系统剪贴板**（共享
+    // 实例懒初始化），把宿主机此刻的文件引用卷进测试（实测：宿主剪贴板残留
+    // 的 chrome_crashpad_handler 被 announce/拉取，transfer_id 与暂存树被
+    // 污染，并行时序放大为断言失败）。
     #[cfg(any(feature = "macos", feature = "wayland"))]
-    let mut detector = LocalFileRefDetector::new();
+    let mut detector = if lock_hub().file_detector_disabled() {
+        None
+    } else {
+        LocalFileRefDetector::new()
+    };
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut wire_buf = Vec::new();

@@ -179,3 +179,13 @@
 **流程教训**：本地 stable fmt 与 CI nightly fmt 口径差（rustfmt.toml 不稳定选项 imports_granularity/group_imports）——本地验证须 `cargo +nightly fmt`，本轮为此空转一轮 CI。
 
 **遗留（另立任务）**：macos feature 下 file_channel_isolation 挂板路径卡死（NSPasteboard 测试上下文疑似主线程派发；基线同样复现、无 macos feature 3/3 过、CI ubuntu/windows 不受影响）；win/x11 平台面待实机。
+
+## 2026-11-28（晚）挂板自死锁根除 + 集成测试双杀（PR #5）
+
+**遗留问题清剿**：macos 集成测试卡死（挂板路径）——`sample` 全线程采样直接定位 `write_file_urls` 持 `pasteboard_gate` 后调 `ns_change_count` 二次拿锁自死锁。**这是真机级 bug**：Mac 作为接收方挂板必死（Linux→Mac 方向在跑构建一直是坏的），潜伏两天只因测试都 Mac 当发送方。修复 = `ns_change_count_locked` 变体；gate 持有点全审计。
+
+死锁解除后集成测试暴露并行污染两连：①测试泵检测器读宿主机真实剪贴板（chrome_crashpad_handler 被卷进暂存树——暂存树残留文件就是证据）；②directory 测试退出条件用 mounted_fp（跨会话保留）被前序测试残留误触发。修：hub `file_detector_disabled` 开关 + tid 域 verified 退出条件。结果：macos 集成测试卡死→并行 4 连全绿（2s 级）。
+
+**方法教训**：集成测试"卡死 vs 失败"是两类问题，卡死先采样别猜；失败先看暂存残留（chrome 文件 = 真实剪贴板污染的直接物证）。TMPDIR 排查用 `python3 -c tempfile.gettempdir()`——macOS 是 /var/folders 不是 /tmp（空目录假象浪费一轮）。
+
+**遗留**：win/x11 平台面——Windows 无实机做不了；X11 需工作机切 Xorg 会话评估（KDE 支持）。DMG 已重打（19:03，含修复）。

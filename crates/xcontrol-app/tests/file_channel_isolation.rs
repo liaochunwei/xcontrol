@@ -24,6 +24,13 @@ use xcontrol_proto::{FileEntry, FileEntryKind, FileMsg, FileRefAnnounce, Message
 
 /// hub 测试互斥（进程级单例的跨用例串行；异步锁——跨 await 持有）。
 static HUB_LOCK: Mutex<()> = Mutex::const_new(());
+/// 测试隔离：关闭泵的真实剪贴板检测器（hub 开关——不用环境变量，2024
+/// edition 的 set_var 是 unsafe 且进程全局有竞态）。
+/// 共享实例懒初始化会接驳宿主机真实剪贴板——宿主残留的文件引用被检测/
+/// announce/拉取后污染 transfer_id 与暂存树（2026-11-28 并行失败根因）。
+fn disable_file_detector() {
+    lock_hub().set_file_detector_disabled();
+}
 
 /// 测试假码派生（docs/08 §4 假码纪律；每码进程内只派生一次）。
 fn psk(code: &'static str) -> [u8; 32] {
@@ -97,6 +104,9 @@ fn entry(name: &str, size: u64) -> FileEntry {
 #[tokio::test]
 async fn classify_dispatches_control_clip_file_and_rejects() {
     let _hub_guard = HUB_LOCK.lock().await;
+    disable_file_detector();
+    disable_file_detector();
+    disable_file_detector();
     let (mut server, addr) = test_server().await;
     let session_id = [0x3Fu8; 16];
     let mut throttle = HandshakeThrottle::<SocketAddr>::with_config(fast_throttle_config());
@@ -537,8 +547,17 @@ async fn directory_tree_pull_expands_and_mounts() {
                 }
             }
         }
-        // host 侧收敛完成（挂板登记）即退出
-        if lock_hub().mounted_fp().is_some() {
+        // host 侧收敛（两个文件条目均 verified）即退出。**不用 mounted_fp**：
+        // 回环防线指纹跨会话保留（docs/04 §8.2 生产语义），并行时前序测试的
+        // 挂板残留会让本循环提前退出、子条目 PullReq 无人应答（2026-11-28
+        // 并行失败根因二）；tid 域 verified 计数无跨测试污染。
+        if lock_hub()
+            .verified
+            .iter()
+            .filter(|(tid, _)| *tid == transfer_id)
+            .count()
+            >= 2
+        {
             break;
         }
     }

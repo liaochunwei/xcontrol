@@ -130,6 +130,16 @@ pub fn ns_change_count() -> u64 {
     let _gate = pasteboard_gate()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ns_change_count_locked()
+}
+
+/// changeCount 采样（**调用方已持 [`pasteboard_gate`] 的内部形态**）：
+/// `write_file_urls` 持 gate 后取写入基线必须走本变体——原实现直接调
+/// [`ns_change_count`] 同线程二次 lock 同一把非重入 Mutex = 无条件自死锁
+/// （2026-11-28 macos 集成测试卡死采样定位：mount_list → write_file_urls →
+/// ns_change_count → __psynch_mutexwait；真机 Mac 作为**接收方**挂板同样
+/// 必死，近期未暴露只因测试都是 Mac 当发送方）。
+fn ns_change_count_locked() -> u64 {
     let count = NSPasteboard::generalPasteboard().changeCount();
     // NSInteger = isize；changeCount 恒 >= 0（内部版本号语义），负值只可能是
     // 平台异常——兜底 0 保持基准不动。
@@ -427,7 +437,9 @@ impl MacClipboard {
             digest_input.extend_from_slice(path.as_bytes());
             digest_input.push(u8::from(*is_dir));
         }
-        let change_count = ns_change_count();
+        // 本函数已持 gate（389 行）——写入基线必须走 locked 变体（自死锁防线，
+        // 见 ns_change_count_locked 文档）。
+        let change_count = ns_change_count_locked();
         Ok(WrittenMark {
             fingerprint: fingerprint_bytes(&digest_input),
             change_count,
